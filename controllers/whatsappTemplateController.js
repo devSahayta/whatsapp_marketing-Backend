@@ -400,7 +400,7 @@ export async function sendTemplate(req, res) {
       account.system_user_access_token
     );
 
-    const allTemplates = metaTemplates.data || [];
+    const allTemplates = metaTemplates.data || metaTemplates || [];
 
     const template = allTemplates.find((t) => t.id === templateId);
 
@@ -520,7 +520,7 @@ export async function sendTemplateBulk(req, res) {
       account.waba_id,
       token
     );
-    const allTemplates = metaTemplates.data || [];
+    const allTemplates = metaTemplates.data || metaTemplates || [];
 
     const template = allTemplates.find((t) => t.id === templateId);
     if (!template)
@@ -612,7 +612,7 @@ export async function sendTemplateBulk(req, res) {
           // --------------------------------------------
           const chat = await getOrCreateChat({
             phone_number: to,
-            event_id: req.body.event_id, // FROM FRONTEND
+            group_id: req.body.group_id, // FROM FRONTEND
           });
 
           // --------------------------------------------
@@ -840,7 +840,7 @@ export async function getSingleMetaTemplate(req, res) {
       account.system_user_access_token
     );
 
-    const templates = data.data || [];
+    const templates = data.data || data || [];
 
     // Find template by id
 
