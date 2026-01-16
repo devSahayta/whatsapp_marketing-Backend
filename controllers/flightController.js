@@ -1,8 +1,8 @@
 import { supabase } from "../config/supabase.js";
 import { fetchAndCacheFlightStatus } from "../services/flightStatus.js";
 
-import { getEvent } from "../models/eventModel.js";
-import { getParticipantsById } from "../models/conversationModel.js";
+// import { getEvent } from "../models/groupModel.js";
+// import { getParticipantsById } from "../models/conversationModel.js";
 
 export const verifyEventOwnership = async (eventId, userId) => {
   const event = await getEvent(eventId);

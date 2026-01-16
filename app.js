@@ -5,7 +5,7 @@ import cors from "cors";
 import waccountRoutes from "./routes/waccountRoutes.js";
 
 import userRoutes from "./routes/userRoutes.js"; // if you have these
-import eventRoutes from "./routes/eventRoutes.js";
+import groupRoutes from "./routes/groupRoutes.js";
 import uploadRoutes from "./routes/uploadRoutes.js";
 import creditRoutes from "./routes/creditRoutes.js";
 import whatsappRoutes from "./routes/whatsappRoutes.js";
@@ -40,15 +40,19 @@ app.use(extractKindeUser);
 
 // Mount user/event routes (if any)
 app.use("/api/users", userRoutes);
-app.use("/api/events", eventRoutes);
+app.use("/api/groups", groupRoutes);
 
 // Protect all /api/uploads routes (your choice) — this keeps current behavior
-app.use("/api/uploads", authenticateUser, uploadRoutes);
+// app.use("/api/uploads", authenticateUser, uploadRoutes);
 
 app.use("/api/credits", creditRoutes);
+
+//chatdashboard and chatbot routes
 app.use("/", whatsappRoutes);
 app.use("/api", chatRoutes);
-app.use("/api", travelItineraryRoutes);
+app.use("/admin", adminChatRoutes);
+
+// app.use("/api", travelItineraryRoutes);
 app.use("/api/waccount", waccountRoutes);
 
 //route for whatapp template
@@ -56,13 +60,13 @@ app.use("/api/watemplates", whatsappTemplateRoutes);
 
 //route for knowledge base
 app.use("/api/knowledge-bases", knowledgeBaseRoutes);
-app.use("/admin", adminChatRoutes);
+
 
 //route for flight tracking
-app.use("/api/flight-tracking", flightTrackingRoutes);
+// app.use("/api/flight-tracking", flightTrackingRoutes);
 
 //for elevenlabs agent
-app.use("/api/agents", agentRoutes);
+// app.use("/api/agents", agentRoutes);
 
 app.get("/", (req, res) => res.send("API is running..."));
 

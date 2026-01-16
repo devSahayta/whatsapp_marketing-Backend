@@ -8,44 +8,35 @@ import { supabase } from "../config/supabase.js";
  * we don't set chat_id here — Supabase will return it for us.
  */
 
-export async function ensureChat({ event_id, phone_number, person_name }) {
-  // try to find exact chat for event + phone
-  let { data: existing, error: findErr } = await supabase
+export async function ensureChat({ group_id, phone_number, person_name }) {
+  const { data: existing, error: findErr } = await supabase
     .from("chats")
     .select("*")
-    .eq("event_id", event_id)
+    .eq("group_id", group_id)
     .eq("phone_number", phone_number)
     .maybeSingle();
 
-  if (findErr) {
-    console.error(":x: ensureChat find error:", findErr);
-    throw findErr;
-  }
-
+  if (findErr) throw findErr;
   if (existing) return existing;
 
-  // Insert new chat row; let DB generate chat_id
   const { data: inserted, error: insertErr } = await supabase
     .from("chats")
     .insert([
       {
-        event_id,
+        group_id,
         phone_number,
         person_name,
-        last_message: "", // set empty string instead of null
+        last_message: "",
         last_message_at: new Date().toISOString(),
         created_at: new Date().toISOString(),
       },
     ])
     .select();
 
-  if (insertErr || !inserted || !inserted[0]) {
-    console.error(":x: ensureChat insert error:", insertErr);
-    throw insertErr || new Error("Failed to insert chat row");
-  }
-
+  if (insertErr) throw insertErr;
   return inserted[0];
 }
+
 
 /**
  * Save a message row.
@@ -61,9 +52,10 @@ export async function saveMessage({
   message,
   message_type = "text",
   media_path = null,
+  buttons = null,
 }) {
   if (!message || message.trim() === "") {
-    message = `[${(message_type || "TEXT").toUpperCase()}]`;
+    message = `[${message_type.toUpperCase()}]`;
   }
 
   const payload = {
@@ -71,11 +63,12 @@ export async function saveMessage({
     sender_type,
     message,
     message_type,
-    media_path, // :white_check_mark: STORE PATH ONLY
+    media_path,
+    buttons,
     created_at: new Date().toISOString(),
   };
 
-  const { data: inserted, error } = await supabase
+  const { data, error } = await supabase
     .from("messages")
     .insert([payload])
     .select();
@@ -90,30 +83,32 @@ export async function saveMessage({
     })
     .eq("chat_id", chat_id);
 
-  return inserted[0];
+  return data[0];
 }
 
 /**
  * Fetch chats for an event — useful for left sidebar.
  * Returns chats ordered by last_message_at desc, then created_at.
  */
-export async function getChatsForEvent({ event_id, limit = 100, offset = 0 }) {
+export async function getChatsForGroup({
+  group_id,
+  limit = 100,
+  offset = 0,
+}) {
   const { data, error } = await supabase
     .from("chats")
     .select(
-      "chat_id, event_id, phone_number, person_name, last_message, created_at, last_message_at,mode"
+      "chat_id, group_id, phone_number, person_name, last_message, created_at, last_message_at, mode"
     )
-    .eq("event_id", event_id)
-    .order("last_message_at", { ascending: false, nulls: "last" })
+    .eq("group_id", group_id)
+    .order("last_message_at", { ascending: false })
     .order("created_at", { ascending: false })
     .range(offset, offset + limit - 1);
 
-  if (error) {
-    console.error(":x: getChatsForEvent error:", error);
-    throw error;
-  }
+  if (error) throw error;
   return data || [];
 }
+
 
 /**
  * Fetch messages for a chat with pagination.

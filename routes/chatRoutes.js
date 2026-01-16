@@ -9,13 +9,13 @@ const router = express.Router();
  * GET /api/events/:eventId/chats
  * Query: ?limit=50&offset=0
  */
-router.get("/events/:eventId/chats", async (req, res) => {
+router.get("/groups/:groupId/chats", async (req, res) => {
   try {
-    const { eventId } = req.params;
+    const { groupId } = req.params;
     const limit = parseInt(req.query.limit || "100", 10);
     const offset = parseInt(req.query.offset || "0", 10);
 
-    const chats = await chatCtrl.getChatsForEvent({ event_id: eventId, limit, offset });
+    const chats = await chatCtrl.getChatsForGroup({ group_id: groupId, limit, offset });
     return res.json({ ok: true, chats });
   } catch (err) {
     console.error(err);
