@@ -1,5 +1,7 @@
 // services/whatsappTemplateService.js
 import axios from "axios";
+import { supabase } from "../config/supabase.js";
+
 const GRAPH = `https://graph.facebook.com/${
   process.env.GRAPH_API_VERSION || "v24.0"
 }`;
@@ -15,15 +17,53 @@ export async function createTemplateOnMeta(wabaId, systemToken, payload) {
   return resp.data;
 }
 
-export async function checkTemplateStatusOnMeta(templateId, systemToken) {
-  const url = `${GRAPH}/${templateId}?fields=status,name`;
+// export async function checkTemplateStatusOnMeta(templateId, systemToken) {
+//   const url = `${GRAPH}/${templateId}?fields=status,name`;
+//   const resp = await axios.get(url, {
+//     headers: {
+//       Authorization: `Bearer ${systemToken}`,
+//       "Content-Type": "application/json",
+//     },
+//   });
+//   return resp.data;
+// }
+
+export async function checkTemplateStatusOnMeta(
+  wabaId,
+  templateName,
+  systemToken
+) {
+  const url = `${GRAPH}/${wabaId}/message_templates`;
+
+  // console.log({ wabaId, templateName, systemToken });
+
   const resp = await axios.get(url, {
+    params: { name: templateName },
     headers: {
       Authorization: `Bearer ${systemToken}`,
-      "Content-Type": "application/json",
     },
   });
-  return resp.data;
+
+  // console.log({ temData: resp.data });
+
+  if (!resp.data?.data?.length) {
+    return {
+      exists: false,
+      status: "NOT_FOUND",
+    };
+  }
+
+  const template = resp.data.data[0];
+
+  return {
+    exists: true,
+    id: template.id,
+    name: template.name,
+    status: template.status,
+    language: template.language,
+    category: template.category,
+    template: template,
+  };
 }
 
 export async function createUploadSession(
@@ -176,6 +216,140 @@ export async function listTemplatesFromMeta(wabaId, userToken) {
   // console.log({ allTemplates });
   return allTemplates;
 }
+
+// export async function listTemplatesFromDb(accountId) {
+//   const { data, error } = await supabase
+//     .from("whatsapp_templates")
+//     .select("preview")
+//     .eq("account_id", accountId)
+//     .not("preview", "is", null);
+
+//   if (error) {
+//     console.error("DB template fetch failed:", error);
+//     throw error;
+//   }
+
+//   // Extract preview objects (same structure as Meta)
+//   const templates = data.map((row) => row.preview).filter(Boolean);
+
+//   return {
+//     data: templates, // 👈 matches Meta response shape
+//   };
+// }
+
+export async function listTemplatesFromDb(accountId, wabaId, systemToken) {
+  // 1. Fetch templates from DB
+  const { data, error } = await supabase
+    .from("whatsapp_templates")
+    .select("wt_id, status, preview")
+    .eq("account_id", accountId)
+    .not("preview", "is", null);
+
+  if (error) {
+    console.error("DB template fetch failed:", error);
+    throw error;
+  }
+
+  const templates = [];
+
+  // 2. Loop through templates
+  for (const row of data) {
+    let preview = row.preview;
+    let status = row.status;
+
+    // 3. Sync only if status is PENDING
+    if (preview?.status === "PENDING") {
+      try {
+        const metaStatus = await checkTemplateStatusOnMeta(
+          wabaId,
+          preview.name,
+          systemToken
+        );
+
+        if (metaStatus.exists) {
+          preview = metaStatus.template;
+          status = metaStatus.status;
+
+          // 4. Update DB (status + preview)
+          await supabase
+            .from("whatsapp_templates")
+            .update({
+              status,
+              preview,
+            })
+            .eq("wt_id", row.wt_id);
+        }
+      } catch (e) {
+        console.warn(
+          `Template status check failed for ${preview?.name}:`,
+          e.message
+        );
+      }
+    }
+
+    templates.push(preview);
+  }
+
+  // 5. Return Meta-like response
+  return {
+    data: templates,
+  };
+}
+
+// export async function syncPendingTemplatesFromMeta(
+//   accountId,
+//   wabaId,
+//   systemToken
+// ) {
+//   // 1. Fetch templates from DB
+//   const { data: dbTemplates } = await listTemplatesFromDb(accountId);
+
+//   // 2. Find pending ones
+//   const pendingTemplates = dbTemplates.filter((t) => t.status === "PENDING");
+
+//   console.log({ pendingTemplates, totalPending: pendingTemplates.length });
+
+//   // Nothing to do → skip Meta
+//   if (!pendingTemplates.length) {
+//     return { synced: 0 };
+//   }
+
+//   // 3. Fetch all templates from Meta ONCE
+//   const metaTemplates = await listTemplatesFromMeta(wabaId, systemToken);
+
+//   console.log({ metaTemplates, totalPending: metaTemplates.length });
+
+//   const metaMap = new Map(metaTemplates.map((t) => [t.name, t]));
+
+//   let updatedCount = 0;
+
+//   // 4. Update only pending templates
+//   for (const pending of pendingTemplates) {
+//     const metaTemplate = metaMap.get(pending.name);
+
+//     console.log({ metaTemplate });
+
+//     if (!metaTemplate) continue;
+
+//     // Status still pending → skip
+//     if (metaTemplate.status === "PENDING") continue;
+
+//     // 5. Update DB
+//     const { error } = await supabase
+//       .from("whatsapp_templates")
+//       .update({
+//         status: metaTemplate.status,
+//         preview: metaTemplate,
+//         updated_at: new Date().toISOString(),
+//       })
+//       .eq("account_id", accountId)
+//       .eq("template_name", metaTemplate.name);
+
+//     if (!error) updatedCount++;
+//   }
+
+//   return { synced: updatedCount };
+// }
 
 //stream media files from meta url for media uploaded
 export async function getMediaMeta(mediaId, userToken) {

@@ -92,7 +92,13 @@ export async function createTemplate(req, res) {
 
         try {
           // Fetch all templates from Meta
-          const data = await wsService.listTemplatesFromMeta(
+          // const data = await wsService.listTemplatesFromMeta(
+          //   account.waba_id,
+          //   account.system_user_access_token
+          // );
+
+          const data = await wsService.listTemplatesFromDb(
+            account.wa_id,
             account.waba_id,
             account.system_user_access_token
           );
@@ -216,10 +222,22 @@ export async function checkTemplateStatus(req, res) {
         .status(400)
         .json({ error: "Account has no system_user_access_token" });
 
+    console.log("No error till here");
+
+    console.log({
+      whatsappId: account.waba_id,
+      templateName: tpl.name,
+      token: account.system_user_access_token,
+    });
+
     const status = await wsService.checkTemplateStatusOnMeta(
-      tpl.template_id,
+      account.waba_id,
+      tpl.name,
       account.system_user_access_token
     );
+
+    console.log({ status });
+
     if (status && status.status)
       await supabase
         .from("whatsapp_templates")
@@ -395,7 +413,13 @@ export async function sendTemplate(req, res) {
     // -------------------------------------------------------------
     // 2. Get Template Data from Meta
     // -------------------------------------------------------------
-    const metaTemplates = await wsService.listTemplatesFromMeta(
+    // const metaTemplates = await wsService.listTemplatesFromMeta(
+    //   account.waba_id,
+    //   account.system_user_access_token
+    // );
+
+    const metaTemplates = await wsService.listTemplatesFromDb(
+      account.wa_id,
       account.waba_id,
       account.system_user_access_token
     );
@@ -516,10 +540,17 @@ export async function sendTemplateBulk(req, res) {
     // --------------------------------------------
     // Fetch template from Meta
     // --------------------------------------------
-    const metaTemplates = await wsService.listTemplatesFromMeta(
+    // const metaTemplates = await wsService.listTemplatesFromMeta(
+    //   account.waba_id,
+    //   token
+    // );
+
+    const metaTemplates = await wsService.listTemplatesFromDb(
+      account.wa_id,
       account.waba_id,
-      token
+      account.system_user_access_token
     );
+
     const allTemplates = metaTemplates.data || metaTemplates || [];
 
     const template = allTemplates.find((t) => t.id === templateId);
@@ -805,7 +836,8 @@ export async function listMetaTemplates(req, res) {
 
     const account = await getWhatsappAccount(user_id);
 
-    const data = await wsService.listTemplatesFromMeta(
+    const data = await wsService.listTemplatesFromDb(
+      account.wa_id,
       account.waba_id,
       account.system_user_access_token
     );
@@ -835,7 +867,13 @@ export async function getSingleMetaTemplate(req, res) {
     const account = await getWhatsappAccount(user_id);
 
     // Fetch all templates from Meta
-    const data = await wsService.listTemplatesFromMeta(
+    // const data = await wsService.listTemplatesFromMeta(
+    //   account.waba_id,
+    //   account.system_user_access_token
+    // );
+
+    const data = await wsService.listTemplatesFromDb(
+      account.wa_id,
       account.waba_id,
       account.system_user_access_token
     );
