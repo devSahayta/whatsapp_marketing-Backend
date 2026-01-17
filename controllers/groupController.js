@@ -1,3 +1,5 @@
+//Controllers/groupController.js
+
 import { Readable } from "stream";
 import { parse } from "@fast-csv/parse";
 import { supabase } from "../config/supabase.js";
@@ -217,6 +219,83 @@ export const getGroupParticipants = async (req, res) => {
     return res.status(500).json({
       error: "Failed to fetch group participants",
     });
+  }
+};
+
+export const deleteGroup = async (req, res) => {
+  try {
+    const { groupId } = req.params;
+
+    if (!groupId) {
+      return res.status(400).json({ error: "Group ID is required" });
+    }
+
+    /* ---------- 1️⃣ Get group ---------- */
+    const { data: group, error: groupErr } = await supabase
+      .from("groups")
+      .select("group_id, uploaded_csv")
+      .eq("group_id", groupId)
+      .single();
+
+    if (groupErr || !group) {
+      return res.status(404).json({ error: "Group not found" });
+    }
+
+    /* ---------- 2️⃣ Get chats under group ---------- */
+    const { data: chats, error: chatErr } = await supabase
+      .from("chats")
+      .select("chat_id")
+      .eq("group_id", groupId);
+
+    if (chatErr) throw chatErr;
+
+    const chatIds = chats?.map((c) => c.chat_id) || [];
+
+    /* ---------- 3️⃣ Delete messages ---------- */
+    if (chatIds.length > 0) {
+      await supabase
+        .from("messages")
+        .delete()
+        .in("chat_id", chatIds);
+    }
+
+    /* ---------- 4️⃣ Delete chats ---------- */
+    await supabase
+      .from("chats")
+      .delete()
+      .eq("group_id", groupId);
+
+    /* ---------- 5️⃣ Delete group contacts ---------- */
+    await supabase
+      .from("group_contacts")
+      .delete()
+      .eq("group_id", groupId);
+
+    /* ---------- 6️⃣ Delete CSV from storage ---------- */
+    if (group.uploaded_csv) {
+      try {
+        const path = group.uploaded_csv.split("/group-csvs/")[1];
+        if (path) {
+          await supabase.storage.from("group-csvs").remove([path]);
+        }
+      } catch (storageErr) {
+        console.warn("⚠️ CSV deletion failed:", storageErr.message);
+        // DO NOT block deletion
+      }
+    }
+
+    /* ---------- 7️⃣ Delete group ---------- */
+    await supabase
+      .from("groups")
+      .delete()
+      .eq("group_id", groupId);
+
+    return res.status(200).json({
+      message: "Group deleted successfully",
+    });
+  } catch (error) {
+    console.error("deleteGroup error:", error);
+    return res.status(500).json({ error: "Internal Server Error" });
   }
 };
 

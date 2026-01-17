@@ -16,12 +16,12 @@ export function renderTemplateBody(template, finalComponents) {
   return text;
 }
 
-export async function getOrCreateChat({ phone_number, event_id, person_name }) {
+export async function getOrCreateChat({ phone_number, group_id, person_name }) {
   const { data: existing } = await supabase
     .from("chats")
     .select("*")
     .eq("phone_number", phone_number)
-    .eq("event_id", event_id)
+    .eq("group_id", group_id)
     .single();
 
   if (existing) return existing;
@@ -30,7 +30,7 @@ export async function getOrCreateChat({ phone_number, event_id, person_name }) {
     .from("chats")
     .insert({
       phone_number,
-      event_id,
+      group_id,
       person_name: person_name || phone_number,
       created_at: new Date(),
     })

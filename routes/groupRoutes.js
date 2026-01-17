@@ -79,6 +79,7 @@ import {
   getGroupsByUser,
   getGroupById,
   getGroupParticipants,
+  deleteGroup,
 } from "../controllers/groupController.js";
 
 const router = express.Router();
@@ -90,6 +91,7 @@ router.get("/", getGroupsByUser);
 router.get("/:groupId", getGroupById);
 // Get all participants in a group
 router.get("/:groupId/participants", getGroupParticipants);
+router.delete("/:groupId", deleteGroup);
 
 
 export default router;
