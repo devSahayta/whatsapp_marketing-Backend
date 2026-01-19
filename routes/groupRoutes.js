@@ -72,6 +72,10 @@
 
 // export default router;
 
+//routes/groupRoutes.js
+
+//routes/groupRoutes.js
+
 import express from "express";
 import multer from "multer";
 import {
@@ -79,6 +83,9 @@ import {
   getGroupsByUser,
   getGroupById,
   getGroupParticipants,
+  addContactToGroup,
+  deleteContact,
+  bulkDeleteContacts,
   deleteGroup,
 } from "../controllers/groupController.js";
 
@@ -86,12 +93,18 @@ const router = express.Router();
 
 const upload = multer({ storage: multer.memoryStorage() });
 
+// Group routes
 router.post("/", upload.single("dataset"), createGroupWithCsv);
 router.get("/", getGroupsByUser);
 router.get("/:groupId", getGroupById);
-// Get all participants in a group
-router.get("/:groupId/participants", getGroupParticipants);
 router.delete("/:groupId", deleteGroup);
 
+// Participant routes
+router.get("/:groupId/participants", getGroupParticipants);
+router.post("/:groupId/contacts", addContactToGroup);
+
+// Contact routes - IMPORTANT: bulk-delete MUST come before :contactId
+router.delete("/contacts/bulk-delete", bulkDeleteContacts);
+router.delete("/contacts/:contactId", deleteContact);
 
 export default router;
