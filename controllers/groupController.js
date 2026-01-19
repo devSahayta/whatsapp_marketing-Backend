@@ -172,7 +172,8 @@ export const getGroupById = async (req, res) => {
   }
 };
 
-// GET all participants (contacts) for a group
+/* -------------------- GET GROUP PARTICIPANTS -------------------- */
+
 export const getGroupParticipants = async (req, res) => {
   try {
     const { groupId } = req.params;
@@ -221,6 +222,225 @@ export const getGroupParticipants = async (req, res) => {
     });
   }
 };
+
+/* -------------------- ADD SINGLE CONTACT -------------------- */
+
+export const addContactToGroup = async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const { full_name, phone_number, email } = req.body;
+
+    // Validation
+    if (!groupId) {
+      return res.status(400).json({ error: "Group ID is required" });
+    }
+
+    if (!full_name || !phone_number) {
+      return res.status(400).json({ 
+        error: "full_name and phone_number are required" 
+      });
+    }
+
+    // 1️⃣ Verify group exists
+    const { data: group, error: groupError } = await supabase
+      .from("groups")
+      .select("group_id, user_id")
+      .eq("group_id", groupId)
+      .single();
+
+    if (groupError || !group) {
+      return res.status(404).json({ error: "Group not found" });
+    }
+
+    // 2️⃣ Check if contact already exists (prevent duplicates)
+    const { data: existing } = await supabase
+      .from("group_contacts")
+      .select("contact_id")
+      .eq("group_id", groupId)
+      .eq("phone_number", phone_number.trim())
+      .maybeSingle();
+
+    if (existing) {
+      return res.status(409).json({ 
+        error: "Contact with this phone number already exists in this group" 
+      });
+    }
+
+    // 3️⃣ Insert new contact
+    const { data: newContact, error: insertError } = await supabase
+      .from("group_contacts")
+      .insert([
+        {
+          group_id: groupId,
+          user_id: group.user_id,
+          full_name: full_name.trim(),
+          phone_number: phone_number.trim(),
+          email: email?.trim() || null,
+        },
+      ])
+      .select()
+      .single();
+
+    if (insertError) {
+      throw insertError;
+    }
+
+    return res.status(201).json({
+      message: "Contact added successfully",
+      contact: newContact,
+    });
+  } catch (err) {
+    console.error("addContactToGroup error:", err);
+    return res.status(500).json({ 
+      error: "Failed to add contact" 
+    });
+  }
+};
+
+/* -------------------- DELETE SINGLE CONTACT -------------------- */
+
+export const deleteContact = async (req, res) => {
+  try {
+    const { contactId } = req.params;
+
+    if (!contactId) {
+      return res.status(400).json({ error: "Contact ID is required" });
+    }
+
+    // 1️⃣ Check if contact exists
+    const { data: contact, error: fetchError } = await supabase
+      .from("group_contacts")
+      .select("contact_id, phone_number, group_id")
+      .eq("contact_id", contactId)
+      .single();
+
+    if (fetchError || !contact) {
+      return res.status(404).json({ error: "Contact not found" });
+    }
+
+    // 2️⃣ Delete associated chat messages (if any)
+    const { data: chats } = await supabase
+      .from("chats")
+      .select("chat_id")
+      .eq("group_id", contact.group_id)
+      .eq("phone_number", contact.phone_number);
+
+    if (chats && chats.length > 0) {
+      const chatIds = chats.map((c) => c.chat_id);
+
+      // Delete messages
+      await supabase
+        .from("messages")
+        .delete()
+        .in("chat_id", chatIds);
+
+      // Delete chats
+      await supabase
+        .from("chats")
+        .delete()
+        .in("chat_id", chatIds);
+    }
+
+    // 3️⃣ Delete contact
+    const { error: deleteError } = await supabase
+      .from("group_contacts")
+      .delete()
+      .eq("contact_id", contactId);
+
+    if (deleteError) {
+      throw deleteError;
+    }
+
+    return res.status(200).json({
+      message: "Contact deleted successfully",
+    });
+  } catch (err) {
+    console.error("deleteContact error:", err);
+    return res.status(500).json({ 
+      error: "Failed to delete contact" 
+    });
+  }
+};
+
+/* -------------------- BULK DELETE CONTACTS -------------------- */
+
+export const bulkDeleteContacts = async (req, res) => {
+  try {
+    const { ids } = req.body;
+
+    // Validation
+    if (!ids || !Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ 
+        error: "ids array is required and must not be empty" 
+      });
+    }
+
+    // 1️⃣ Get all contacts to delete
+    const { data: contacts, error: fetchError } = await supabase
+      .from("group_contacts")
+      .select("contact_id, phone_number, group_id")
+      .in("contact_id", ids);
+
+    if (fetchError) {
+      throw fetchError;
+    }
+
+    if (!contacts || contacts.length === 0) {
+      return res.status(404).json({ 
+        error: "No contacts found with provided IDs" 
+      });
+    }
+
+    // 2️⃣ Get all chats for these contacts
+    const phoneNumbers = contacts.map((c) => c.phone_number);
+    const groupIds = [...new Set(contacts.map((c) => c.group_id))];
+
+    const { data: chats } = await supabase
+      .from("chats")
+      .select("chat_id")
+      .in("group_id", groupIds)
+      .in("phone_number", phoneNumbers);
+
+    // 3️⃣ Delete messages and chats
+    if (chats && chats.length > 0) {
+      const chatIds = chats.map((c) => c.chat_id);
+
+      // Delete messages
+      await supabase
+        .from("messages")
+        .delete()
+        .in("chat_id", chatIds);
+
+      // Delete chats
+      await supabase
+        .from("chats")
+        .delete()
+        .in("chat_id", chatIds);
+    }
+
+    // 4️⃣ Delete contacts
+    const { error: deleteError } = await supabase
+      .from("group_contacts")
+      .delete()
+      .in("contact_id", ids);
+
+    if (deleteError) {
+      throw deleteError;
+    }
+
+    return res.status(200).json({
+      message: `${contacts.length} contact(s) deleted successfully`,
+      deletedCount: contacts.length,
+    });
+  } catch (err) {
+    console.error("bulkDeleteContacts error:", err);
+    return res.status(500).json({ 
+      error: "Failed to delete contacts" 
+    });
+  }
+};
+
+/* -------------------- DELETE GROUP -------------------- */
 
 export const deleteGroup = async (req, res) => {
   try {
@@ -298,4 +518,3 @@ export const deleteGroup = async (req, res) => {
     return res.status(500).json({ error: "Internal Server Error" });
   }
 };
-
