@@ -92,13 +92,7 @@ export async function createTemplate(req, res) {
 
         try {
           // Fetch all templates from Meta
-          // const data = await wsService.listTemplatesFromMeta(
-          //   account.waba_id,
-          //   account.system_user_access_token
-          // );
-
-          const data = await wsService.listTemplatesFromDb(
-            account.wa_id,
+          const data = await wsService.listTemplatesFromMeta(
             account.waba_id,
             account.system_user_access_token
           );
@@ -117,7 +111,7 @@ export async function createTemplate(req, res) {
           console.warn("Template created but preview fetch failed:", e.message);
         }
 
-        console.log({ preview, previewComponent: preview.components });
+        // console.log({ preview, previewComponent: preview.components });
 
         // update row with template_id and status
         await supabase
@@ -836,6 +830,13 @@ export async function listMetaTemplates(req, res) {
 
     const account = await getWhatsappAccount(user_id);
 
+    //fetch from meta
+    // const data = await wsService.listTemplatesFromMeta(
+    //   account.waba_id,
+    //   account.system_user_access_token
+    // );
+
+    //fetch from database
     const data = await wsService.listTemplatesFromDb(
       account.wa_id,
       account.waba_id,
