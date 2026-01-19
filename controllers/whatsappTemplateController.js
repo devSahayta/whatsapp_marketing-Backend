@@ -28,7 +28,7 @@ export async function createTemplate(req, res) {
     // Extract buttons safely
     let buttonList = [];
     const buttonComponent = payload.components?.find(
-      (c) => c.type === "BUTTONS"
+      (c) => c.type === "BUTTONS",
     );
 
     if (buttonComponent?.buttons) {
@@ -83,7 +83,7 @@ export async function createTemplate(req, res) {
             category: payload.category,
             parameter_format: payload.parameter_format || "positional",
             components: payload.components,
-          }
+          },
         );
 
         let preview = null;
@@ -94,7 +94,7 @@ export async function createTemplate(req, res) {
           // Fetch all templates from Meta
           const data = await wsService.listTemplatesFromMeta(
             account.waba_id,
-            account.system_user_access_token
+            account.system_user_access_token,
           );
 
           const templates = data.data || data || [];
@@ -150,7 +150,7 @@ export async function createUploadSession(req, res) {
     const sessionData = await wsService.createUploadSession(
       account.app_id,
       account.system_user_access_token,
-      { file_name, file_type }
+      { file_name, file_type },
     );
 
     return res.json(sessionData);
@@ -179,7 +179,7 @@ export async function uploadBinaryToSession(req, res) {
       sessionId,
       buffer,
       req.file.mimetype || "application/octet-stream",
-      account.system_user_access_token
+      account.system_user_access_token,
     );
     return res.json(resp);
   } catch (err) {
@@ -227,7 +227,7 @@ export async function checkTemplateStatus(req, res) {
     const status = await wsService.checkTemplateStatusOnMeta(
       account.waba_id,
       tpl.name,
-      account.system_user_access_token
+      account.system_user_access_token,
     );
 
     console.log({ status });
@@ -415,7 +415,7 @@ export async function sendTemplate(req, res) {
     const metaTemplates = await wsService.listTemplatesFromDb(
       account.wa_id,
       account.waba_id,
-      account.system_user_access_token
+      account.system_user_access_token,
     );
 
     const allTemplates = metaTemplates.data || metaTemplates || [];
@@ -474,7 +474,7 @@ export async function sendTemplate(req, res) {
     const sendResp = await wsService.sendTemplateMessage(
       account.phone_number_id,
       account.system_user_access_token,
-      messagePayload
+      messagePayload,
     );
 
     // -------------------------------------------------------------
@@ -542,7 +542,7 @@ export async function sendTemplateBulk(req, res) {
     const metaTemplates = await wsService.listTemplatesFromDb(
       account.wa_id,
       account.waba_id,
-      account.system_user_access_token
+      account.system_user_access_token,
     );
 
     const allTemplates = metaTemplates.data || metaTemplates || [];
@@ -597,7 +597,7 @@ export async function sendTemplateBulk(req, res) {
         const sendResp = await wsService.sendTemplateMessage(
           phoneNumberId,
           token,
-          payload
+          payload,
         );
 
         // Log success
@@ -721,7 +721,7 @@ export async function uploadMedia(req, res) {
     const metaResp = await wsService.uploadMediaForMessage(
       account.phone_number_id,
       account.system_user_access_token,
-      form
+      form,
     );
 
     // Save in database
@@ -801,7 +801,7 @@ export async function deleteMedia(req, res) {
     // ---- DELETE FROM META ----
     const metaResult = await wsService.deleteMediaFromMeta(
       media.media_id,
-      account.system_user_access_token
+      account.system_user_access_token,
     );
 
     if (!metaResult.success) {
@@ -840,7 +840,7 @@ export async function listMetaTemplates(req, res) {
     const data = await wsService.listTemplatesFromDb(
       account.wa_id,
       account.waba_id,
-      account.system_user_access_token
+      account.system_user_access_token,
     );
 
     res.json({ templates: data.data || data || [] });
@@ -876,7 +876,7 @@ export async function getSingleMetaTemplate(req, res) {
     const data = await wsService.listTemplatesFromDb(
       account.wa_id,
       account.waba_id,
-      account.system_user_access_token
+      account.system_user_access_token,
     );
 
     const templates = data.data || data || [];
@@ -918,7 +918,7 @@ export async function mediaProxy(req, res) {
     // 1) Get temp URL from Meta
     const meta = await wsService.getMediaMeta(
       mediaId,
-      account.system_user_access_token
+      account.system_user_access_token,
     );
 
     if (!meta.url)
@@ -927,7 +927,7 @@ export async function mediaProxy(req, res) {
     // 2) Fetch actual file stream
     const fileRes = await wsService.fetchMediaFile(
       meta.url,
-      account.system_user_access_token
+      account.system_user_access_token,
     );
 
     // 3) Return file stream to client
@@ -1025,7 +1025,7 @@ export async function deleteMetaTemplate(req, res) {
       account.waba_id,
       account.system_user_access_token,
       templateId,
-      template_name
+      template_name,
     );
 
     // Optionally delete it from your supabase DB also (if stored)
