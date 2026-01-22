@@ -3,7 +3,10 @@
 import dotenv from "dotenv";
 dotenv.config();
 import axios from "axios";
-import { sendWhatsAppTextMessage, fetchMediaUrl } from "../utils/whatsappClient.js";
+import {
+  sendWhatsAppTextMessage,
+  fetchMediaUrl,
+} from "../utils/whatsappClient.js";
 import { supabase } from "../config/supabase.js";
 import * as chatCtrl from "./chatController.js";
 
@@ -45,8 +48,37 @@ export const handleIncomingMessage = async (req, res) => {
 
   const value = req.body.entry?.[0]?.changes?.[0]?.value;
 
+  // if (value?.statuses) {
+  //   console.log("ℹ️ Status notification received:", value.statuses[0]?.status);
+  //   return res.sendStatus(200);
+  // }
+
   if (value?.statuses) {
-    console.log("ℹ️ Status notification received:", value.statuses[0]?.status);
+    for (const statusObj of value.statuses) {
+      const waMessageId = statusObj.id;
+      const status = statusObj.status; // sent | delivered | read
+      const timestamp = new Date(Number(statusObj.timestamp) * 1000);
+
+      console.log("📌 WA Status Update:", waMessageId, status);
+
+      const updateData = {
+        status,
+      };
+
+      if (status === "sent") updateData.sent_at = timestamp;
+      if (status === "delivered") updateData.delivered_at = timestamp;
+      if (status === "read") updateData.read_at = timestamp;
+
+      const { error } = await supabase
+        .from("whatsapp_messages")
+        .update(updateData)
+        .eq("wa_message_id", waMessageId);
+
+      if (error) {
+        console.error("❌ Failed to update message status:", error);
+      }
+    }
+
     return res.sendStatus(200);
   }
 
@@ -65,8 +97,10 @@ export const handleIncomingMessage = async (req, res) => {
       userText = message?.button?.payload || message?.button?.text || userText;
     }
 
-    let mediaUrl = message.image?.url || message.document?.url || message.video?.url || null;
-    let mediaId = message.image?.id || message.document?.id || message.video?.id || null;
+    let mediaUrl =
+      message.image?.url || message.document?.url || message.video?.url || null;
+    let mediaId =
+      message.image?.id || message.document?.id || message.video?.id || null;
     let origFilename = message.document?.filename || null;
 
     if (!mediaUrl && mediaId && typeof fetchMediaUrl === "function") {
@@ -114,7 +148,11 @@ export const handleIncomingMessage = async (req, res) => {
 
           const { error: uploadError } = await supabase.storage
             .from(BUCKET_NAME)
-            .upload(storagePath, buffer, { contentType: bufferResp.headers.get("content-type") || "application/octet-stream" });
+            .upload(storagePath, buffer, {
+              contentType:
+                bufferResp.headers.get("content-type") ||
+                "application/octet-stream",
+            });
 
           if (!uploadError) storedMediaPath = storagePath;
         }
@@ -127,15 +165,15 @@ export const handleIncomingMessage = async (req, res) => {
     await chatCtrl.saveMessage({
       chat_id: chatRow.chat_id,
       sender_type: "user",
-      message: userText || (mediaUrl ? `[${message.type.toUpperCase()}]` : "TEXT"),
+      message:
+        userText || (mediaUrl ? `[${message.type.toUpperCase()}]` : "TEXT"),
       message_type: message.type || "text",
-      media_path: storedMediaPath
+      media_path: storedMediaPath,
     });
 
     console.log("✅ Message saved for chat:", chatRow.chat_id);
 
     return res.sendStatus(200);
-
   } catch (err) {
     console.error("❌ Webhook Handler Error:", err);
     return res.sendStatus(500);
@@ -148,19 +186,24 @@ export const handleIncomingMessage = async (req, res) => {
 export const startInitialMessage = async (req, res) => {
   try {
     const { event_id } = req.body;
-    if (!event_id) return res.status(400).json({ error: "Event ID is required" });
+    if (!event_id)
+      return res.status(400).json({ error: "Event ID is required" });
 
     const { data: participants } = await supabase
       .from("participants")
       .select("participant_id, full_name, phone_number, event_id")
       .eq("event_id", event_id);
 
-    if (!participants?.length) return res.status(404).json({ error: "No participants found" });
+    if (!participants?.length)
+      return res.status(404).json({ error: "No participants found" });
 
     const templateName = "rsvp_initial_message";
     const metaTemplate = await fetchTemplateFromSystem(templateName);
-    const templateBody = metaTemplate?.components?.find(c => c.type === "BODY")?.text;
-    if (!templateBody) return res.status(500).json({ error: "Template body missing" });
+    const templateBody = metaTemplate?.components?.find(
+      (c) => c.type === "BODY",
+    )?.text;
+    if (!templateBody)
+      return res.status(500).json({ error: "Template body missing" });
 
     for (const p of participants) {
       let phone = p.phone_number?.toString().trim();
@@ -182,7 +225,12 @@ export const startInitialMessage = async (req, res) => {
       else {
         const { data: newChat } = await supabase
           .from("chats")
-          .insert({ event_id: p.event_id, phone_number: phone, person_name: name, last_message: personalizedMessage })
+          .insert({
+            event_id: p.event_id,
+            phone_number: phone,
+            person_name: name,
+            last_message: personalizedMessage,
+          })
           .select("chat_id")
           .single();
         chat_id = newChat.chat_id;
@@ -192,12 +240,14 @@ export const startInitialMessage = async (req, res) => {
         chat_id,
         sender_type: "system",
         message_type: "text",
-        message: personalizedMessage
+        message: personalizedMessage,
       });
     }
 
-    return res.json({ success: true, message: "✅ Initial messages triggered successfully!" });
-
+    return res.json({
+      success: true,
+      message: "✅ Initial messages triggered successfully!",
+    });
   } catch (err) {
     console.error("❌ WhatsApp Send Error:", err);
     return res.status(500).json({ error: "WhatsApp send failed" });
@@ -217,12 +267,16 @@ export const sendBatchInitialMessage = async (req, res) => {
       .select("participant_id, full_name, phone_number, event_id")
       .eq("event_id", event_id);
 
-    if (!participants?.length) return res.status(404).json({ error: "No participants found" });
+    if (!participants?.length)
+      return res.status(404).json({ error: "No participants found" });
 
     const templateName = "invite_rsvp";
     const metaTemplate = await fetchTemplateFromSystem(templateName);
-    const templateBody = metaTemplate?.components?.find(c => c.type === "BODY")?.text;
-    if (!templateBody) return res.status(500).json({ error: "Template body missing" });
+    const templateBody = metaTemplate?.components?.find(
+      (c) => c.type === "BODY",
+    )?.text;
+    if (!templateBody)
+      return res.status(500).json({ error: "Template body missing" });
 
     let successCount = 0;
     for (const p of participants) {
@@ -234,7 +288,7 @@ export const sendBatchInitialMessage = async (req, res) => {
 
         // Send via WhatsApp (template)
         await sendInitialTemplateMessage(phone, templateName, [
-          { type: "body", parameters: [{ type: "text", text: name }] }
+          { type: "body", parameters: [{ type: "text", text: name }] },
         ]);
 
         // Ensure chat exists
@@ -249,7 +303,12 @@ export const sendBatchInitialMessage = async (req, res) => {
         else {
           const { data: newChat } = await supabase
             .from("chats")
-            .insert({ event_id: p.event_id, phone_number: phone, person_name: name, last_message: personalizedMessage })
+            .insert({
+              event_id: p.event_id,
+              phone_number: phone,
+              person_name: name,
+              last_message: personalizedMessage,
+            })
             .select("chat_id")
             .single();
           chat_id = newChat.chat_id;
@@ -260,7 +319,7 @@ export const sendBatchInitialMessage = async (req, res) => {
           chat_id,
           sender_type: "system",
           message_type: "text",
-          message: personalizedMessage
+          message: personalizedMessage,
         });
 
         successCount++;
@@ -269,8 +328,11 @@ export const sendBatchInitialMessage = async (req, res) => {
       }
     }
 
-    return res.json({ message: "✅ Batch sent", total: participants.length, sent: successCount });
-
+    return res.json({
+      message: "✅ Batch sent",
+      total: participants.length,
+      sent: successCount,
+    });
   } catch (err) {
     console.error("❌ sendBatchInitialMessage error:", err);
     return res.status(500).json({ error: "Failed to send batch messages" });
