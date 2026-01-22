@@ -10,7 +10,7 @@ import {
 import { supabase } from "../config/supabase.js";
 import * as chatCtrl from "./chatController.js";
 
-const BUCKET_NAME = process.env.SUPABASE_BUCKET || "participant-docs";
+const BUCKET_NAME = process.env.SUPABASE_BUCKET || "message_media";
 const TEMPLATE_URL = process.env.TEMPLATE_BASE_URL;
 
 async function fetchTemplateFromSystem(templateName) {
@@ -133,33 +133,54 @@ export const handleIncomingMessage = async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // 🔹 UPLOAD MEDIA IF PRESENT
-    let storedMediaPath = null;
-    if (mediaUrl) {
-      try {
-        const bufferResp = await fetch(mediaUrl);
-        if (bufferResp.ok) {
-          const buffer = Buffer.from(await bufferResp.arrayBuffer());
-          const ts = Date.now();
-          const safeName = origFilename
-            ? origFilename.replace(/\s+/g, "_")
-            : `document_${ts}`;
-          const storagePath = `${chatRow.chat_id}/${ts}_${safeName}`;
+  
+// 🔹 UPLOAD MEDIA IF PRESENT
+let storedMediaPath = null;
 
-          const { error: uploadError } = await supabase.storage
-            .from(message_media)
-            .upload(storagePath, buffer, {
-              contentType:
-                bufferResp.headers.get("content-type") ||
-                "application/octet-stream",
-            });
+if (mediaId) {
+  try {
+    // 1️⃣ Get media URL from WhatsApp
+    const mediaUrl = await fetchMediaUrl(mediaId);
+    if (!mediaUrl) throw new Error("Media URL fetch failed");
 
-          if (!uploadError) storedMediaPath = storagePath;
-        }
-      } catch (err) {
-        console.error("❌ Media upload error:", err);
-      }
+    // 2️⃣ Download media WITH AUTH
+    const mediaResp = await fetch(mediaUrl, {
+      headers: {
+        Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`,
+      },
+    });
+
+    if (!mediaResp.ok) {
+      throw new Error("Failed to download media from WhatsApp");
     }
+
+    const buffer = Buffer.from(await mediaResp.arrayBuffer());
+
+    // 3️⃣ Build safe filename
+    const ts = Date.now();
+    const ext =
+      message.type === "image" ? "jpg" :
+      message.type === "video" ? "mp4" :
+      message.type === "audio" ? "ogg" :
+      "bin";
+
+    const storagePath = `${chatRow.chat_id}/${ts}.${ext}`;
+
+    // 4️⃣ Upload to Supabase bucket
+    const { error: uploadError } = await supabase.storage
+      .from(BUCKET_NAME)
+      .upload(storagePath, buffer, {
+        contentType: mediaResp.headers.get("content-type") || "application/octet-stream",
+      });
+
+    if (uploadError) throw uploadError;
+
+    storedMediaPath = storagePath;
+  } catch (err) {
+    console.error("❌ Media upload failed:", err.message);
+  }
+}
+
 
     // 🔹 SAVE USER MESSAGE
     await chatCtrl.saveMessage({
