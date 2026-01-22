@@ -29,7 +29,7 @@ app.use(
   cors({
     origin: [
       "http://localhost:5173",
-      "https://whatsapp-marketing-frontend-six.vercel.app",
+      "https://whatsapp-marketing-frontend-qzk7.vercel.app",
     ],
     credentials: true,
   })
