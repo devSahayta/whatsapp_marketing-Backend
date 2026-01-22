@@ -134,52 +134,36 @@ export const handleIncomingMessage = async (req, res) => {
     }
 
   
-// 🔹 UPLOAD MEDIA IF PRESENT
 let storedMediaPath = null;
 
-if (mediaId) {
+if (mediaUrl) {
   try {
-    // 1️⃣ Get media URL from WhatsApp
-    const mediaUrl = await fetchMediaUrl(mediaId);
-    if (!mediaUrl) throw new Error("Media URL fetch failed");
+    const { buffer, contentType } = await downloadWhatsAppMedia(mediaUrl);
 
-    // 2️⃣ Download media WITH AUTH
-    const mediaResp = await fetch(mediaUrl, {
-      headers: {
-        Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`,
-      },
-    });
-
-    if (!mediaResp.ok) {
-      throw new Error("Failed to download media from WhatsApp");
-    }
-
-    const buffer = Buffer.from(await mediaResp.arrayBuffer());
-
-    // 3️⃣ Build safe filename
     const ts = Date.now();
-    const ext =
-      message.type === "image" ? "jpg" :
-      message.type === "video" ? "mp4" :
-      message.type === "audio" ? "ogg" :
-      "bin";
+    const ext = contentType.split("/")[1] || "bin";
+    const fileName = `${message.type}_${ts}.${ext}`;
+    const storagePath = `${chatRow.chat_id}/${fileName}`;
 
-    const storagePath = `${chatRow.chat_id}/${ts}.${ext}`;
-
-    // 4️⃣ Upload to Supabase bucket
     const { error: uploadError } = await supabase.storage
-      .from(BUCKET_NAME)
-      .upload(storagePath, buffer, {
-        contentType: mediaResp.headers.get("content-type") || "application/octet-stream",
-      });
+      .from("message_media")
+      .upload(storagePath, buffer, { contentType });
 
-    if (uploadError) throw uploadError;
+    if (uploadError) {
+      console.error("❌ Upload error:", uploadError);
+    } else {
+      const { data } = supabase.storage
+        .from("message_media")
+        .getPublicUrl(storagePath);
 
-    storedMediaPath = storagePath;
+      storedMediaPath = data.publicUrl; // ✅ PUBLIC URL
+      console.log("✅ Public media URL:", storedMediaPath);
+    }
   } catch (err) {
-    console.error("❌ Media upload failed:", err.message);
+    console.error("❌ Media handling error:", err.message);
   }
 }
+
 
 
     // 🔹 SAVE USER MESSAGE
