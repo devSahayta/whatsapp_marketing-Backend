@@ -29,7 +29,7 @@ app.use(
   cors({
     origin: [
       "http://localhost:5173",
-      "https://rsvp-ai-agent-frontend.vercel.app",
+      "https://whatsapp-marketing-backend.vercel.app",
     ],
     credentials: true,
   })
