@@ -147,7 +147,7 @@ export const handleIncomingMessage = async (req, res) => {
           const storagePath = `${chatRow.chat_id}/${ts}_${safeName}`;
 
           const { error: uploadError } = await supabase.storage
-            .from(BUCKET_NAME)
+            .from(message_media)
             .upload(storagePath, buffer, {
               contentType:
                 bufferResp.headers.get("content-type") ||
