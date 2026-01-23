@@ -27,3 +27,20 @@ export async function downloadMediaFromWhatsApp(mediaId) {
 
   return filePath; // local path for Vision OCR
 }
+
+export async function downloadWhatsAppMedia(mediaUrl) {
+  const token = process.env.WHATSAPP_TOKEN;
+
+  const response = await axios.get(mediaUrl, {
+    responseType: "arraybuffer",
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  return {
+    buffer: Buffer.from(response.data),
+    contentType: response.headers["content-type"],
+  };
+}
+

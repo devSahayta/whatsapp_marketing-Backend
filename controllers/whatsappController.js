@@ -9,6 +9,10 @@ import {
 } from "../utils/whatsappClient.js";
 import { supabase } from "../config/supabase.js";
 import * as chatCtrl from "./chatController.js";
+import {
+  downloadWhatsAppMedia
+} from "../utils/whatsappMedia.js";
+
 
 const BUCKET_NAME = process.env.SUPABASE_BUCKET || "message_media";
 const TEMPLATE_URL = process.env.TEMPLATE_BASE_URL;
@@ -97,19 +101,18 @@ export const handleIncomingMessage = async (req, res) => {
       userText = message?.button?.payload || message?.button?.text || userText;
     }
 
-    let mediaUrl =
-      message.image?.url || message.document?.url || message.video?.url || null;
     let mediaId =
-      message.image?.id || message.document?.id || message.video?.id || null;
-    let origFilename = message.document?.filename || null;
+  message.image?.id ||
+  message.document?.id ||
+  message.video?.id ||
+  null;
 
-    if (!mediaUrl && mediaId && typeof fetchMediaUrl === "function") {
-      try {
-        mediaUrl = await fetchMediaUrl(mediaId);
-      } catch (err) {
-        console.warn("fetchMediaUrl failed:", err);
-      }
-    }
+let mediaUrl = null;
+
+if (mediaId) {
+  mediaUrl = await fetchMediaUrl(mediaId);
+}
+
 
     console.log("📩 Incoming:", {
       from,
