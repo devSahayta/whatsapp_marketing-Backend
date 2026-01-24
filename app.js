@@ -18,7 +18,7 @@ import knowledgeBaseRoutes from "./routes/knowledgeBaseRoutes.js";
 import adminChatRoutes from "./routes/adminChatRoutes.js";
 import agentRoutes from "./routes/agentRoutes.js";
 import flightTrackingRoutes from "./routes/flightRoutes.js";
-// import analyticsRoutes from "./routes/analyticsRoutes.js"; 
+import analyticsRoutes from "./routes/analyticsRoutes.js"; 
 
 dotenv.config();
 
@@ -62,7 +62,7 @@ app.use("/api/watemplates", whatsappTemplateRoutes);
 //route for knowledge base
 app.use("/api/knowledge-bases", knowledgeBaseRoutes);
 //analytics route
-// app.use("/api/analytics", analyticsRoutes);
+app.use("/api/analytics", analyticsRoutes);
 
 
 //route for flight tracking
