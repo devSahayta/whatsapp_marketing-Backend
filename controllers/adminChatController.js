@@ -1,28 +1,51 @@
 import { supabase } from "../config/supabase.js";
 import { sendWhatsAppTextMessage } from "../utils/whatsappClient.js";
 
-// checking 24 hours meta rule before sending message
-const is24HourWindowExpired = async (chat_id) => {
-  const { data, error } = await supabase
+const canAdminSendText = async (chat_id) => {
+  // Get last user message
+  const { data: lastUserMsg } = await supabase
     .from("messages")
     .select("created_at")
     .eq("chat_id", chat_id)
-    .eq("message_type", "template")
-    .eq("sender_type", "admin")
+    .eq("sender_type", "user")
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
 
-  if (error) throw error;
+  if (!lastUserMsg?.created_at) {
+    // User never replied
+    return { allowed: false, reason: "NO_USER_REPLY" };
+  }
 
-  // If no template was ever sent → window expired
-  if (!data?.created_at) return true;
+  // Get last admin template
+  const { data: lastTemplateMsg } = await supabase
+    .from("messages")
+    .select("created_at")
+    .eq("chat_id", chat_id)
+    .eq("sender_type", "admin")
+    .eq("message_type", "template")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
 
-  const lastTemplateTime = new Date(data.created_at).getTime();
-  const now = Date.now();
+  // If template was sent AFTER last user reply → conversation not reopened
+  if (
+    lastTemplateMsg?.created_at &&
+    new Date(lastTemplateMsg.created_at) > new Date(lastUserMsg.created_at)
+  ) {
+    return { allowed: false, reason: "TEMPLATE_ONLY_WAITING_FOR_USER" };
+  }
 
-  const diffHours = (now - lastTemplateTime) / (1000 * 60 * 60);
-  return diffHours > 24;
+  // Check 24-hour window from last user message
+  const diffHours =
+    (Date.now() - new Date(lastUserMsg.created_at).getTime()) /
+    (1000 * 60 * 60);
+
+  if (diffHours > 24) {
+    return { allowed: false, reason: "WINDOW_EXPIRED" };
+  }
+
+  return { allowed: true };
 };
 
 /**
@@ -51,14 +74,29 @@ export const sendAdminMessage = async (req, res) => {
       return res.status(404).json({ error: "Chat not found" });
     }
 
-    /* 1.1 Enforce WhatsApp 24-hour rule */
-    const isExpired = await is24HourWindowExpired(chat_id);
+    /* 1️⃣.5️⃣ Enforce WhatsApp conversation rules */
+    const permission = await canAdminSendText(chat_id);
 
-    if (isExpired) {
+    if (!permission.allowed) {
+      let errorMessage = "You can only send WhatsApp templates at this time.";
+
+      if (permission.reason === "NO_USER_REPLY") {
+        errorMessage = "User has not replied yet. You can only send templates.";
+      }
+
+      if (permission.reason === "WINDOW_EXPIRED") {
+        errorMessage =
+          "24-hour window expired. Please send a template to re-engage the user.";
+      }
+
+      if (permission.reason === "TEMPLATE_ONLY_WAITING_FOR_USER") {
+        errorMessage =
+          "Template sent. Please wait for the user to reply before sending messages.";
+      }
+
       return res.status(403).json({
-        error:
-          "24-hour window expired. Please send a WhatsApp template to re-open the conversation.",
-        code: "WHATSAPP_24H_WINDOW_EXPIRED",
+        error: errorMessage,
+        code: permission.reason,
       });
     }
 

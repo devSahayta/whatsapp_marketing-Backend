@@ -9,10 +9,7 @@ import {
 } from "../utils/whatsappClient.js";
 import { supabase } from "../config/supabase.js";
 import * as chatCtrl from "./chatController.js";
-import {
-  downloadWhatsAppMedia
-} from "../utils/whatsappMedia.js";
-
+import { downloadWhatsAppMedia } from "../utils/whatsappMedia.js";
 
 const BUCKET_NAME = process.env.SUPABASE_BUCKET || "message_media";
 const TEMPLATE_URL = process.env.TEMPLATE_BASE_URL;
@@ -51,6 +48,14 @@ export const handleIncomingMessage = async (req, res) => {
   console.log("🔹 FULL WHATSAPP PAYLOAD:", JSON.stringify(req.body, null, 2));
 
   const value = req.body.entry?.[0]?.changes?.[0]?.value;
+
+  const wabaId = req.body.entry?.[0]?.id;
+  const phoneNumberId = value?.metadata?.phone_number_id;
+
+  if (!wabaId || !phoneNumberId) {
+    console.error("❌ Missing WABA ID or phone_number_id");
+    return res.sendStatus(200);
+  }
 
   // if (value?.statuses) {
   //   console.log("ℹ️ Status notification received:", value.statuses[0]?.status);
@@ -102,17 +107,13 @@ export const handleIncomingMessage = async (req, res) => {
     }
 
     let mediaId =
-  message.image?.id ||
-  message.document?.id ||
-  message.video?.id ||
-  null;
+      message.image?.id || message.document?.id || message.video?.id || null;
 
-let mediaUrl = null;
+    let mediaUrl = null;
 
-if (mediaId) {
-  mediaUrl = await fetchMediaUrl(mediaId);
-}
-
+    if (mediaId) {
+      mediaUrl = await fetchMediaUrl(mediaId);
+    }
 
     console.log("📩 Incoming:", {
       from,
@@ -122,11 +123,39 @@ if (mediaId) {
       mediaId,
     });
 
+    // Get user id from whatsapp account table
+    const { data: waAccount, error: waErr } = await supabase
+      .from("whatsapp_accounts")
+      .select("user_id")
+      .eq("waba_id", wabaId)
+      .eq("phone_number_id", phoneNumberId)
+      .eq("status", "active")
+      .maybeSingle();
+
+    if (waErr || !waAccount?.user_id) {
+      console.error("❌ No WhatsApp account mapped for:", {
+        wabaId,
+        phoneNumberId,
+      });
+      return res.sendStatus(200);
+    }
+
+    const user_id = waAccount.user_id;
+
     // 🔹 FIND CHAT BY PHONE NUMBER
+    // const { data: chatRow } = await supabase
+    //   .from("chats")
+    //   .select("chat_id, group_id")
+    //   .eq("phone_number", from)
+    //   .order("created_at", { ascending: false })
+    //   .limit(1)
+    //   .maybeSingle();
+
     const { data: chatRow } = await supabase
       .from("chats")
-      .select("chat_id, group_id")
+      .select("chat_id")
       .eq("phone_number", from)
+      .eq("user_id", user_id)
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();
@@ -136,38 +165,35 @@ if (mediaId) {
       return res.sendStatus(200);
     }
 
-  
-let storedMediaPath = null;
+    let storedMediaPath = null;
 
-if (mediaUrl) {
-  try {
-    const { buffer, contentType } = await downloadWhatsAppMedia(mediaUrl);
+    if (mediaUrl) {
+      try {
+        const { buffer, contentType } = await downloadWhatsAppMedia(mediaUrl);
 
-    const ts = Date.now();
-    const ext = contentType.split("/")[1] || "bin";
-    const fileName = `${message.type}_${ts}.${ext}`;
-    const storagePath = `${chatRow.chat_id}/${fileName}`;
+        const ts = Date.now();
+        const ext = contentType.split("/")[1] || "bin";
+        const fileName = `${message.type}_${ts}.${ext}`;
+        const storagePath = `${chatRow.chat_id}/${fileName}`;
 
-    const { error: uploadError } = await supabase.storage
-      .from("message_media")
-      .upload(storagePath, buffer, { contentType });
+        const { error: uploadError } = await supabase.storage
+          .from("message_media")
+          .upload(storagePath, buffer, { contentType });
 
-    if (uploadError) {
-      console.error("❌ Upload error:", uploadError);
-    } else {
-      const { data } = supabase.storage
-        .from("message_media")
-        .getPublicUrl(storagePath);
+        if (uploadError) {
+          console.error("❌ Upload error:", uploadError);
+        } else {
+          const { data } = supabase.storage
+            .from("message_media")
+            .getPublicUrl(storagePath);
 
-      storedMediaPath = data.publicUrl; // ✅ PUBLIC URL
-      console.log("✅ Public media URL:", storedMediaPath);
+          storedMediaPath = data.publicUrl; // ✅ PUBLIC URL
+          console.log("✅ Public media URL:", storedMediaPath);
+        }
+      } catch (err) {
+        console.error("❌ Media handling error:", err.message);
+      }
     }
-  } catch (err) {
-    console.error("❌ Media handling error:", err.message);
-  }
-}
-
-
 
     // 🔹 SAVE USER MESSAGE
     await chatCtrl.saveMessage({
