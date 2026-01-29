@@ -129,7 +129,7 @@ export const handleIncomingMessage = async (req, res) => {
       .select("user_id")
       .eq("waba_id", wabaId)
       .eq("phone_number_id", phoneNumberId)
-      .eq("status", "active")
+      .limit(1)
       .maybeSingle();
 
     if (waErr || !waAccount?.user_id) {
