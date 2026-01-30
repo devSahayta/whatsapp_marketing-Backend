@@ -151,14 +151,14 @@ export const handleIncomingMessage = async (req, res) => {
     //   .limit(1)
     //   .maybeSingle();
 
-    const { data: chatRow } = await supabase
-      .from("chats")
-      .select("chat_id")
-      .eq("phone_number", from)
-      .eq("user_id", user_id)
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
+   const { data: chatRow } = await supabase
+      .from("chats")
+      .select("chat_id")
+      .eq("phone_number", from)
+      .eq("user_id", user_id)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle()
 
     if (!chatRow) {
       console.warn("⚠️ No chat found for phone:", from);

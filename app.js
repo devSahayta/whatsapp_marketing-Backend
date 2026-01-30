@@ -19,6 +19,8 @@ import adminChatRoutes from "./routes/adminChatRoutes.js";
 import agentRoutes from "./routes/agentRoutes.js";
 import flightTrackingRoutes from "./routes/flightRoutes.js";
 import analyticsRoutes from "./routes/analyticsRoutes.js";
+import campaignRoutes from "./routes/campaignRoutes.js";
+import { startCampaignScheduler } from "./scheduler/campaignScheduler.js";
 
 dotenv.config();
 
@@ -63,6 +65,12 @@ app.use("/api/watemplates", whatsappTemplateRoutes);
 app.use("/api/knowledge-bases", knowledgeBaseRoutes);
 //analytics route
 app.use("/api/analytics", analyticsRoutes);
+app.use("/api/campaigns", campaignRoutes);
+
+// Start scheduler
+
+
+
 
 //route for flight tracking
 // app.use("/api/flight-tracking", flightTrackingRoutes);
@@ -74,3 +82,5 @@ app.get("/", (req, res) => res.send("API is running..."));
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+startCampaignScheduler();
