@@ -1,6 +1,52 @@
 import { supabase } from "../config/supabase.js";
 import { sendWhatsAppTextMessage } from "../utils/whatsappClient.js";
 
+const canAdminSendText = async (chat_id) => {
+  // Get last user message
+  const { data: lastUserMsg } = await supabase
+    .from("messages")
+    .select("created_at")
+    .eq("chat_id", chat_id)
+    .eq("sender_type", "user")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (!lastUserMsg?.created_at) {
+    // User never replied
+    return { allowed: false, reason: "NO_USER_REPLY" };
+  }
+
+  // Get last admin template
+  const { data: lastTemplateMsg } = await supabase
+    .from("messages")
+    .select("created_at")
+    .eq("chat_id", chat_id)
+    .eq("sender_type", "admin")
+    .eq("message_type", "template")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  // If template was sent AFTER last user reply → conversation not reopened
+  if (
+    lastTemplateMsg?.created_at &&
+    new Date(lastTemplateMsg.created_at) > new Date(lastUserMsg.created_at)
+  ) {
+    return { allowed: false, reason: "TEMPLATE_ONLY_WAITING_FOR_USER" };
+  }
+
+  // Check 24-hour window from last user message
+  const diffHours =
+    (Date.now() - new Date(lastUserMsg.created_at).getTime()) /
+    (1000 * 60 * 60);
+
+  if (diffHours > 24) {
+    return { allowed: false, reason: "WINDOW_EXPIRED" };
+  }
+
+  return { allowed: true };
+};
 
 /**
  * POST /admin/chat/send
@@ -12,7 +58,9 @@ export const sendAdminMessage = async (req, res) => {
     const admin_id = req.user?.user_id;
 
     if (!chat_id || !message) {
-      return res.status(400).json({ error: "chat_id and message are required" });
+      return res
+        .status(400)
+        .json({ error: "chat_id and message are required" });
     }
 
     /* 1️⃣ Fetch chat */
@@ -24,6 +72,32 @@ export const sendAdminMessage = async (req, res) => {
 
     if (chatError || !chat) {
       return res.status(404).json({ error: "Chat not found" });
+    }
+
+    /* 1️⃣.5️⃣ Enforce WhatsApp conversation rules */
+    const permission = await canAdminSendText(chat_id);
+
+    if (!permission.allowed) {
+      let errorMessage = "You can only send WhatsApp templates at this time.";
+
+      if (permission.reason === "NO_USER_REPLY") {
+        errorMessage = "User has not replied yet. You can only send templates.";
+      }
+
+      if (permission.reason === "WINDOW_EXPIRED") {
+        errorMessage =
+          "24-hour window expired. Please send a template to re-engage the user.";
+      }
+
+      if (permission.reason === "TEMPLATE_ONLY_WAITING_FOR_USER") {
+        errorMessage =
+          "Template sent. Please wait for the user to reply before sending messages.";
+      }
+
+      return res.status(403).json({
+        error: errorMessage,
+        code: permission.reason,
+      });
     }
 
     /* 2️⃣ Save admin message */
@@ -68,8 +142,6 @@ export const sendAdminMessage = async (req, res) => {
 //   try {
 //     const { chat_id } = req.body;
 // const admin_id = req.user.user_id;
-
-
 
 //     if (!chat_id || !admin_id) {
 //       return res.status(400).json({

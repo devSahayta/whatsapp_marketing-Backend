@@ -637,7 +637,7 @@ export async function sendTemplateBulk(req, res) {
           // --------------------------------------------
           const chat = await getOrCreateChat({
             phone_number: to,
-            group_id: req.body.group_id, // FROM FRONTEND
+            user_id: user_id,
           });
 
           // --------------------------------------------

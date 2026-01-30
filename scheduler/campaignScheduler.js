@@ -126,6 +126,7 @@ async function processCampaign(campaign) {
           message.phone_number,
           message.contact_name,
           campaign.group_id,
+          campaign.user_id,  // Add user_id
           campaign.template_variables
         );
 
@@ -178,7 +179,7 @@ async function processCampaign(campaign) {
   }
 }
 
-async function sendWhatsAppMessage(account, template, phoneNumber, contactName, groupId, variables) {
+async function sendWhatsAppMessage(account, template, phoneNumber, contactName, groupId, userId, variables) {
   try {
     // Build template message
     const messageBody = {
@@ -244,8 +245,8 @@ async function sendWhatsAppMessage(account, template, phoneNumber, contactName, 
 
     console.log(`   💾 Stored in whatsapp_messages: ${wmRecord.wm_id}`);
 
-    // 2️⃣ Find or create chat
-    const chatId = await findOrCreateChat(phoneNumber, contactName, groupId);
+    // 2️⃣ Find or create chat (FIXED: Now updates existing chats)
+    const chatId = await findOrCreateChat(phoneNumber, contactName, groupId, userId);
     console.log(`   💬 Chat ID: ${chatId}`);
 
     // 3️⃣ Store in messages table (for chat dashboard)
@@ -280,43 +281,54 @@ async function sendWhatsAppMessage(account, template, phoneNumber, contactName, 
 }
 
 /* =====================================
-   HELPER: FIND OR CREATE CHAT
+   HELPER: FIND OR CREATE CHAT (FIXED)
 ====================================== */
 
-async function findOrCreateChat(phoneNumber, contactName, groupId) {
-  // Check if chat already exists
-  const { data: existingChat } = await supabase
+async function findOrCreateChat(phoneNumber, contactName, groupId, userId) {
+  // First, try to find existing chat by phone number and user_id
+  const { data: existingChats } = await supabase
     .from("chats")
-    .select("chat_id")
+    .select("chat_id, group_id, person_name")
     .eq("phone_number", phoneNumber)
-    .eq("group_id", groupId)
-    .single();
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false })
+    .limit(1);
 
-  if (existingChat) {
-    // Update last message time
+  if (existingChats && existingChats.length > 0) {
+    const existingChat = existingChats[0];
+    console.log(`   🔄 Updating existing chat: ${existingChat.chat_id}`);
+    
+    // Update the existing chat with new message and group_id
     await supabase
       .from("chats")
       .update({
-        last_message: "Template message sent",
+        last_message: "Template message sent via campaign",
         last_message_at: new Date().toISOString(),
         last_admin_message_at: new Date().toISOString(),
+        group_id: groupId, // Update group_id
+        person_name: contactName || existingChat.person_name || "Unknown",
+        updated_at: new Date().toISOString()// Update name if provided
       })
       .eq("chat_id", existingChat.chat_id);
 
     return existingChat.chat_id;
   }
 
-  // Create new chat
+  // If no chat exists, create a new one
+  console.log(`   🆕 Creating new chat for ${phoneNumber}`);
+  
   const { data: newChat, error } = await supabase
     .from("chats")
     .insert({
       phone_number: phoneNumber,
       person_name: contactName || "Unknown",
-      last_message: "Template message sent",
+      last_message: "Template message sent via campaign",
       last_message_at: new Date().toISOString(),
       group_id: groupId,
       mode: "AUTO",
       last_admin_message_at: new Date().toISOString(),
+      user_id: userId,
+      updated_at: new Date().toISOString()
     })
     .select()
     .single();
@@ -326,7 +338,7 @@ async function findOrCreateChat(phoneNumber, contactName, groupId) {
     throw error;
   }
 
-  console.log(`   🆕 Created new chat: ${newChat.chat_id}`);
+  console.log(`   ✅ New chat created: ${newChat.chat_id}`);
   return newChat.chat_id;
 }
 
@@ -340,7 +352,17 @@ function extractTemplateText(template) {
       return `Template: ${template.name}`;
     }
 
-    const bodyComponent = template.components.find(
+    // Try parsing if it's a JSON string
+    let components = template.components;
+    if (typeof components === 'string') {
+      try {
+        components = JSON.parse(components);
+      } catch (e) {
+        return `Template: ${template.name}`;
+      }
+    }
+
+    const bodyComponent = components.find(
       (comp) => comp.type === "BODY"
     );
 

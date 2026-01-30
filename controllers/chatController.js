@@ -28,7 +28,7 @@ export async function ensureChat({ group_id, phone_number, person_name }) {
         .from("chats")
         .update({ person_name: actualName || phone_number })
         .eq("chat_id", existing.chat_id);
-      
+
       // Return updated version
       return { ...existing, person_name: actualName || phone_number };
     }
@@ -75,7 +75,7 @@ async function getPersonNameFromContacts(group_id, phone_number) {
     // Find matching contact (handle different phone formats)
     const match = data.find((contact) => {
       const contactClean = contact.phone_number?.replace(/[\s\-\(\)]/g, "");
-      
+
       // Match exact or last 10 digits
       return (
         contactClean === cleanPhone ||
@@ -160,15 +160,11 @@ export async function saveMessage({
  * Fetch chats for a group — useful for left sidebar.
  * Returns chats ordered by last_message_at desc.
  */
-export async function getChatsForGroup({
-  group_id,
-  limit = 100,
-  offset = 0,
-}) {
+export async function getChatsForGroup({ group_id, limit = 100, offset = 0 }) {
   const { data, error } = await supabase
     .from("chats")
     .select(
-      "chat_id, group_id, phone_number, person_name, last_message, created_at, last_message_at, mode"
+      "chat_id, group_id, phone_number, person_name, last_message, created_at, last_message_at, mode",
     )
     .eq("group_id", group_id)
     .order("last_message_at", { ascending: false })
@@ -188,24 +184,40 @@ export async function getChatsForGroup({
       ) {
         const actualName = await getPersonNameFromContacts(
           group_id,
-          chat.phone_number
+          chat.phone_number,
         );
-        
+
         if (actualName) {
           // Update the chat with actual name
           await supabase
             .from("chats")
             .update({ person_name: actualName })
             .eq("chat_id", chat.chat_id);
-          
+
           chat.person_name = actualName;
         }
       }
       return chat;
-    })
+    }),
   );
 
   return enhanced;
+}
+
+export async function getChatsForUser({ user_id, limit = 100, offset = 0 }) {
+  const { data, error } = await supabase
+    .from("chats")
+    .select(
+      "chat_id, user_id, phone_number, person_name, last_message, last_message_at, created_at, mode",
+    )
+    .eq("user_id", user_id)
+    .order("last_message_at", { ascending: false })
+    .order("created_at", { ascending: false })
+    .range(offset, offset + limit - 1);
+
+  if (error) throw error;
+
+  return data || [];
 }
 
 /**
@@ -220,7 +232,7 @@ export async function getMessagesForChat({
   let query = supabase
     .from("messages")
     .select(
-      "message_id, chat_id, sender_type, message, message_type, media_path, created_at, buttons"
+      "message_id, chat_id, sender_type, message, message_type, media_path, created_at, buttons",
     )
     .eq("chat_id", chat_id)
     .order("created_at", { ascending: true })
@@ -280,7 +292,7 @@ export async function fixExistingChatNames(group_id) {
       // Fetch actual name from contacts
       const actualName = await getPersonNameFromContacts(
         chat.group_id,
-        chat.phone_number
+        chat.phone_number,
       );
 
       if (actualName) {
