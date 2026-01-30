@@ -611,11 +611,10 @@ export async function sendTemplateBulk(req, res) {
           status: sendResp.error ? "FAILED" : "SENT",
         };
 
-        await supabase.from("whatsapp_messages").insert(log);
-
-        results.success.push({ to, id: log.wm_id });
-
         if (!sendResp.error) {
+          await supabase.from("whatsapp_messages").insert(log);
+
+          results.success.push({ to, id: log.wm_id });
           // --------------------------------------------
           // Render message text for DB
           // --------------------------------------------
