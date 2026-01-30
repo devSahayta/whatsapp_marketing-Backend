@@ -124,44 +124,17 @@ export const handleIncomingMessage = async (req, res) => {
     });
 
     // Get user id from whatsapp account table
-    const { data: waAccount, error: waErr } = await supabase
+    const { data: waAccounts, error: waErr } = await supabase
       .from("whatsapp_accounts")
       .select("user_id")
       .eq("waba_id", wabaId)
-      .eq("phone_number_id", phoneNumberId)
-      .limit(1)
-      .maybeSingle();
+      .eq("phone_number_id", phoneNumberId);
 
-    if (waErr || !waAccount?.user_id) {
-      console.error("❌ No WhatsApp account mapped for:", {
+    if (waErr || !waAccounts?.length) {
+      console.error("❌ No WhatsApp accounts mapped", {
         wabaId,
         phoneNumberId,
       });
-      return res.sendStatus(200);
-    }
-
-    const user_id = waAccount.user_id;
-
-    // 🔹 FIND CHAT BY PHONE NUMBER
-    // const { data: chatRow } = await supabase
-    //   .from("chats")
-    //   .select("chat_id, group_id")
-    //   .eq("phone_number", from)
-    //   .order("created_at", { ascending: false })
-    //   .limit(1)
-    //   .maybeSingle();
-
-   const { data: chatRow } = await supabase
-      .from("chats")
-      .select("chat_id")
-      .eq("phone_number", from)
-      .eq("user_id", user_id)
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle()
-
-    if (!chatRow) {
-      console.warn("⚠️ No chat found for phone:", from);
       return res.sendStatus(200);
     }
 
@@ -195,17 +168,49 @@ export const handleIncomingMessage = async (req, res) => {
       }
     }
 
-    // 🔹 SAVE USER MESSAGE
-    await chatCtrl.saveMessage({
-      chat_id: chatRow.chat_id,
-      sender_type: "user",
-      message:
-        userText || (mediaUrl ? `[${message.type.toUpperCase()}]` : "TEXT"),
-      message_type: message.type || "text",
-      media_path: storedMediaPath,
-    });
+    // loop through every user to store message in their chat dashboard
+    for (const acc of waAccounts) {
+      const user_id = acc.user_id;
 
-    console.log("✅ Message saved for chat:", chatRow.chat_id);
+      // find chat
+      const { data: chatRow } = await supabase
+        .from("chats")
+        .select("chat_id")
+        .eq("user_id", user_id)
+        .eq("phone_number", from)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (!chatRow?.chat_id) {
+        console.warn("⚠️ No chat found for", { user_id, from });
+        continue; // skip this user, but continue others
+      }
+
+      // save message
+      await chatCtrl.saveMessage({
+        chat_id: chatRow.chat_id,
+        sender_type: "user",
+        message:
+          userText || (mediaUrl ? `[${message.type.toUpperCase()}]` : "TEXT"),
+        message_type: message.type || "text",
+        media_path: storedMediaPath,
+      });
+
+      console.log("✅ Message saved for user:", user_id);
+    }
+
+    // 🔹 SAVE USER MESSAGE
+    // await chatCtrl.saveMessage({
+    //   chat_id: chatRow.chat_id,
+    //   sender_type: "user",
+    //   message:
+    //     userText || (mediaUrl ? `[${message.type.toUpperCase()}]` : "TEXT"),
+    //   message_type: message.type || "text",
+    //   media_path: storedMediaPath,
+    // });
+
+    // console.log("✅ Message saved for chat:", chatRow.chat_id);
 
     return res.sendStatus(200);
   } catch (err) {
