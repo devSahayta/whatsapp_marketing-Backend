@@ -125,8 +125,9 @@ if (mediaId) {
     // 🔹 FIND CHAT BY PHONE NUMBER
     const { data: chatRow } = await supabase
       .from("chats")
-      .select("chat_id, group_id")
+      .select("chat_id, group_id ")
       .eq("phone_number", from)
+      
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();
