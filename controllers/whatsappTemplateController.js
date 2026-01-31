@@ -11,6 +11,10 @@ import {
 import fetch from "node-fetch";
 const { FormData, Blob } = global;
 
+// top of controller file
+const bulkProgress = new Map();
+// key: user_id + templateId
+
 // create template (store in DB and optionally submit to Meta)
 export async function createTemplate(req, res) {
   try {
@@ -578,6 +582,13 @@ export async function sendTemplateBulk(req, res) {
     // Simple wait function for throttling
     const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+    const progressKey = `${user_id}_${templateId}`;
+
+    bulkProgress.set(progressKey, {
+      total: recipients.length,
+      completed: 0,
+    });
+
     // --------------------------------------------
     // Loop each recipient with throttling
     // --------------------------------------------
@@ -675,11 +686,19 @@ export async function sendTemplateBulk(req, res) {
           to,
           error: err.response?.data || err.message,
         });
+      } finally {
+        const prog = bulkProgress.get(progressKey);
+        if (prog) {
+          prog.completed += 1;
+          bulkProgress.set(progressKey, prog);
+        }
       }
 
       // Throttle to stay safe from Meta
       await wait(350); // 300–400ms is ideal
     }
+
+    bulkProgress.delete(progressKey);
 
     return res.json({
       success: true,
@@ -694,6 +713,22 @@ export async function sendTemplateBulk(req, res) {
     console.error("BULK SEND ERROR:", err);
     res.status(500).json({ error: err.response?.data || err.message });
   }
+}
+
+// For getting bulk-progress of template sending
+export function getBulkProgress(req, res) {
+  const { user_id, templateId } = req.query;
+  const key = `${user_id}_${templateId}`;
+
+  const progress = bulkProgress.get(key);
+
+  if (!progress) {
+    return res.json({ completed: 0, total: 0 });
+  }
+
+  // console.log({ progress });
+
+  res.json(progress);
 }
 
 export async function uploadMedia(req, res) {
