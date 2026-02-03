@@ -21,17 +21,25 @@ export const createCampaign = async (req, res) => {
     } = req.body;
 
     // Validate required fields
-    if (!user_id || !campaign_name || !group_id || !wt_id || !account_id || !scheduled_at) {
+    if (
+      !user_id ||
+      !campaign_name ||
+      !group_id ||
+      !wt_id ||
+      !account_id ||
+      !scheduled_at
+    ) {
       return res.status(400).json({
         success: false,
-        error: "Missing required fields: user_id, campaign_name, group_id, wt_id, account_id, scheduled_at",
+        error:
+          "Missing required fields: user_id, campaign_name, group_id, wt_id, account_id, scheduled_at",
       });
     }
 
     // Check if scheduled_at is in the future
     const scheduledDate = new Date(scheduled_at);
     const now = new Date();
-    
+
     if (scheduledDate <= now) {
       return res.status(400).json({
         success: false,
@@ -126,7 +134,8 @@ export const getCampaigns = async (req, res) => {
     // Get campaigns with relations using foreign keys
     const { data: campaigns, error } = await supabase
       .from("campaigns")
-      .select(`
+      .select(
+        `
         *,
         groups!fk_campaigns_group_id (
           group_name,
@@ -142,7 +151,8 @@ export const getCampaigns = async (req, res) => {
         whatsapp_accounts!fk_campaigns_account_id (
           business_phone_number
         )
-      `)
+      `,
+      )
       .eq("user_id", user_id)
       .order("created_at", { ascending: false });
 
@@ -182,7 +192,8 @@ export const getCampaignById = async (req, res) => {
     // Get campaign details with relations
     const { data: campaign, error: campaignError } = await supabase
       .from("campaigns")
-      .select(`
+      .select(
+        `
         *,
         groups!fk_campaigns_group_id (
           group_name,
@@ -200,7 +211,8 @@ export const getCampaignById = async (req, res) => {
         whatsapp_accounts!fk_campaigns_account_id (
           business_phone_number
         )
-      `)
+      `,
+      )
       .eq("campaign_id", campaign_id)
       .eq("user_id", user_id)
       .single();
@@ -250,6 +262,226 @@ export const getCampaignById = async (req, res) => {
     });
   }
 };
+
+// export const getCampaignById = async (req, res) => {
+//   try {
+//     const { campaign_id } = req.params;
+//     const { user_id } = req.query;
+
+//     if (!user_id) {
+//       return res.status(400).json({
+//         success: false,
+//         error: "user_id is required",
+//       });
+//     }
+
+//     /* -------------------------------------
+//        1. Fetch campaign
+//     ------------------------------------- */
+//     const { data: campaign, error: campaignError } = await supabase
+//       .from("campaigns")
+//       .select(
+//         `
+//         *,
+//         groups!fk_campaigns_group_id (
+//           group_name,
+//           description,
+//           status
+//         ),
+//         whatsapp_templates!fk_campaigns_wt_id (
+//           name,
+//           category,
+//           language,
+//           components,
+//           preview,
+//           template_id
+//         ),
+//         whatsapp_accounts!fk_campaigns_account_id (
+//           business_phone_number
+//         )
+//       `,
+//       )
+//       .eq("campaign_id", campaign_id)
+//       .eq("user_id", user_id)
+//       .single();
+
+//     if (campaignError) throw campaignError;
+//     if (!campaign) {
+//       return res.status(404).json({
+//         success: false,
+//         error: "Campaign not found",
+//       });
+//     }
+
+//     /* -------------------------------------
+//        2. Fetch campaign messages
+//     ------------------------------------- */
+//     const { data: campaignMessages, error: cmError } = await supabase
+//       .from("campaign_messages")
+//       .select("*")
+//       .eq("campaign_id", campaign_id)
+//       .order("created_at", { ascending: false });
+
+//     if (cmError) throw cmError;
+
+//     if (!campaignMessages || campaignMessages.length === 0) {
+//       return res.status(200).json({
+//         success: true,
+//         data: {
+//           campaign,
+//           messages: [],
+//           stats: {
+//             total: 0,
+//             pending: 0,
+//             sent: 0,
+//             delivered: 0,
+//             read: 0,
+//             failed: 0,
+//           },
+//         },
+//       });
+//     }
+
+//     /* -------------------------------------
+//        3. Fetch whatsapp_messages (source of truth)
+//     ------------------------------------- */
+//     const wmIds = campaignMessages.map((m) => m.wm_id).filter(Boolean);
+
+//     const { data: whatsappMessages, error: wmError } = await supabase
+//       .from("whatsapp_messages")
+//       .select("wm_id, status, delivered_at, read_at")
+//       .in("wm_id", wmIds);
+
+//     if (wmError) throw wmError;
+
+//     const wmMap = new Map();
+//     whatsappMessages.forEach((wm) => {
+//       wmMap.set(wm.wm_id, wm);
+//     });
+
+//     /* -------------------------------------
+//        4. Merge delivery/read info
+//     ------------------------------------- */
+//     // const mergedMessages = campaignMessages.map((cm) => {
+//     //   const wm = wmMap.get(cm.wm_id);
+
+//     //   if (!wm) return cm;
+
+//     //   return {
+//     //     ...cm,
+//     //     status: wm.status || cm.status,
+//     //     delivered_at: wm.delivered_at || cm.delivered_at,
+//     //     read_at: wm.read_at || cm.read_at,
+//     //   };
+//     // });
+
+//     const mergedMessages = campaignMessages.map((cm) => {
+//       const wm = wmMap.get(cm.wm_id);
+//       if (!wm) return cm;
+
+//       return {
+//         ...cm,
+//         status: wm.status, // 🔥 ALWAYS trust whatsapp_messages
+//         delivered_at: wm.delivered_at,
+//         read_at: wm.read_at,
+//         failed_at:
+//           wm.status === "failed"
+//             ? cm.failed_at || new Date().toISOString()
+//             : cm.failed_at,
+//       };
+//     });
+
+//     /* -------------------------------------
+//        5. (OPTIONAL BUT RECOMMENDED)
+//        Sync delivery/read back to campaign_messages
+//     ------------------------------------- */
+//     // const updates = mergedMessages.filter(
+//     //   (m) =>
+//     //     m.wm_id &&
+//     //     (m.delivered_at || m.read_at) &&
+//     //     (m.delivered_at !==
+//     //       campaignMessages.find((x) => x.cm_id === m.cm_id)?.delivered_at ||
+//     //       m.read_at !==
+//     //         campaignMessages.find((x) => x.cm_id === m.cm_id)?.read_at),
+//     // );
+
+//     // if (updates.length > 0) {
+//     //   await Promise.all(
+//     //     updates.map((m) =>
+//     //       supabase
+//     //         .from("campaign_messages")
+//     //         .update({
+//     //           status: m.status,
+//     //           delivered_at: m.delivered_at,
+//     //           read_at: m.read_at,
+//     //           updated_at: new Date().toISOString(),
+//     //         })
+//     //         .eq("cm_id", m.cm_id),
+//     //     ),
+//     //   );
+//     // }
+
+//     const updates = mergedMessages.filter((m) => {
+//       const original = campaignMessages.find((x) => x.cm_id === m.cm_id);
+
+//       if (!original) return false;
+
+//       return (
+//         m.status !== original.status || // ✅ status-only changes
+//         m.delivered_at !== original.delivered_at ||
+//         m.read_at !== original.read_at
+//       );
+//     });
+
+//     if (updates.length > 0) {
+//       await Promise.all(
+//         updates.map((m) =>
+//           supabase
+//             .from("campaign_messages")
+//             .update({
+//               status: m.status,
+//               delivered_at: m.delivered_at,
+//               read_at: m.read_at,
+//               failed_at: m.status === "failed" ? m.failed_at : null,
+//               updated_at: new Date().toISOString(),
+//             })
+//             .eq("cm_id", m.cm_id),
+//         ),
+//       );
+//     }
+
+//     /* -------------------------------------
+//        6. Calculate stats (final truth)
+//     ------------------------------------- */
+//     const stats = {
+//       total: mergedMessages.length,
+//       pending: mergedMessages.filter((m) => m.status === "pending").length,
+//       sent: mergedMessages.filter((m) => m.status === "sent").length,
+//       delivered: mergedMessages.filter((m) => m.status === "delivered").length,
+//       read: mergedMessages.filter((m) => m.status === "read").length,
+//       failed: mergedMessages.filter((m) => m.status === "failed").length,
+//     };
+
+//     /* -------------------------------------
+//        7. Response
+//     ------------------------------------- */
+//     return res.status(200).json({
+//       success: true,
+//       data: {
+//         campaign,
+//         messages: mergedMessages,
+//         stats,
+//       },
+//     });
+//   } catch (err) {
+//     console.error("getCampaignById error:", err);
+//     return res.status(500).json({
+//       success: false,
+//       error: "Failed to fetch campaign details",
+//       details: err.message,
+//     });
+//   }
+// };
 
 /* =====================================
    4️⃣ UPDATE CAMPAIGN (reschedule)
@@ -431,7 +663,11 @@ export const deleteCampaign = async (req, res) => {
     }
 
     // Can only delete scheduled or cancelled campaigns
-    if (!["scheduled", "cancelled", "completed", "failed"].includes(existing.status)) {
+    if (
+      !["scheduled", "cancelled", "completed", "failed"].includes(
+        existing.status,
+      )
+    ) {
       return res.status(400).json({
         success: false,
         error: `Cannot delete campaign with status: ${existing.status}`,
@@ -478,13 +714,15 @@ export const getUserGroups = async (req, res) => {
 
     const { data: groups, error } = await supabase
       .from("groups")
-      .select(`
+      .select(
+        `
         group_id,
         group_name,
         description,
         status,
         created_at
-      `)
+      `,
+      )
       .eq("user_id", user_id)
       .eq("status", "active")
       .order("created_at", { ascending: false });
@@ -503,7 +741,7 @@ export const getUserGroups = async (req, res) => {
           ...group,
           contact_count: contacts?.length || 0,
         };
-      })
+      }),
     );
 
     return res.status(200).json({
@@ -555,7 +793,8 @@ export const getUserTemplates = async (req, res) => {
     // Get templates for these accounts
     const { data: templates, error } = await supabase
       .from("whatsapp_templates")
-      .select(`
+      .select(
+        `
         wt_id,
         account_id,
         template_id,
@@ -568,7 +807,8 @@ export const getUserTemplates = async (req, res) => {
         buttons,
         preview,
         status
-      `)
+      `,
+      )
       .in("account_id", accountIds)
       .eq("status", "APPROVED")
       .order("created_at", { ascending: false });
@@ -585,6 +825,242 @@ export const getUserTemplates = async (req, res) => {
     return res.status(500).json({
       success: false,
       error: "Failed to fetch templates",
+      details: err.message,
+    });
+  }
+};
+
+// /* =====================================
+//    🔁 RETRY FAILED CAMPAIGN
+// ====================================== */
+
+// export const retryCampaign = async (req, res) => {
+//   try {
+//     const { campaign_id } = req.params;
+//     const { user_id } = req.body;
+
+//     if (!user_id) {
+//       return res.status(400).json({
+//         success: false,
+//         error: "user_id is required",
+//       });
+//     }
+
+//     /* -------------------------------------
+//        1. Validate campaign
+//     ------------------------------------- */
+//     const { data: campaign, error } = await supabase
+//       .from("campaigns")
+//       .select("campaign_id, status")
+//       .eq("campaign_id", campaign_id)
+//       .eq("user_id", user_id)
+//       .single();
+
+//     if (error || !campaign) {
+//       return res.status(404).json({
+//         success: false,
+//         error: "Campaign not found",
+//       });
+//     }
+
+//     if (!["completed", "failed"].includes(campaign.status)) {
+//       return res.status(400).json({
+//         success: false,
+//         error: `Cannot retry campaign with status: ${campaign.status}`,
+//       });
+//     }
+
+//     /* -------------------------------------
+//        2. Find failed messages
+//     ------------------------------------- */
+//     const { data: failedMessages, error: fmError } = await supabase
+//       .from("campaign_messages")
+//       .select("cm_id")
+//       .eq("campaign_id", campaign_id)
+//       .eq("status", "failed");
+
+//     if (fmError) throw fmError;
+
+//     if (!failedMessages || failedMessages.length === 0) {
+//       return res.status(400).json({
+//         success: false,
+//         error: "No failed messages to retry",
+//       });
+//     }
+
+//     const failedIds = failedMessages.map((m) => m.cm_id);
+
+//     /* -------------------------------------
+//        3. Reset failed → pending
+//     ------------------------------------- */
+//     await supabase
+//       .from("campaign_messages")
+//       .update({
+//         status: "pending",
+//         failed_at: null,
+//         error_message: null,
+//         error_code: null,
+//         updated_at: new Date().toISOString(),
+//       })
+//       .in("cm_id", failedIds);
+
+//     /* -------------------------------------
+//        4. Reset campaign status
+//     ------------------------------------- */
+//     await supabase
+//       .from("campaigns")
+//       .update({
+//         status: "scheduled",
+//         scheduled_at: new Date().toISOString(), // retry immediately
+//         messages_failed: 0,
+//         updated_at: new Date().toISOString(),
+//       })
+//       .eq("campaign_id", campaign_id);
+
+//     return res.status(200).json({
+//       success: true,
+//       message: `Retry started for ${failedIds.length} failed messages`,
+//       retry_count: failedIds.length,
+//     });
+//   } catch (err) {
+//     console.error("retryCampaign error:", err);
+//     return res.status(500).json({
+//       success: false,
+//       error: "Failed to retry campaign",
+//       details: err.message,
+//     });
+//   }
+// };
+
+/* =====================================
+   🔁 RETRY FAILED CAMPAIGN
+====================================== */
+
+export const retryCampaign = async (req, res) => {
+  try {
+    const { campaign_id } = req.params;
+    const { user_id } = req.body;
+
+    if (!user_id) {
+      return res.status(400).json({
+        success: false,
+        error: "user_id is required",
+      });
+    }
+
+    /* -------------------------------------
+       1. Validate campaign
+    ------------------------------------- */
+    const { data: campaign, error } = await supabase
+      .from("campaigns")
+      .select("campaign_id, status")
+      .eq("campaign_id", campaign_id)
+      .eq("user_id", user_id)
+      .single();
+
+    if (error || !campaign) {
+      return res.status(404).json({
+        success: false,
+        error: "Campaign not found",
+      });
+    }
+
+    if (campaign.status === "scheduled") {
+      return res.status(400).json({
+        success: false,
+        error: "Campaign is already scheduled. Please wait for it to run.",
+      });
+    }
+
+    if (campaign.status === "processing") {
+      return res.status(400).json({
+        success: false,
+        error: "Campaign is currently processing. Retry is not allowed.",
+      });
+    }
+
+    if (!["completed", "failed"].includes(campaign.status)) {
+      return res.status(400).json({
+        success: false,
+        error: `Retry not allowed for campaign status: ${campaign.status}`,
+      });
+    }
+
+    /* -------------------------------------
+       2. Find FAILED messages (retry < 3)
+    ------------------------------------- */
+    const { data: failedMessages, error: fmError } = await supabase
+      .from("campaign_messages")
+      .select("cm_id, retry_count")
+      .eq("campaign_id", campaign_id)
+      .eq("status", "failed")
+      .lt("retry_count", 3);
+
+    if (fmError) throw fmError;
+
+    if (!failedMessages || failedMessages.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: "No failed messages eligible for retry",
+      });
+    }
+
+    const failedIds = failedMessages.map((m) => m.cm_id);
+
+    /* -------------------------------------
+       3. Reset failed → pending
+    ------------------------------------- */
+    await supabase
+      .from("campaign_messages")
+      .update({
+        status: "pending",
+        failed_at: null,
+        error_message: null,
+        error_code: null,
+        updated_at: new Date().toISOString(),
+      })
+      .in("cm_id", failedIds);
+
+    /* -------------------------------------
+       4. Increment retry_count
+    ------------------------------------- */
+    for (const msg of failedMessages) {
+      await supabase
+        .from("campaign_messages")
+        .update({
+          retry_count: msg.retry_count + 1,
+        })
+        .eq("cm_id", msg.cm_id);
+    }
+
+    /* -------------------------------------
+       5. Schedule retry after 2 minutes
+    ------------------------------------- */
+    const RETRY_DELAY_MINUTES = 2;
+    const retryAt = new Date(
+      Date.now() + RETRY_DELAY_MINUTES * 60 * 1000,
+    ).toISOString();
+
+    await supabase
+      .from("campaigns")
+      .update({
+        status: "scheduled",
+        scheduled_at: retryAt,
+        messages_failed: 0,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("campaign_id", campaign_id);
+
+    return res.status(200).json({
+      success: true,
+      message: `Retry scheduled for ${failedIds.length} failed messages`,
+      retry_after_minutes: RETRY_DELAY_MINUTES,
+    });
+  } catch (err) {
+    console.error("retryCampaign error:", err);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to retry campaign",
       details: err.message,
     });
   }
