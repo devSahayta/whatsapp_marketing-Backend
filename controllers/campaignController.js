@@ -1065,3 +1065,137 @@ export const retryCampaign = async (req, res) => {
     });
   }
 };
+
+/* =====================================
+   🔄 SYNC CAMPAIGN MESSAGE STATUS
+===================================== */
+
+export const syncCampaignMessageStatus = async (req, res) => {
+  try {
+    const { campaign_id } = req.params;
+    const { user_id } = req.body;
+
+    if (!user_id) {
+      return res.status(400).json({
+        success: false,
+        error: "user_id is required",
+      });
+    }
+
+    /* -------------------------------------
+       1. Validate campaign
+    ------------------------------------- */
+    const { data: campaign, error: cError } = await supabase
+      .from("campaigns")
+      .select("campaign_id, status")
+      .eq("campaign_id", campaign_id)
+      .eq("user_id", user_id)
+      .single();
+
+    if (cError || !campaign) {
+      return res.status(404).json({
+        success: false,
+        error: "Campaign not found",
+      });
+    }
+
+    /* 🚫 IMPORTANT RULE */
+    if (campaign.status === "scheduled") {
+      return res.status(200).json({
+        success: true,
+        skipped: true,
+        message: "Campaign is scheduled. Sync skipped.",
+      });
+    }
+
+    /* -------------------------------------
+       2. Fetch campaign_messages
+    ------------------------------------- */
+    const { data: campaignMessages, error: cmError } = await supabase
+      .from("campaign_messages")
+      .select("cm_id, wm_id, status, delivered_at, read_at")
+      .eq("campaign_id", campaign_id);
+
+    if (cmError) throw cmError;
+
+    if (!campaignMessages || campaignMessages.length === 0) {
+      return res.status(200).json({
+        success: true,
+        message: "No campaign messages to sync",
+        updated: 0,
+      });
+    }
+
+    /* -------------------------------------
+       3. Fetch whatsapp_messages (truth)
+    ------------------------------------- */
+    const wmIds = campaignMessages.map((m) => m.wm_id).filter(Boolean);
+
+    const { data: whatsappMessages, error: wmError } = await supabase
+      .from("whatsapp_messages")
+      .select("wm_id, status, delivered_at, read_at")
+      .in("wm_id", wmIds);
+
+    if (wmError) throw wmError;
+
+    const wmMap = new Map();
+    whatsappMessages.forEach((wm) => wmMap.set(wm.wm_id, wm));
+
+    /* -------------------------------------
+       4. Detect changes
+    ------------------------------------- */
+    const updates = [];
+
+    for (const cm of campaignMessages) {
+      const wm = wmMap.get(cm.wm_id);
+      if (!wm) continue;
+
+      const statusChanged = wm.status && wm.status !== cm.status;
+      const deliveredChanged =
+        wm.delivered_at && wm.delivered_at !== cm.delivered_at;
+      const readChanged = wm.read_at && wm.read_at !== cm.read_at;
+
+      if (statusChanged || deliveredChanged || readChanged) {
+        updates.push({
+          cm_id: cm.cm_id,
+          status: wm.status,
+          delivered_at: wm.delivered_at,
+          read_at: wm.read_at,
+        });
+      }
+    }
+
+    /* -------------------------------------
+       5. Apply updates
+    ------------------------------------- */
+    await Promise.all(
+      updates.map((u) =>
+        supabase
+          .from("campaign_messages")
+          .update({
+            status: u.status,
+            delivered_at: u.delivered_at,
+            read_at: u.read_at,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("cm_id", u.cm_id),
+      ),
+    );
+
+    return res.status(200).json({
+      success: true,
+      updated: updates.length,
+      message:
+        updates.length > 0
+          ? "Campaign messages synced successfully"
+          : "No updates required",
+    });
+  } catch (err) {
+    console.error("syncCampaignMessageStatus error:", err);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to sync campaign messages",
+      details: err.message,
+    });
+  }
+};

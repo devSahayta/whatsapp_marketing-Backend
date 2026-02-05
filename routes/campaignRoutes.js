@@ -11,6 +11,7 @@ import {
   getUserGroups,
   getUserTemplates,
   retryCampaign,
+  syncCampaignMessageStatus,
 } from "../controllers/campaignController.js";
 
 const router = express.Router();
@@ -25,6 +26,9 @@ router.delete("/:campaign_id", deleteCampaign);
 
 // Retry failed messages
 router.post("/:campaign_id/retry", retryCampaign);
+
+// Sync Status for campagin message from whatsapp message
+router.post("/:campaign_id/sync-status", syncCampaignMessageStatus);
 
 // Helper endpoints for dropdowns
 router.get("/helpers/groups", getUserGroups); // Get user's groups
