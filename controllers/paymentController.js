@@ -103,7 +103,7 @@ export const verifyPayment = async (req, res) => {
       .single();
 
     // Activate subscription
-    await activateSubscription(payment.user_id, plan);
+    await activateSubscription(payment.user_id, plan, payment.payment_id);
 
     res.json({ success: true });
   } catch (err) {

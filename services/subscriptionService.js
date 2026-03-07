@@ -3,7 +3,7 @@ import { supabase } from "../config/supabase.js";
 /**
  * Create or Extend Subscription
  */
-export const activateSubscription = async (userId, plan) => {
+export const activateSubscription = async (userId, plan, paymentId) => {
   const now = new Date();
 
   // 1️⃣ Check existing subscription
@@ -43,6 +43,7 @@ export const activateSubscription = async (userId, plan) => {
         start_date: startDate,
         end_date: endDate,
         status: "active",
+        payment_id: paymentId, // Link payment to subscription
       })
       .eq("subscription_id", existingSub.subscription_id)
       .select()
@@ -65,6 +66,7 @@ export const activateSubscription = async (userId, plan) => {
         start_date: startDate,
         end_date: endDate,
         status: "active",
+        payment_id: paymentId, // Link payment to subscription
       })
       .select()
       .single();
