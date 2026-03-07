@@ -21,6 +21,7 @@ import flightTrackingRoutes from "./routes/flightRoutes.js";
 import analyticsRoutes from "./routes/analyticsRoutes.js";
 import campaignRoutes from "./routes/campaignRoutes.js";
 import { startCampaignScheduler } from "./scheduler/campaignScheduler.js";
+import paymentRoutes from "./routes/paymentRoutes.js";
 
 dotenv.config();
 
@@ -68,10 +69,10 @@ app.use("/api/knowledge-bases", knowledgeBaseRoutes);
 app.use("/api/analytics", analyticsRoutes);
 app.use("/api/campaigns", campaignRoutes);
 
+//Payment routes
+app.use("/api/payment", paymentRoutes);
+
 // Start scheduler
-
-
-
 
 //route for flight tracking
 // app.use("/api/flight-tracking", flightTrackingRoutes);
