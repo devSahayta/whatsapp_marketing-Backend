@@ -592,110 +592,228 @@ export async function sendTemplateBulk(req, res) {
     // --------------------------------------------
     // Loop each recipient with throttling
     // --------------------------------------------
-    for (const to of recipients) {
-      const payload = {
-        messaging_product: "whatsapp",
-        to: to,
-        type: "template",
-        template: {
-          name: template.name,
-          language: { code: template.language || "en_US" },
-          components: finalComponents,
-        },
-      };
+    // for (const to of recipients) {
+    //   const payload = {
+    //     messaging_product: "whatsapp",
+    //     to: to,
+    //     type: "template",
+    //     template: {
+    //       name: template.name,
+    //       language: { code: template.language || "en_US" },
+    //       components: finalComponents,
+    //     },
+    //   };
 
-      try {
-        const sendResp = await wsService.sendTemplateMessage(
-          phoneNumberId,
-          token,
-          payload,
-        );
+    //   try {
+    //     const sendResp = await wsService.sendTemplateMessage(
+    //       phoneNumberId,
+    //       token,
+    //       payload,
+    //     );
 
-        // Log success
-        const log = {
-          wm_id: uuidv4(),
-          account_id: account.wa_id,
-          to_number: to,
-          template_name: template.name,
-          message_body: payload,
-          wa_message_id: sendResp?.messages?.[0]?.id || null,
-          status: sendResp.error ? "FAILED" : "SENT",
-        };
+    //     // Log success
+    //     const log = {
+    //       wm_id: uuidv4(),
+    //       account_id: account.wa_id,
+    //       to_number: to,
+    //       template_name: template.name,
+    //       message_body: payload,
+    //       wa_message_id: sendResp?.messages?.[0]?.id || null,
+    //       status: sendResp.error ? "FAILED" : "SENT",
+    //     };
 
-        if (!sendResp.error) {
-          await supabase.from("whatsapp_messages").insert(log);
+    //     if (!sendResp.error) {
+    //       await supabase.from("whatsapp_messages").insert(log);
 
-          results.success.push({ to, id: log.wm_id });
-          // --------------------------------------------
-          // Render message text for DB
-          // --------------------------------------------
-          const renderedText = renderTemplateBody(template, finalComponents);
+    //       results.success.push({ to, id: log.wm_id });
+    //       // --------------------------------------------
+    //       // Render message text for DB
+    //       // --------------------------------------------
+    //       const renderedText = renderTemplateBody(template, finalComponents);
 
-          // --------------------------------------------
-          // Detect media (optional)
-          // --------------------------------------------
-          const headerComp = finalComponents.find((c) => c.type === "header");
+    //       // --------------------------------------------
+    //       // Detect media (optional)
+    //       // --------------------------------------------
+    //       const headerComp = finalComponents.find((c) => c.type === "header");
 
-          const mediaPath =
-            headerComp?.parameters?.[0]?.image?.id ||
-            headerComp?.parameters?.[0]?.video?.id ||
-            headerComp?.parameters?.[0]?.document?.id ||
-            null;
+    //       const mediaPath =
+    //         headerComp?.parameters?.[0]?.image?.id ||
+    //         headerComp?.parameters?.[0]?.video?.id ||
+    //         headerComp?.parameters?.[0]?.document?.id ||
+    //         null;
 
-          // --------------------------------------------
-          // Create / Update Chat
-          // --------------------------------------------
-          const chat = await getOrCreateChat({
-            phone_number: to,
-            user_id: user_id,
-          });
+    //       // --------------------------------------------
+    //       // Create / Update Chat
+    //       // --------------------------------------------
+    //       const chat = await getOrCreateChat({
+    //         phone_number: to,
+    //         user_id: user_id,
+    //       });
 
-          // --------------------------------------------
-          // Insert message
-          // --------------------------------------------
+    //       // --------------------------------------------
+    //       // Insert message
+    //       // --------------------------------------------
 
-          //checking if any button available in template
-          const buttons = extractTemplateButtons(template);
+    //       //checking if any button available in template
+    //       const buttons = extractTemplateButtons(template);
 
-          //write message
-          await supabase.from("messages").insert({
-            chat_id: chat.chat_id,
-            sender_type: "admin",
-            message: renderedText,
-            message_type: "template",
-            media_path: mediaPath,
-            buttons,
-            created_at: new Date(),
-          });
+    //       //write message
+    //       await supabase.from("messages").insert({
+    //         chat_id: chat.chat_id,
+    //         sender_type: "admin",
+    //         message: renderedText,
+    //         message_type: "template",
+    //         media_path: mediaPath,
+    //         buttons,
+    //         created_at: new Date(),
+    //       });
 
-          // --------------------------------------------
-          // Update chat last message
-          // --------------------------------------------
-          await supabase
-            .from("chats")
-            .update({
-              last_message: renderedText,
-              last_message_at: new Date(),
-            })
-            .eq("chat_id", chat.chat_id);
-        }
-      } catch (err) {
-        console.error("Send failed for:", to, err.message);
+    //       // --------------------------------------------
+    //       // Update chat last message
+    //       // --------------------------------------------
+    //       await supabase
+    //         .from("chats")
+    //         .update({
+    //           last_message: renderedText,
+    //           last_message_at: new Date(),
+    //         })
+    //         .eq("chat_id", chat.chat_id);
+    //     }
+    //   } catch (err) {
+    //     console.error("Send failed for:", to, err.message);
 
-        results.failed.push({
-          to,
-          error: err.response?.data || err.message,
-        });
-      } finally {
-        const prog = bulkProgress.get(progressKey);
-        if (prog) {
-          prog.completed += 1;
-          bulkProgress.set(progressKey, prog);
-        }
-      }
+    //     results.failed.push({
+    //       to,
+    //       error: err.response?.data || err.message,
+    //     });
+    //   } finally {
+    //     const prog = bulkProgress.get(progressKey);
+    //     if (prog) {
+    //       prog.completed += 1;
+    //       bulkProgress.set(progressKey, prog);
+    //     }
+    //   }
 
-      // Throttle to stay safe from Meta
-      await wait(350); // 300–400ms is ideal
+    //   // Throttle to stay safe from Meta
+    //   await wait(350); // 300–400ms is ideal
+    // }
+
+    const BATCH_SIZE = 40;
+
+    for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
+      const batch = recipients.slice(i, i + BATCH_SIZE);
+
+      await Promise.all(
+        batch.map(async (to) => {
+          const payload = {
+            messaging_product: "whatsapp",
+            to: to,
+            type: "template",
+            template: {
+              name: template.name,
+              language: { code: template.language || "en_US" },
+              components: finalComponents,
+            },
+          };
+
+          try {
+            const sendResp = await wsService.sendTemplateMessage(
+              phoneNumberId,
+              token,
+              payload,
+            );
+
+            // Log success
+            const log = {
+              wm_id: uuidv4(),
+              account_id: account.wa_id,
+              to_number: to,
+              template_name: template.name,
+              message_body: payload,
+              wa_message_id: sendResp?.messages?.[0]?.id || null,
+              status: sendResp.error ? "FAILED" : "SENT",
+            };
+
+            if (!sendResp.error) {
+              await supabase.from("whatsapp_messages").insert(log);
+
+              results.success.push({ to, id: log.wm_id });
+              // --------------------------------------------
+              // Render message text for DB
+              // --------------------------------------------
+              const renderedText = renderTemplateBody(
+                template,
+                finalComponents,
+              );
+
+              // --------------------------------------------
+              // Detect media (optional)
+              // --------------------------------------------
+              const headerComp = finalComponents.find(
+                (c) => c.type === "header",
+              );
+
+              const mediaPath =
+                headerComp?.parameters?.[0]?.image?.id ||
+                headerComp?.parameters?.[0]?.video?.id ||
+                headerComp?.parameters?.[0]?.document?.id ||
+                null;
+
+              // --------------------------------------------
+              // Create / Update Chat
+              // --------------------------------------------
+              const chat = await getOrCreateChat({
+                phone_number: to,
+                user_id: user_id,
+              });
+
+              // --------------------------------------------
+              // Insert message
+              // --------------------------------------------
+
+              //checking if any button available in template
+              const buttons = extractTemplateButtons(template);
+
+              //write message
+              await supabase.from("messages").insert({
+                chat_id: chat.chat_id,
+                sender_type: "admin",
+                message: renderedText,
+                message_type: "template",
+                media_path: mediaPath,
+                buttons,
+                created_at: new Date(),
+              });
+
+              // --------------------------------------------
+              // Update chat last message
+              // --------------------------------------------
+              await supabase
+                .from("chats")
+                .update({
+                  last_message: renderedText,
+                  last_message_at: new Date(),
+                })
+                .eq("chat_id", chat.chat_id);
+            }
+          } catch (err) {
+            console.error("Send failed for:", to, err.message);
+
+            results.failed.push({
+              to,
+              error: err.response?.data || err.message,
+            });
+          } finally {
+            const prog = bulkProgress.get(progressKey);
+            if (prog) {
+              prog.completed += 1;
+              bulkProgress.set(progressKey, prog);
+            }
+          }
+        }),
+      );
+
+      await wait(400);
     }
 
     bulkProgress.delete(progressKey);
