@@ -35,7 +35,7 @@ app.use(
     origin: [
       "http://localhost:5173",
       "https://whatsapp-marketing-frontend-three.vercel.app",
-      "https://www.samvaadik.com",
+      "https://samvaadik.com",
     ],
     credentials: true,
   }),
