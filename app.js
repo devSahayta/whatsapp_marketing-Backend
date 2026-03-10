@@ -22,6 +22,7 @@ import analyticsRoutes from "./routes/analyticsRoutes.js";
 import campaignRoutes from "./routes/campaignRoutes.js";
 import { startCampaignScheduler } from "./scheduler/campaignScheduler.js";
 import paymentRoutes from "./routes/paymentRoutes.js";
+import mediaRoutes from './routes/mediaRoutes.js';
 
 dotenv.config();
 
@@ -71,6 +72,9 @@ app.use("/api/campaigns", campaignRoutes);
 
 //Payment routes
 app.use("/api/payment", paymentRoutes);
+
+//mediaforCampaigns
+app.use('/api/media', mediaRoutes);
 
 // Start scheduler
 

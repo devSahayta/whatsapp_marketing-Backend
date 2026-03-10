@@ -1,4 +1,4 @@
-// scheduler/campaignScheduler.js
+// scheduler/campaignScheduler.js - FIXED: Passing media_id correctly
 
 import cron from "node-cron";
 import { supabase } from "../config/supabase.js";
@@ -58,6 +58,11 @@ async function processCampaign(campaign) {
   console.log(`\n📤 Processing: ${campaign.campaign_name}`);
   console.log(`   Campaign ID: ${campaign.campaign_id}`);
   console.log(`   Scheduled: ${campaign.scheduled_at}`);
+  
+  // 🔥 Log media_id if present
+  if (campaign.media_id) {
+    console.log(`   📎 Media ID: ${campaign.media_id}`);
+  }
 
   try {
     // 1️⃣ Update status to processing
@@ -120,14 +125,16 @@ async function processCampaign(campaign) {
 
     for (const message of messages) {
       try {
+        // 🔥 PASS campaign.media_id here!
         const result = await sendWhatsAppMessage(
           account,
           template,
           message.phone_number,
           message.contact_name,
           campaign.group_id,
-          campaign.user_id,  // Add user_id
-          campaign.template_variables
+          campaign.user_id,
+          campaign.template_variables,
+          campaign.media_id  // ← Pass media_id from campaign!
         );
 
         // Update campaign_messages
@@ -179,8 +186,26 @@ async function processCampaign(campaign) {
   }
 }
 
-async function sendWhatsAppMessage(account, template, phoneNumber, contactName, groupId, userId, variables) {
+/* =====================================
+   🔧 SEND WHATSAPP MESSAGE
+   Now handles media templates!
+====================================== */
+
+async function sendWhatsAppMessage(account, template, phoneNumber, contactName, groupId, userId, variables, campaignMediaId) {
   try {
+    console.log(`   📞 Preparing message for ${phoneNumber}`);
+    
+    // Parse template components
+    let templateComponents = template.components;
+    if (typeof templateComponents === 'string') {
+      try {
+        templateComponents = JSON.parse(templateComponents);
+      } catch (e) {
+        console.log('   ⚠️  Failed to parse template components');
+        templateComponents = [];
+      }
+    }
+
     // Build template message
     const messageBody = {
       messaging_product: "whatsapp",
@@ -193,7 +218,58 @@ async function sendWhatsAppMessage(account, template, phoneNumber, contactName, 
       },
     };
 
-    // Add variables if needed
+    // ========================================
+    // 🎨 HANDLE MEDIA HEADER (IMAGE/VIDEO/DOCUMENT)
+    // ========================================
+    const headerComponent = templateComponents.find(comp => comp.type === 'HEADER');
+    
+    if (headerComponent && headerComponent.format) {
+      const format = headerComponent.format.toUpperCase();
+      
+      if (['IMAGE', 'VIDEO', 'DOCUMENT'].includes(format)) {
+        console.log(`   🖼️  Media template detected: ${format}`);
+        
+        // 🔥 USE CAMPAIGN'S SELECTED MEDIA_ID
+        const mediaId = campaignMediaId;
+        
+        if (!mediaId) {
+          throw new Error(`Media ${format} template requires media_id but campaign has none selected`);
+        }
+        
+        console.log(`   📎 Using campaign's media ID: ${mediaId}`);
+        
+        // Add header component with media
+        messageBody.template.components.push({
+          type: 'header',
+          parameters: [
+            {
+              type: format.toLowerCase(), // 'image', 'video', or 'document'
+              [format.toLowerCase()]: {
+                id: mediaId, // WhatsApp media ID from campaign
+              },
+            },
+          ],
+        });
+        
+        console.log(`   ✅ Added ${format} header with media ID: ${mediaId}`);
+      } else if (format === 'TEXT' && headerComponent.example) {
+        // Handle TEXT header with variables
+        const headerText = headerComponent.example.header_text || [];
+        if (headerText.length > 0) {
+          messageBody.template.components.push({
+            type: 'header',
+            parameters: headerText.map(text => ({
+              type: 'text',
+              text: text,
+            })),
+          });
+        }
+      }
+    }
+
+    // ========================================
+    // 📝 HANDLE BODY VARIABLES
+    // ========================================
     if (variables && Object.keys(variables).length > 0) {
       const parameters = Object.values(variables).map((value) => ({
         type: "text",
@@ -204,7 +280,11 @@ async function sendWhatsAppMessage(account, template, phoneNumber, contactName, 
         type: "body",
         parameters: parameters,
       });
+      
+      console.log(`   📝 Added ${parameters.length} body variable(s)`);
     }
+
+    console.log(`   📤 Sending message payload:`, JSON.stringify(messageBody, null, 2));
 
     const phoneNumberId = account.phone_number_id;
     const accessToken = account.system_user_access_token;
@@ -245,11 +325,11 @@ async function sendWhatsAppMessage(account, template, phoneNumber, contactName, 
 
     console.log(`   💾 Stored in whatsapp_messages: ${wmRecord.wm_id}`);
 
-    // 2️⃣ Find or create chat (FIXED: Now updates existing chats)
+    // 2️⃣ Find or create chat
     const chatId = await findOrCreateChat(phoneNumber, contactName, groupId, userId);
     console.log(`   💬 Chat ID: ${chatId}`);
 
-    // 3️⃣ Store in messages table (for chat dashboard)
+    // 3️⃣ Store in messages table
     const { data: messageRecord, error: msgError } = await supabase
       .from("messages")
       .insert({
@@ -275,17 +355,16 @@ async function sendWhatsAppMessage(account, template, phoneNumber, contactName, 
   } catch (err) {
     console.error("WhatsApp API Error:", err.response?.data || err.message);
     throw new Error(
-      err.response?.data?.error?.message || "Failed to send message"
+      err.response?.data?.error?.message || err.message || "Failed to send message"
     );
   }
 }
 
 /* =====================================
-   HELPER: FIND OR CREATE CHAT (FIXED)
+   HELPER: FIND OR CREATE CHAT
 ====================================== */
 
 async function findOrCreateChat(phoneNumber, contactName, groupId, userId) {
-  // First, try to find existing chat by phone number and user_id
   const { data: existingChats } = await supabase
     .from("chats")
     .select("chat_id, group_id, person_name")
@@ -298,23 +377,21 @@ async function findOrCreateChat(phoneNumber, contactName, groupId, userId) {
     const existingChat = existingChats[0];
     console.log(`   🔄 Updating existing chat: ${existingChat.chat_id}`);
     
-    // Update the existing chat with new message and group_id
     await supabase
       .from("chats")
       .update({
         last_message: "Template message sent via campaign",
         last_message_at: new Date().toISOString(),
         last_admin_message_at: new Date().toISOString(),
-        group_id: groupId, // Update group_id
+        group_id: groupId,
         person_name: contactName || existingChat.person_name || "Unknown",
-        updated_at: new Date().toISOString()// Update name if provided
+        updated_at: new Date().toISOString()
       })
       .eq("chat_id", existingChat.chat_id);
 
     return existingChat.chat_id;
   }
 
-  // If no chat exists, create a new one
   console.log(`   🆕 Creating new chat for ${phoneNumber}`);
   
   const { data: newChat, error } = await supabase
@@ -352,7 +429,6 @@ function extractTemplateText(template) {
       return `Template: ${template.name}`;
     }
 
-    // Try parsing if it's a JSON string
     let components = template.components;
     if (typeof components === 'string') {
       try {
@@ -391,8 +467,6 @@ async function markCampaignCompleted(campaignId, sent, failed) {
     })
     .eq("campaign_id", campaignId);
 }
-
-
 
 /* =====================================
    HELPER: SLEEP

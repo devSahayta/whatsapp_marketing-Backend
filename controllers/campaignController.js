@@ -6,6 +6,8 @@ import { supabase } from "../config/supabase.js";
    1️⃣ CREATE CAMPAIGN
 ====================================== */
 
+// controllers/campaignController.js - UPDATE CREATE CAMPAIGN
+
 export const createCampaign = async (req, res) => {
   try {
     const {
@@ -18,6 +20,7 @@ export const createCampaign = async (req, res) => {
       scheduled_at,
       timezone,
       template_variables,
+      media_id,
     } = req.body;
 
     // Validate required fields
@@ -47,25 +50,91 @@ export const createCampaign = async (req, res) => {
       });
     }
 
-    // Get total recipients count
-    const { data: contacts, error: contactsError } = await supabase
+    // Validate media if template requires it
+    const { data: template } = await supabase
+      .from("whatsapp_templates")
+      .select("components")
+      .eq("wt_id", wt_id)
+      .single();
+
+    if (template) {
+      let components = template.components;
+      if (typeof components === "string") {
+        components = JSON.parse(components);
+      }
+
+      const headerComp = components.find((c) => c.type === "HEADER");
+      const hasMedia =
+        headerComp &&
+        ["IMAGE", "VIDEO", "DOCUMENT"].includes(headerComp.format);
+
+      if (hasMedia && !media_id) {
+        return res.status(400).json({
+          success: false,
+          error: `This template requires ${headerComp.format} media. Please select or upload media.`,
+        });
+      }
+    }
+
+    console.log(`📊 Fetching contacts for group: ${group_id}`);
+
+    // 🔥 STEP 1: Get total count first (fast, no data fetched)
+    const { count: totalContacts, error: countError } = await supabase
       .from("group_contacts")
-      .select("contact_id, phone_number, full_name")
+      .select("contact_id", { count: "exact", head: true })
       .eq("group_id", group_id)
       .eq("user_id", user_id);
 
-    if (contactsError) throw contactsError;
+    if (countError) throw countError;
 
-    const totalRecipients = contacts?.length || 0;
+    console.log(`✅ Total contacts in group: ${totalContacts}`);
 
-    if (totalRecipients === 0) {
+    if (totalContacts === 0) {
       return res.status(400).json({
         success: false,
         error: "No contacts found in this group",
       });
     }
 
-    // Create campaign
+    // 🔥 STEP 2: Fetch ALL contacts using pagination
+    let allContacts = [];
+    let page = 0;
+    const pageSize = 1000;
+    let hasMore = true;
+
+    while (hasMore) {
+      const { data: contacts, error: contactsError } = await supabase
+        .from("group_contacts")
+        .select("contact_id, phone_number, full_name")
+        .eq("group_id", group_id)
+        .eq("user_id", user_id)
+        .range(page * pageSize, (page + 1) * pageSize - 1);
+
+      if (contactsError) throw contactsError;
+
+      if (contacts && contacts.length > 0) {
+        allContacts = allContacts.concat(contacts);
+        console.log(
+          `📄 Fetched page ${page + 1}: ${contacts.length} contacts (Total so far: ${allContacts.length})`
+        );
+        page++;
+      }
+
+      // Stop if we got fewer contacts than pageSize (last page)
+      if (!contacts || contacts.length < pageSize) {
+        hasMore = false;
+      }
+    }
+
+    console.log(`✅ Total contacts fetched: ${allContacts.length}`);
+
+    if (allContacts.length !== totalContacts) {
+      console.warn(
+        `⚠️ Mismatch: Expected ${totalContacts}, got ${allContacts.length}`
+      );
+    }
+
+    // 🔥 STEP 3: Create campaign with accurate count
     const { data: campaign, error: campaignError } = await supabase
       .from("campaigns")
       .insert({
@@ -78,33 +147,60 @@ export const createCampaign = async (req, res) => {
         scheduled_at,
         timezone: timezone || "UTC",
         template_variables: template_variables || {},
+        media_id: media_id || null,
         status: "scheduled",
-        total_recipients: totalRecipients,
+        total_recipients: allContacts.length, // ✅ Use actual count (2137)
       })
       .select()
       .single();
 
     if (campaignError) throw campaignError;
 
-    // Create campaign_messages entries for each contact (pending status)
-    const campaignMessages = contacts.map((contact) => ({
-      campaign_id: campaign.campaign_id,
-      contact_id: contact.contact_id,
-      phone_number: contact.phone_number,
-      contact_name: contact.full_name,
-      status: "pending",
-    }));
+    console.log(`📤 Campaign created: ${campaign.campaign_id}`);
+    console.log(`👥 Creating ${allContacts.length} campaign messages...`);
 
-    const { error: messagesError } = await supabase
-      .from("campaign_messages")
-      .insert(campaignMessages);
+    // 🔥 STEP 4: Insert campaign messages in BATCHES
+    const batchSize = 1000;
+    let insertedCount = 0;
 
-    if (messagesError) throw messagesError;
+    for (let i = 0; i < allContacts.length; i += batchSize) {
+      const batch = allContacts.slice(i, i + batchSize);
+
+      const campaignMessages = batch.map((contact) => ({
+        campaign_id: campaign.campaign_id,
+        contact_id: contact.contact_id,
+        phone_number: contact.phone_number,
+        contact_name: contact.full_name,
+        status: "pending",
+      }));
+
+      const { error: messagesError } = await supabase
+        .from("campaign_messages")
+        .insert(campaignMessages);
+
+      if (messagesError) {
+        console.error(
+          `❌ Error inserting batch ${i / batchSize + 1}:`,
+          messagesError
+        );
+        throw messagesError;
+      }
+
+      insertedCount += batch.length;
+      console.log(
+        `✅ Inserted batch ${i / batchSize + 1}: ${batch.length} messages (Total: ${insertedCount}/${allContacts.length})`
+      );
+    }
+
+    console.log(`✅ All ${insertedCount} campaign messages created!`);
 
     return res.status(201).json({
       success: true,
       message: "Campaign created successfully",
-      data: campaign,
+      data: {
+        ...campaign,
+        total_contacts_processed: insertedCount,
+      },
     });
   } catch (err) {
     console.error("createCampaign error:", err);
@@ -730,7 +826,7 @@ export const getUserGroups = async (req, res) => {
         description,
         status,
         created_at
-      `,
+      `
       )
       .eq("user_id", user_id)
       .eq("status", "active")
@@ -738,19 +834,23 @@ export const getUserGroups = async (req, res) => {
 
     if (error) throw error;
 
-    // Get contact count for each group
+    // 🔥 FIXED: Use .count() for accurate contact count (no 1000 limit)
     const groupsWithCounts = await Promise.all(
       (groups || []).map(async (group) => {
-        const { data: contacts } = await supabase
+        const { count, error: countError } = await supabase
           .from("group_contacts")
-          .select("contact_id")
+          .select("contact_id", { count: "exact", head: true })
           .eq("group_id", group.group_id);
+
+        if (countError) {
+          console.error(`Error counting contacts for group ${group.group_id}:`, countError);
+        }
 
         return {
           ...group,
-          contact_count: contacts?.length || 0,
+          contact_count: count || 0, // ✅ Shows 2137 instead of 1000
         };
-      }),
+      })
     );
 
     return res.status(200).json({
@@ -838,108 +938,6 @@ export const getUserTemplates = async (req, res) => {
     });
   }
 };
-
-// /* =====================================
-//    🔁 RETRY FAILED CAMPAIGN
-// ====================================== */
-
-// export const retryCampaign = async (req, res) => {
-//   try {
-//     const { campaign_id } = req.params;
-//     const { user_id } = req.body;
-
-//     if (!user_id) {
-//       return res.status(400).json({
-//         success: false,
-//         error: "user_id is required",
-//       });
-//     }
-
-//     /* -------------------------------------
-//        1. Validate campaign
-//     ------------------------------------- */
-//     const { data: campaign, error } = await supabase
-//       .from("campaigns")
-//       .select("campaign_id, status")
-//       .eq("campaign_id", campaign_id)
-//       .eq("user_id", user_id)
-//       .single();
-
-//     if (error || !campaign) {
-//       return res.status(404).json({
-//         success: false,
-//         error: "Campaign not found",
-//       });
-//     }
-
-//     if (!["completed", "failed"].includes(campaign.status)) {
-//       return res.status(400).json({
-//         success: false,
-//         error: `Cannot retry campaign with status: ${campaign.status}`,
-//       });
-//     }
-
-//     /* -------------------------------------
-//        2. Find failed messages
-//     ------------------------------------- */
-//     const { data: failedMessages, error: fmError } = await supabase
-//       .from("campaign_messages")
-//       .select("cm_id")
-//       .eq("campaign_id", campaign_id)
-//       .eq("status", "failed");
-
-//     if (fmError) throw fmError;
-
-//     if (!failedMessages || failedMessages.length === 0) {
-//       return res.status(400).json({
-//         success: false,
-//         error: "No failed messages to retry",
-//       });
-//     }
-
-//     const failedIds = failedMessages.map((m) => m.cm_id);
-
-//     /* -------------------------------------
-//        3. Reset failed → pending
-//     ------------------------------------- */
-//     await supabase
-//       .from("campaign_messages")
-//       .update({
-//         status: "pending",
-//         failed_at: null,
-//         error_message: null,
-//         error_code: null,
-//         updated_at: new Date().toISOString(),
-//       })
-//       .in("cm_id", failedIds);
-
-//     /* -------------------------------------
-//        4. Reset campaign status
-//     ------------------------------------- */
-//     await supabase
-//       .from("campaigns")
-//       .update({
-//         status: "scheduled",
-//         scheduled_at: new Date().toISOString(), // retry immediately
-//         messages_failed: 0,
-//         updated_at: new Date().toISOString(),
-//       })
-//       .eq("campaign_id", campaign_id);
-
-//     return res.status(200).json({
-//       success: true,
-//       message: `Retry started for ${failedIds.length} failed messages`,
-//       retry_count: failedIds.length,
-//     });
-//   } catch (err) {
-//     console.error("retryCampaign error:", err);
-//     return res.status(500).json({
-//       success: false,
-//       error: "Failed to retry campaign",
-//       details: err.message,
-//     });
-//   }
-// };
 
 /* =====================================
    🔁 RETRY FAILED CAMPAIGN
