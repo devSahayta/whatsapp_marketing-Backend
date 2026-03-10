@@ -1,4 +1,4 @@
-// scheduler/campaignScheduler.js - FIXED: Passing media_id correctly
+// scheduler/campaignScheduler.js - OPTIMIZED FOR 2137+ CONTACTS
 
 import cron from "node-cron";
 import { supabase } from "../config/supabase.js";
@@ -54,12 +54,19 @@ async function checkAndSendCampaigns() {
   }
 }
 
+/* =====================================
+   🔥 OPTIMIZED: Process Campaign
+   - Handles 2137+ contacts
+   - Batch processing (parallel)
+   - Pagination for fetching
+   - Progress tracking
+   - Resumable
+====================================== */
+
 async function processCampaign(campaign) {
   console.log(`\n📤 Processing: ${campaign.campaign_name}`);
   console.log(`   Campaign ID: ${campaign.campaign_id}`);
   console.log(`   Scheduled: ${campaign.scheduled_at}`);
-  
-  // 🔥 Log media_id if present
   if (campaign.media_id) {
     console.log(`   📎 Media ID: ${campaign.media_id}`);
   }
@@ -76,105 +83,183 @@ async function processCampaign(campaign) {
 
     console.log("   Status: PROCESSING");
 
-    // 2️⃣ Get pending messages
-    const { data: messages, error: msgError } = await supabase
+    // 2️⃣ Get total pending count
+    const { count: totalPending, error: countError } = await supabase
       .from("campaign_messages")
-      .select("*")
+      .select("cm_id", { count: "exact", head: true })
       .eq("campaign_id", campaign.campaign_id)
       .eq("status", "pending");
 
-    if (msgError) throw msgError;
+    if (countError) throw countError;
 
-    if (!messages || messages.length === 0) {
+    console.log(`   📊 Total pending messages: ${totalPending}`);
+
+    if (totalPending === 0) {
       console.log("   ⚠️  No pending messages");
-      await markCampaignCompleted(campaign.campaign_id, 0, 0);
+      
+      // Get current counts
+      const { count: sentCount } = await supabase
+        .from("campaign_messages")
+        .select("cm_id", { count: "exact", head: true })
+        .eq("campaign_id", campaign.campaign_id)
+        .eq("status", "sent");
+
+      const { count: failedCount } = await supabase
+        .from("campaign_messages")
+        .select("cm_id", { count: "exact", head: true })
+        .eq("campaign_id", campaign.campaign_id)
+        .eq("status", "failed");
+
+      await markCampaignCompleted(campaign.campaign_id, sentCount || 0, failedCount || 0);
       return;
     }
 
-    console.log(`   Recipients: ${messages.length}`);
+    // 3️⃣ Fetch ALL pending messages with pagination
+    let allMessages = [];
+    let page = 0;
+    const pageSize = 1000;
 
-    // 3️⃣ Get template
-    const { data: template } = await supabase
+    while (true) {
+      const { data: messages, error: msgError } = await supabase
+        .from("campaign_messages")
+        .select("*")
+        .eq("campaign_id", campaign.campaign_id)
+        .eq("status", "pending")
+        .range(page * pageSize, (page + 1) * pageSize - 1);
+
+      if (msgError) throw msgError;
+
+      if (!messages || messages.length === 0) break;
+
+      allMessages = allMessages.concat(messages);
+      console.log(`   📄 Fetched page ${page + 1}: ${messages.length} messages (Total: ${allMessages.length})`);
+
+      if (messages.length < pageSize) break;
+      page++;
+    }
+
+    console.log(`   ✅ Total messages to send: ${allMessages.length}`);
+
+    // 4️⃣ Get template
+    const { data: template, error: templateError } = await supabase
       .from("whatsapp_templates")
       .select("*")
       .eq("wt_id", campaign.wt_id)
       .single();
 
-    if (!template) {
+    if (templateError || !template) {
       throw new Error("Template not found");
     }
 
     console.log(`   Template: ${template.name}`);
 
-    // 4️⃣ Get account
-    const { data: account } = await supabase
+    // 5️⃣ Get account
+    const { data: account, error: accountError } = await supabase
       .from("whatsapp_accounts")
       .select("*")
       .eq("wa_id", campaign.account_id)
       .single();
 
-    if (!account) {
+    if (accountError || !account) {
       throw new Error("WhatsApp account not found");
     }
 
     console.log(`   Account: ${account.business_phone_number}`);
 
-    // 5️⃣ Send messages
+    // 6️⃣ Send messages in BATCHES (parallel processing)
     let sent = 0;
     let failed = 0;
 
-    for (const message of messages) {
-      try {
-        // 🔥 PASS campaign.media_id here!
-        const result = await sendWhatsAppMessage(
-          account,
-          template,
-          message.phone_number,
-          message.contact_name,
-          campaign.group_id,
-          campaign.user_id,
-          campaign.template_variables,
-          campaign.media_id  // ← Pass media_id from campaign!
-        );
+    const BATCH_SIZE = 10; // Send 10 messages in parallel
+    const BATCH_DELAY = 2000; // 2 seconds between batches
 
-        // Update campaign_messages
-        await supabase
-          .from("campaign_messages")
-          .update({
-            status: "sent",
-            sent_at: new Date().toISOString(),
-            wm_id: result.wm_id,
-            wa_message_id: result.wa_message_id,
-          })
-          .eq("cm_id", message.cm_id);
+    const totalBatches = Math.ceil(allMessages.length / BATCH_SIZE);
 
-        sent++;
-        console.log(`   ✅ Sent to ${message.phone_number}`);
-        await sleep(1000); // 1 second delay
-      } catch (err) {
-        await supabase
-          .from("campaign_messages")
-          .update({
-            status: "failed",
-            failed_at: new Date().toISOString(),
-            error_message: err.message,
-            error_code: err.code || "SEND_ERROR",
-          })
-          .eq("cm_id", message.cm_id);
+    for (let i = 0; i < allMessages.length; i += BATCH_SIZE) {
+      const batch = allMessages.slice(i, i + BATCH_SIZE);
+      const batchNumber = Math.floor(i / BATCH_SIZE) + 1;
 
-        failed++;
-        console.log(`   ❌ Failed: ${message.phone_number} - ${err.message}`);
+      console.log(`   📤 Sending batch ${batchNumber}/${totalBatches} (${batch.length} messages)...`);
+
+      // Send batch in parallel using Promise.allSettled
+      const results = await Promise.allSettled(
+        batch.map((message) =>
+          sendWhatsAppMessage(
+            account,
+            template,
+            message.phone_number,
+            message.contact_name,
+            campaign.group_id,
+            campaign.user_id,
+            campaign.template_variables,
+            campaign.media_id
+          )
+        )
+      );
+
+      // Process results and update database
+      for (let j = 0; j < results.length; j++) {
+        const result = results[j];
+        const message = batch[j];
+
+        if (result.status === "fulfilled") {
+          // Success
+          await supabase
+            .from("campaign_messages")
+            .update({
+              status: "sent",
+              sent_at: new Date().toISOString(),
+              wm_id: result.value.wm_id,
+              wa_message_id: result.value.wa_message_id,
+            })
+            .eq("cm_id", message.cm_id);
+
+          sent++;
+          console.log(`      ✅ ${message.phone_number}`);
+        } else {
+          // Failed
+          await supabase
+            .from("campaign_messages")
+            .update({
+              status: "failed",
+              failed_at: new Date().toISOString(),
+              error_message: result.reason?.message || "Unknown error",
+              error_code: result.reason?.code || "SEND_ERROR",
+            })
+            .eq("cm_id", message.cm_id);
+
+          failed++;
+          console.log(`      ❌ ${message.phone_number}: ${result.reason?.message}`);
+        }
+      }
+
+      // Update campaign progress after each batch
+      await supabase
+        .from("campaigns")
+        .update({
+          messages_sent: sent,
+          messages_failed: failed,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("campaign_id", campaign.campaign_id);
+
+      console.log(`   📊 Progress: ${sent + failed}/${allMessages.length} (Sent: ${sent}, Failed: ${failed})`);
+
+      // Delay between batches to avoid rate limiting
+      if (i + BATCH_SIZE < allMessages.length) {
+        await sleep(BATCH_DELAY);
       }
     }
 
-    // 6️⃣ Complete campaign
+    // 7️⃣ Complete campaign
     await markCampaignCompleted(campaign.campaign_id, sent, failed);
 
     console.log(`\n✅ Campaign completed!`);
+    console.log(`   Total: ${sent + failed}`);
     console.log(`   Sent: ${sent}`);
     console.log(`   Failed: ${failed}`);
   } catch (err) {
-    console.error(`❌ Campaign failed:`, err);
+    console.error(`❌ Campaign processing failed:`, err);
 
     await supabase
       .from("campaigns")
@@ -187,21 +272,27 @@ async function processCampaign(campaign) {
 }
 
 /* =====================================
-   🔧 SEND WHATSAPP MESSAGE
-   Now handles media templates!
+   SEND WHATSAPP MESSAGE (with media)
 ====================================== */
 
-async function sendWhatsAppMessage(account, template, phoneNumber, contactName, groupId, userId, variables, campaignMediaId) {
+async function sendWhatsAppMessage(
+  account,
+  template,
+  phoneNumber,
+  contactName,
+  groupId,
+  userId,
+  variables,
+  campaignMediaId
+) {
   try {
-    console.log(`   📞 Preparing message for ${phoneNumber}`);
-    
     // Parse template components
     let templateComponents = template.components;
-    if (typeof templateComponents === 'string') {
+    if (typeof templateComponents === "string") {
       try {
         templateComponents = JSON.parse(templateComponents);
       } catch (e) {
-        console.log('   ⚠️  Failed to parse template components');
+        console.log("   ⚠️  Failed to parse template components");
         templateComponents = [];
       }
     }
@@ -218,48 +309,41 @@ async function sendWhatsAppMessage(account, template, phoneNumber, contactName, 
       },
     };
 
-    // ========================================
-    // 🎨 HANDLE MEDIA HEADER (IMAGE/VIDEO/DOCUMENT)
-    // ========================================
-    const headerComponent = templateComponents.find(comp => comp.type === 'HEADER');
-    
+    // Handle MEDIA HEADER (IMAGE/VIDEO/DOCUMENT)
+    const headerComponent = templateComponents.find(
+      (comp) => comp.type === "HEADER"
+    );
+
     if (headerComponent && headerComponent.format) {
       const format = headerComponent.format.toUpperCase();
-      
-      if (['IMAGE', 'VIDEO', 'DOCUMENT'].includes(format)) {
-        console.log(`   🖼️  Media template detected: ${format}`);
-        
-        // 🔥 USE CAMPAIGN'S SELECTED MEDIA_ID
-        const mediaId = campaignMediaId;
-        
+
+      if (["IMAGE", "VIDEO", "DOCUMENT"].includes(format)) {
+        let mediaId = campaignMediaId;
+
         if (!mediaId) {
-          throw new Error(`Media ${format} template requires media_id but campaign has none selected`);
+          throw new Error(
+            `Media ${format} template requires media_id but campaign has none selected`
+          );
         }
-        
-        console.log(`   📎 Using campaign's media ID: ${mediaId}`);
-        
-        // Add header component with media
+
         messageBody.template.components.push({
-          type: 'header',
+          type: "header",
           parameters: [
             {
-              type: format.toLowerCase(), // 'image', 'video', or 'document'
+              type: format.toLowerCase(),
               [format.toLowerCase()]: {
-                id: mediaId, // WhatsApp media ID from campaign
+                id: mediaId,
               },
             },
           ],
         });
-        
-        console.log(`   ✅ Added ${format} header with media ID: ${mediaId}`);
-      } else if (format === 'TEXT' && headerComponent.example) {
-        // Handle TEXT header with variables
+      } else if (format === "TEXT" && headerComponent.example) {
         const headerText = headerComponent.example.header_text || [];
         if (headerText.length > 0) {
           messageBody.template.components.push({
-            type: 'header',
-            parameters: headerText.map(text => ({
-              type: 'text',
+            type: "header",
+            parameters: headerText.map((text) => ({
+              type: "text",
               text: text,
             })),
           });
@@ -267,9 +351,7 @@ async function sendWhatsAppMessage(account, template, phoneNumber, contactName, 
       }
     }
 
-    // ========================================
-    // 📝 HANDLE BODY VARIABLES
-    // ========================================
+    // Handle BODY VARIABLES
     if (variables && Object.keys(variables).length > 0) {
       const parameters = Object.values(variables).map((value) => ({
         type: "text",
@@ -280,11 +362,7 @@ async function sendWhatsAppMessage(account, template, phoneNumber, contactName, 
         type: "body",
         parameters: parameters,
       });
-      
-      console.log(`   📝 Added ${parameters.length} body variable(s)`);
     }
-
-    console.log(`   📤 Sending message payload:`, JSON.stringify(messageBody, null, 2));
 
     const phoneNumberId = account.phone_number_id;
     const accessToken = account.system_user_access_token;
@@ -304,9 +382,7 @@ async function sendWhatsAppMessage(account, template, phoneNumber, contactName, 
     const wa_message_id = response.data.messages?.[0]?.id;
     const templateText = extractTemplateText(template);
 
-    console.log(`   📱 WhatsApp Message ID: ${wa_message_id}`);
-
-    // 1️⃣ Store in whatsapp_messages table
+    // Store in whatsapp_messages table
     const { data: wmRecord, error: wmError } = await supabase
       .from("whatsapp_messages")
       .insert({
@@ -323,29 +399,16 @@ async function sendWhatsAppMessage(account, template, phoneNumber, contactName, 
 
     if (wmError) throw wmError;
 
-    console.log(`   💾 Stored in whatsapp_messages: ${wmRecord.wm_id}`);
-
-    // 2️⃣ Find or create chat
+    // Find or create chat
     const chatId = await findOrCreateChat(phoneNumber, contactName, groupId, userId);
-    console.log(`   💬 Chat ID: ${chatId}`);
 
-    // 3️⃣ Store in messages table
-    const { data: messageRecord, error: msgError } = await supabase
-      .from("messages")
-      .insert({
-        chat_id: chatId,
-        sender_type: "admin",
-        message: templateText,
-        message_type: "template",
-      })
-      .select()
-      .single();
-
-    if (msgError) {
-      console.log(`   ⚠️  Failed to store in messages table: ${msgError.message}`);
-    } else {
-      console.log(`   ✉️  Stored in messages table: ${messageRecord.message_id}`);
-    }
+    // Store in messages table
+    await supabase.from("messages").insert({
+      chat_id: chatId,
+      sender_type: "admin",
+      message: templateText,
+      message_type: "template",
+    });
 
     return {
       wm_id: wmRecord.wm_id,
@@ -361,7 +424,7 @@ async function sendWhatsAppMessage(account, template, phoneNumber, contactName, 
 }
 
 /* =====================================
-   HELPER: FIND OR CREATE CHAT
+   HELPER FUNCTIONS
 ====================================== */
 
 async function findOrCreateChat(phoneNumber, contactName, groupId, userId) {
@@ -375,8 +438,7 @@ async function findOrCreateChat(phoneNumber, contactName, groupId, userId) {
 
   if (existingChats && existingChats.length > 0) {
     const existingChat = existingChats[0];
-    console.log(`   🔄 Updating existing chat: ${existingChat.chat_id}`);
-    
+
     await supabase
       .from("chats")
       .update({
@@ -385,15 +447,13 @@ async function findOrCreateChat(phoneNumber, contactName, groupId, userId) {
         last_admin_message_at: new Date().toISOString(),
         group_id: groupId,
         person_name: contactName || existingChat.person_name || "Unknown",
-        updated_at: new Date().toISOString()
+        updated_at: new Date().toISOString(),
       })
       .eq("chat_id", existingChat.chat_id);
 
     return existingChat.chat_id;
   }
 
-  console.log(`   🆕 Creating new chat for ${phoneNumber}`);
-  
   const { data: newChat, error } = await supabase
     .from("chats")
     .insert({
@@ -405,23 +465,15 @@ async function findOrCreateChat(phoneNumber, contactName, groupId, userId) {
       mode: "AUTO",
       last_admin_message_at: new Date().toISOString(),
       user_id: userId,
-      updated_at: new Date().toISOString()
+      updated_at: new Date().toISOString(),
     })
     .select()
     .single();
 
-  if (error) {
-    console.log(`   ⚠️  Failed to create chat: ${error.message}`);
-    throw error;
-  }
+  if (error) throw error;
 
-  console.log(`   ✅ New chat created: ${newChat.chat_id}`);
   return newChat.chat_id;
 }
-
-/* =====================================
-   HELPER: EXTRACT TEMPLATE TEXT
-====================================== */
 
 function extractTemplateText(template) {
   try {
@@ -430,7 +482,7 @@ function extractTemplateText(template) {
     }
 
     let components = template.components;
-    if (typeof components === 'string') {
+    if (typeof components === "string") {
       try {
         components = JSON.parse(components);
       } catch (e) {
@@ -438,9 +490,7 @@ function extractTemplateText(template) {
       }
     }
 
-    const bodyComponent = components.find(
-      (comp) => comp.type === "BODY"
-    );
+    const bodyComponent = components.find((comp) => comp.type === "BODY");
 
     if (bodyComponent && bodyComponent.text) {
       return bodyComponent.text;
@@ -451,10 +501,6 @@ function extractTemplateText(template) {
     return `Template: ${template.name}`;
   }
 }
-
-/* =====================================
-   HELPER: MARK CAMPAIGN COMPLETED
-====================================== */
 
 async function markCampaignCompleted(campaignId, sent, failed) {
   await supabase
@@ -467,10 +513,6 @@ async function markCampaignCompleted(campaignId, sent, failed) {
     })
     .eq("campaign_id", campaignId);
 }
-
-/* =====================================
-   HELPER: SLEEP
-====================================== */
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
