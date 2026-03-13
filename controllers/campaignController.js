@@ -322,14 +322,32 @@ export const getCampaignById = async (req, res) => {
       });
     }
 
-    // Get campaign messages
-    const { data: messages, error: messagesError } = await supabase
-      .from("campaign_messages")
-      .select("*")
-      .eq("campaign_id", campaign_id)
-      .order("created_at", { ascending: false });
+    // Get campaign messages (FETCH ALL ROWS)
+let allMessages = [];
+let from = 0;
+const batchSize = 1000;
+let done = false;
 
-    if (messagesError) throw messagesError;
+while (!done) {
+  const { data, error } = await supabase
+    .from("campaign_messages")
+    .select("*")
+    .eq("campaign_id", campaign_id)
+    .order("created_at", { ascending: false })
+    .range(from, from + batchSize - 1);
+
+  if (error) throw error;
+
+  allMessages = [...allMessages, ...(data || [])];
+
+  if (!data || data.length < batchSize) {
+    done = true;
+  } else {
+    from += batchSize;
+  }
+}
+
+const messages = allMessages;
 
     // Calculate statistics
     // const stats = {

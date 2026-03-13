@@ -20,7 +20,7 @@ import agentRoutes from "./routes/agentRoutes.js";
 import flightTrackingRoutes from "./routes/flightRoutes.js";
 import analyticsRoutes from "./routes/analyticsRoutes.js";
 import campaignRoutes from "./routes/campaignRoutes.js";
-import { startCampaignScheduler } from "./scheduler/campaignScheduler.js";
+// import { startCampaignScheduler } from "./scheduler/campaignScheduler.js";
 import paymentRoutes from "./routes/paymentRoutes.js";
 import mediaRoutes from './routes/mediaRoutes.js';
 
@@ -89,4 +89,4 @@ app.get("/", (req, res) => res.send("API is running..."));
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
-startCampaignScheduler();
+// startCampaignScheduler();
