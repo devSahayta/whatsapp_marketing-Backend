@@ -70,24 +70,6 @@ export const handleIncomingMessage = async (req, res) => {
 
       console.log("📌 WA Status Update:", waMessageId, status);
 
-      // const updateData = {
-      //   status,
-      // };
-
-      // if (status === "sent") updateData.sent_at = timestamp;
-      // if (status === "delivered") updateData.delivered_at = timestamp;
-      // if (status === "read") updateData.read_at = timestamp;
-      // if (status === "failed") updateData.failed_at = timestamp;
-
-      // if (statusObj.errors) {
-      //   updateData.error_code = statusObj.errors.code || "unknown_error";
-      //   updateData.error_message =
-      //     statusObj?.errors.message ||
-      //     statusObj?.errors?.error_data.details ||
-      //     statusObj?.errors?.title ||
-      //     "Unknown error";
-      // }
-
       const updateData = {
         status,
       };
@@ -108,15 +90,6 @@ export const handleIncomingMessage = async (req, res) => {
           err?.title ||
           "Unknown error";
       }
-
-      // const { error } = await supabase
-      //   .from("whatsapp_messages")
-      //   .update(updateData)
-      //   .eq("wa_message_id", waMessageId);
-
-      // if (error) {
-      //   console.error("❌ Failed to update message status:", error);
-      // }
 
       // new logic to also update campaign_messages when whatsapp_messages is updated
       const { data: updatedMsg, error } = await supabase
