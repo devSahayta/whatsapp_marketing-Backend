@@ -1001,7 +1001,7 @@ export const retryCampaign = async (req, res) => {
       });
     }
 
-    if (campaign.status === "processing") {
+    if (campaign.status === 'processing' && campaign.started_at) {
       return res.status(400).json({
         success: false,
         error: "Campaign is currently processing. Retry is not allowed.",
@@ -1071,14 +1071,16 @@ export const retryCampaign = async (req, res) => {
     ).toISOString();
 
     await supabase
-      .from("campaigns")
-      .update({
-        status: "scheduled",
-        scheduled_at: retryAt,
-        messages_failed: 0,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("campaign_id", campaign_id);
+  .from("campaigns")
+  .update({
+    status: "scheduled",
+    scheduled_at: retryAt,
+    started_at: null,   // ⭐ VERY IMPORTANT
+    completed_at: null, // optional but recommended
+    messages_failed: 0,
+    updated_at: new Date().toISOString(),
+  })
+  .eq("campaign_id", campaign_id);
 
     return res.status(200).json({
       success: true,
