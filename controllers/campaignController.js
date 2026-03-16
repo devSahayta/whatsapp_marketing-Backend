@@ -324,31 +324,31 @@ export const getCampaignById = async (req, res) => {
     }
 
     // Get campaign messages (FETCH ALL ROWS)
-let allMessages = [];
-let from = 0;
-const batchSize = 1000;
-let done = false;
+    let allMessages = [];
+    let from = 0;
+    const batchSize = 1000;
+    let done = false;
 
-while (!done) {
-  const { data, error } = await supabase
-    .from("campaign_messages")
-    .select("*")
-    .eq("campaign_id", campaign_id)
-    .order("created_at", { ascending: false })
-    .range(from, from + batchSize - 1);
+    while (!done) {
+      const { data, error } = await supabase
+        .from("campaign_messages")
+        .select("*")
+        .eq("campaign_id", campaign_id)
+        .order("created_at", { ascending: false })
+        .range(from, from + batchSize - 1);
 
-  if (error) throw error;
+      if (error) throw error;
 
-  allMessages = [...allMessages, ...(data || [])];
+      allMessages = [...allMessages, ...(data || [])];
 
-  if (!data || data.length < batchSize) {
-    done = true;
-  } else {
-    from += batchSize;
-  }
-}
+      if (!data || data.length < batchSize) {
+        done = true;
+      } else {
+        from += batchSize;
+      }
+    }
 
-const messages = allMessages;
+    const messages = allMessages;
 
     // Calculate statistics
     // const stats = {
@@ -1128,7 +1128,6 @@ export const syncCampaignMessageStatus = async (req, res) => {
       });
     }
 
-    /* 🚫 IMPORTANT RULE */
     if (campaign.status === "scheduled") {
       return res.status(200).json({
         success: true,
@@ -1137,128 +1136,116 @@ export const syncCampaignMessageStatus = async (req, res) => {
       });
     }
 
-    // /* -------------------------------------
-    //    2. Fetch campaign_messages
-    // ------------------------------------- */
-    // const { data: campaignMessages, error: cmError } = await supabase
-    //   .from("campaign_messages")
-    //   .select("cm_id, wm_id, status, delivered_at, read_at")
-    //   .eq("campaign_id", campaign_id);
-
-    // if (cmError) throw cmError;
-
     /* -------------------------------------
-   2. Fetch campaign_messages (ALL ROWS)
-------------------------------------- */
+       2. Process in batches
+    ------------------------------------- */
 
-    let campaignMessages = [];
-    let from = 0;
-    const batchSize = 1000;
-    let done = false;
+    const batchSize = 500;
+    let offset = 0;
+    let totalUpdated = 0;
 
-    while (!done) {
-      const { data, error } = await supabase
+    while (true) {
+      const { data: campaignMessages, error } = await supabase
         .from("campaign_messages")
         .select("cm_id, wm_id, status, delivered_at, read_at")
         .eq("campaign_id", campaign_id)
-        .range(from, from + batchSize - 1);
+        .not("wm_id", "is", null)
+        .range(offset, offset + batchSize - 1);
 
       if (error) throw error;
 
-      if (data.length === 0) {
-        done = true;
-      } else {
-        campaignMessages = [...campaignMessages, ...data];
-        from += batchSize;
+      if (!campaignMessages.length) break;
+
+      const wmIds = campaignMessages.map((m) => m.wm_id);
+
+      /* -------------------------------------
+         3. Fetch whatsapp_messages
+      ------------------------------------- */
+
+      let whatsappMessages = [];
+      const chunkSize = 100;
+
+      for (let i = 0; i < wmIds.length; i += chunkSize) {
+        const chunk = wmIds.slice(i, i + chunkSize);
+
+        const { data, error } = await supabase
+          .from("whatsapp_messages")
+          .select("wm_id, status, delivered_at, read_at")
+          .in("wm_id", chunk);
+
+        if (error) throw error;
+
+        whatsappMessages.push(...data);
       }
 
-      if (data.length < batchSize) done = true;
-    }
+      // console.log("Batch size:", campaignMessages.length);
+      // console.log("wmIds count:", wmIds.length);
 
-    console.log(
-      `🔄 Total campaign messages fetched: ${campaignMessages.length}`,
-    );
+      const wmMap = new Map();
+      whatsappMessages.forEach((wm) => wmMap.set(wm.wm_id, wm));
 
-    if (!campaignMessages || campaignMessages.length === 0) {
-      return res.status(200).json({
-        success: true,
-        message: "No campaign messages to sync",
-        updated: 0,
-      });
-    }
+      /* -------------------------------------
+         4. Detect updates
+      ------------------------------------- */
 
-    /* -------------------------------------
-       3. Fetch whatsapp_messages (truth)
-    ------------------------------------- */
-    const wmIds = campaignMessages.map((m) => m.wm_id).filter(Boolean);
+      const updates = [];
 
-    const { data: whatsappMessages, error: wmError } = await supabase
-      .from("whatsapp_messages")
-      .select("wm_id, status, delivered_at, read_at")
-      .in("wm_id", wmIds);
+      for (const cm of campaignMessages) {
+        const wm = wmMap.get(cm.wm_id);
+        if (!wm) continue;
 
-    if (wmError) throw wmError;
+        const statusChanged = wm.status && wm.status !== cm.status;
 
-    const wmMap = new Map();
-    whatsappMessages.forEach((wm) => wmMap.set(wm.wm_id, wm));
+        const deliveredChanged =
+          wm.delivered_at &&
+          (!cm.delivered_at ||
+            new Date(wm.delivered_at).getTime() !==
+              new Date(cm.delivered_at).getTime());
 
-    /* -------------------------------------
-   4. Detect changes (SAFE COMPARISON)
-------------------------------------- */
-    const updates = [];
+        const readChanged =
+          wm.read_at &&
+          (!cm.read_at ||
+            new Date(wm.read_at).getTime() !== new Date(cm.read_at).getTime());
 
-    for (const cm of campaignMessages) {
-      if (!cm.wm_id) continue;
-
-      const wm = wmMap.get(cm.wm_id);
-
-      if (!wm) continue;
-
-      const statusChanged = wm.status && wm.status !== cm.status;
-
-      const deliveredChanged =
-        wm.delivered_at &&
-        (!cm.delivered_at ||
-          new Date(wm.delivered_at).getTime() !==
-            new Date(cm.delivered_at).getTime());
-
-      const readChanged =
-        wm.read_at &&
-        (!cm.read_at ||
-          new Date(wm.read_at).getTime() !== new Date(cm.read_at).getTime());
-
-      if (statusChanged || deliveredChanged || readChanged) {
-        updates.push({
-          cm_id: cm.cm_id,
-          status: wm.status,
-          delivered_at: wm.delivered_at,
-          read_at: wm.read_at,
-        });
+        if (statusChanged || deliveredChanged || readChanged) {
+          updates.push({
+            cm_id: cm.cm_id,
+            status: wm.status,
+            delivered_at: wm.delivered_at,
+            read_at: wm.read_at,
+          });
+        }
       }
-    }
 
-    /* -------------------------------------
-       5. Apply updates
-    ------------------------------------- */
-    await Promise.all(
-      updates.map((u) =>
-        supabase
-          .from("campaign_messages")
-          .update({
-            status: u.status,
-            delivered_at: u.delivered_at,
-            read_at: u.read_at,
-            updated_at: new Date().toISOString(),
-          })
-          .eq("cm_id", u.cm_id),
-      ),
-    );
+      /* -------------------------------------
+         5. Apply updates
+      ------------------------------------- */
+
+      await Promise.all(
+        updates.map((u) =>
+          supabase
+            .from("campaign_messages")
+            .update({
+              status: u.status,
+              delivered_at: u.delivered_at,
+              read_at: u.read_at,
+              updated_at: new Date().toISOString(),
+            })
+            .eq("cm_id", u.cm_id),
+        ),
+      );
+
+      // console.log("Updates to apply:", updates.length);
+
+      totalUpdated += updates.length;
+      offset += batchSize;
+    }
 
     return res.status(200).json({
       success: true,
-      updated: updates.length,
+      updated: totalUpdated,
       message:
-        updates.length > 0
+        totalUpdated > 0
           ? "Campaign messages synced successfully"
           : "No updates required",
     });
