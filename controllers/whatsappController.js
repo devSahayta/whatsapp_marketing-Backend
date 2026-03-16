@@ -70,6 +70,24 @@ export const handleIncomingMessage = async (req, res) => {
 
       console.log("📌 WA Status Update:", waMessageId, status);
 
+      // const updateData = {
+      //   status,
+      // };
+
+      // if (status === "sent") updateData.sent_at = timestamp;
+      // if (status === "delivered") updateData.delivered_at = timestamp;
+      // if (status === "read") updateData.read_at = timestamp;
+      // if (status === "failed") updateData.failed_at = timestamp;
+
+      // if (statusObj.errors) {
+      //   updateData.error_code = statusObj.errors.code || "unknown_error";
+      //   updateData.error_message =
+      //     statusObj?.errors.message ||
+      //     statusObj?.errors?.error_data.details ||
+      //     statusObj?.errors?.title ||
+      //     "Unknown error";
+      // }
+
       const updateData = {
         status,
       };
@@ -79,12 +97,15 @@ export const handleIncomingMessage = async (req, res) => {
       if (status === "read") updateData.read_at = timestamp;
       if (status === "failed") updateData.failed_at = timestamp;
 
-      if (statusObj.errors) {
-        updateData.error_code = statusObj.errors.code || "unknown_error";
+      if (statusObj.errors && statusObj.errors.length > 0) {
+        const err = statusObj.errors[0];
+
+        updateData.error_code = err.code || "unknown_error";
+
         updateData.error_message =
-          statusObj?.errors.message ||
-          statusObj?.errors?.error_data.details ||
-          statusObj?.errors?.title ||
+          err.message ||
+          err?.error_data?.details ||
+          err?.title ||
           "Unknown error";
       }
 
