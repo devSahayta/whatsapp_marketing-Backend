@@ -82,9 +82,9 @@ export const handleIncomingMessage = async (req, res) => {
       if (statusObj.errors) {
         updateData.error_code = statusObj.errors.code || "unknown_error";
         updateData.error_message =
-          statusObj.errors.message ||
-          statusObj.errors.error_data.details ||
-          statusObj.errors.title ||
+          statusObj?.errors.message ||
+          statusObj?.errors?.error_data.details ||
+          statusObj?.errors?.title ||
           "Unknown error";
       }
 
