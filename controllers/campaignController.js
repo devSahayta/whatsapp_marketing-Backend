@@ -1,5 +1,6 @@
 // controllers/campaignController.js
 
+import { log } from "console";
 import { supabase } from "../config/supabase.js";
 
 /* =====================================
@@ -115,7 +116,7 @@ export const createCampaign = async (req, res) => {
       if (contacts && contacts.length > 0) {
         allContacts = allContacts.concat(contacts);
         console.log(
-          `📄 Fetched page ${page + 1}: ${contacts.length} contacts (Total so far: ${allContacts.length})`
+          `📄 Fetched page ${page + 1}: ${contacts.length} contacts (Total so far: ${allContacts.length})`,
         );
         page++;
       }
@@ -130,7 +131,7 @@ export const createCampaign = async (req, res) => {
 
     if (allContacts.length !== totalContacts) {
       console.warn(
-        `⚠️ Mismatch: Expected ${totalContacts}, got ${allContacts.length}`
+        `⚠️ Mismatch: Expected ${totalContacts}, got ${allContacts.length}`,
       );
     }
 
@@ -181,14 +182,14 @@ export const createCampaign = async (req, res) => {
       if (messagesError) {
         console.error(
           `❌ Error inserting batch ${i / batchSize + 1}:`,
-          messagesError
+          messagesError,
         );
         throw messagesError;
       }
 
       insertedCount += batch.length;
       console.log(
-        `✅ Inserted batch ${i / batchSize + 1}: ${batch.length} messages (Total: ${insertedCount}/${allContacts.length})`
+        `✅ Inserted batch ${i / batchSize + 1}: ${batch.length} messages (Total: ${insertedCount}/${allContacts.length})`,
       );
     }
 
@@ -826,7 +827,7 @@ export const getUserGroups = async (req, res) => {
         description,
         status,
         created_at
-      `
+      `,
       )
       .eq("user_id", user_id)
       .eq("status", "active")
@@ -843,14 +844,17 @@ export const getUserGroups = async (req, res) => {
           .eq("group_id", group.group_id);
 
         if (countError) {
-          console.error(`Error counting contacts for group ${group.group_id}:`, countError);
+          console.error(
+            `Error counting contacts for group ${group.group_id}:`,
+            countError,
+          );
         }
 
         return {
           ...group,
           contact_count: count || 0, // ✅ Shows 2137 instead of 1000
         };
-      })
+      }),
     );
 
     return res.status(200).json({
@@ -1115,15 +1119,47 @@ export const syncCampaignMessageStatus = async (req, res) => {
       });
     }
 
-    /* -------------------------------------
-       2. Fetch campaign_messages
-    ------------------------------------- */
-    const { data: campaignMessages, error: cmError } = await supabase
-      .from("campaign_messages")
-      .select("cm_id, wm_id, status, delivered_at, read_at")
-      .eq("campaign_id", campaign_id);
+    // /* -------------------------------------
+    //    2. Fetch campaign_messages
+    // ------------------------------------- */
+    // const { data: campaignMessages, error: cmError } = await supabase
+    //   .from("campaign_messages")
+    //   .select("cm_id, wm_id, status, delivered_at, read_at")
+    //   .eq("campaign_id", campaign_id);
 
-    if (cmError) throw cmError;
+    // if (cmError) throw cmError;
+
+    /* -------------------------------------
+   2. Fetch campaign_messages (ALL ROWS)
+------------------------------------- */
+
+    let campaignMessages = [];
+    let from = 0;
+    const batchSize = 1000;
+    let done = false;
+
+    while (!done) {
+      const { data, error } = await supabase
+        .from("campaign_messages")
+        .select("cm_id, wm_id, status, delivered_at, read_at")
+        .eq("campaign_id", campaign_id)
+        .range(from, from + batchSize - 1);
+
+      if (error) throw error;
+
+      if (data.length === 0) {
+        done = true;
+      } else {
+        campaignMessages = [...campaignMessages, ...data];
+        from += batchSize;
+      }
+
+      if (data.length < batchSize) done = true;
+    }
+
+    console.log(
+      `🔄 Total campaign messages fetched: ${campaignMessages.length}`,
+    );
 
     if (!campaignMessages || campaignMessages.length === 0) {
       return res.status(200).json({
@@ -1149,18 +1185,29 @@ export const syncCampaignMessageStatus = async (req, res) => {
     whatsappMessages.forEach((wm) => wmMap.set(wm.wm_id, wm));
 
     /* -------------------------------------
-       4. Detect changes
-    ------------------------------------- */
+   4. Detect changes (SAFE COMPARISON)
+------------------------------------- */
     const updates = [];
 
     for (const cm of campaignMessages) {
+      if (!cm.wm_id) continue;
+
       const wm = wmMap.get(cm.wm_id);
+
       if (!wm) continue;
 
       const statusChanged = wm.status && wm.status !== cm.status;
+
       const deliveredChanged =
-        wm.delivered_at && wm.delivered_at !== cm.delivered_at;
-      const readChanged = wm.read_at && wm.read_at !== cm.read_at;
+        wm.delivered_at &&
+        (!cm.delivered_at ||
+          new Date(wm.delivered_at).getTime() !==
+            new Date(cm.delivered_at).getTime());
+
+      const readChanged =
+        wm.read_at &&
+        (!cm.read_at ||
+          new Date(wm.read_at).getTime() !== new Date(cm.read_at).getTime());
 
       if (statusChanged || deliveredChanged || readChanged) {
         updates.push({

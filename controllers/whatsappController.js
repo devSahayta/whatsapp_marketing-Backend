@@ -77,14 +77,55 @@ export const handleIncomingMessage = async (req, res) => {
       if (status === "sent") updateData.sent_at = timestamp;
       if (status === "delivered") updateData.delivered_at = timestamp;
       if (status === "read") updateData.read_at = timestamp;
+      if (status === "failed") updateData.failed_at = timestamp;
 
-      const { error } = await supabase
+      if (statusObj.errors) {
+        updateData.error_code = statusObj.errors.code || "unknown_error";
+        updateData.error_message =
+          statusObj.errors.message ||
+          statusObj.errors.error_data.details ||
+          statusObj.errors.title ||
+          "Unknown error";
+      }
+
+      // const { error } = await supabase
+      //   .from("whatsapp_messages")
+      //   .update(updateData)
+      //   .eq("wa_message_id", waMessageId);
+
+      // if (error) {
+      //   console.error("❌ Failed to update message status:", error);
+      // }
+
+      // new logic to also update campaign_messages when whatsapp_messages is updated
+      const { data: updatedMsg, error } = await supabase
         .from("whatsapp_messages")
         .update(updateData)
-        .eq("wa_message_id", waMessageId);
+        .eq("wa_message_id", waMessageId)
+        .select("wm_id")
+        .single();
 
       if (error) {
         console.error("❌ Failed to update message status:", error);
+      } else if (updatedMsg?.wm_id) {
+        // 🔹 ALSO UPDATE CAMPAIGN MESSAGE
+        const { error: cmError } = await supabase
+          .from("campaign_messages")
+          .update({
+            status: status,
+            delivered_at: updateData.delivered_at || undefined,
+            read_at: updateData.read_at || undefined,
+            sent_at: updateData.sent_at || undefined,
+            failed_at: updateData.failed_at || undefined,
+            error_code: updateData.error_code || undefined,
+            error_message: updateData.error_message || undefined,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("wm_id", updatedMsg.wm_id);
+
+        if (cmError) {
+          console.error("❌ Failed to update campaign message:", cmError);
+        }
       }
     }
 
