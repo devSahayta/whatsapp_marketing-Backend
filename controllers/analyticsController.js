@@ -21,37 +21,60 @@ export const getMessageStatsAndChart = async (req, res) => {
 
     const account_id = account.wa_id;
 
-    // Fetch filtered messages
-    let query = supabase
-      .from("whatsapp_messages")
-      .select(
-        `
-    wm_id,
-    status,
-    sent_at,
-    delivered_at,
-    read_at,
-    created_at
-  `,
-      )
-      .eq("account_id", account_id);
+    /* =====================================================
+       ✅ FETCH ALL MESSAGES (AUTO PAGINATION FIX)
+    ====================================================== */
 
-    if (from && to) {
-      query = query
-        .gte("created_at", `${from} 00:00:00`)
-        .lte("created_at", `${to} 23:59:59`);
+    const PAGE_SIZE = 1000;
+    let allMessages = [];
+    let fromIndex = 0;
+    let toIndex = PAGE_SIZE - 1;
+
+    while (true) {
+      let query = supabase
+        .from("whatsapp_messages")
+        .select(`
+          wm_id,
+          status,
+          sent_at,
+          delivered_at,
+          read_at,
+          created_at
+        `)
+        .eq("account_id", account_id)
+        .range(fromIndex, toIndex);
+
+      if (from && to) {
+        query = query
+          .gte("created_at", `${from} 00:00:00`)
+          .lte("created_at", `${to} 23:59:59`);
+      }
+
+      const { data, error } = await query;
+
+      if (error) throw error;
+
+      if (!data || data.length === 0) break;
+
+      allMessages = [...allMessages, ...data];
+
+      // stop when last page reached
+      if (data.length < PAGE_SIZE) break;
+
+      fromIndex += PAGE_SIZE;
+      toIndex += PAGE_SIZE;
     }
 
-    const { data: messages, error } = await query;
+    const messages = allMessages;
 
-    if (error) throw error;
+    /* =====================================================
+       SECTION 2: STATUS COUNTS
+    ====================================================== */
 
-    // -------- SECTION 2: STATUS COUNTS --------
     let sent = 0;
     let delivered = 0;
     let read = 0;
 
-    // -------- SECTION 2.1: DAILY CHART --------
     const dailyStats = {};
 
     messages.forEach((msg) => {
@@ -87,22 +110,16 @@ export const getMessageStatsAndChart = async (req, res) => {
 
     return res.json({
       success: true,
-
-      //date range
       date_range: {
-        from: from ? from : "All time",
-        to: to ? to : "All time",
+        from: from || "All time",
+        to: to || "All time",
       },
-
-      // SECTION 2
       overview: {
         sent,
         delivered,
         read,
         open_rate: openRate,
       },
-
-      // SECTION 2.1
       daily_chart: Object.values(dailyStats).sort(
         (a, b) => new Date(a.date) - new Date(b.date),
       ),
@@ -157,144 +174,145 @@ export const getOverviewStats = async (req, res) => {
 
     const { startDate, endDate } = getDateRange(from_date, to_date);
 
-    // 1️⃣ Total Groups (filtered by created_at if date range provided)
+    /* ======================================================
+       1️⃣ TOTAL GROUPS (COUNT FIX)
+    ====================================================== */
+
     let groupsQuery = supabase
       .from("groups")
-      .select("group_id, created_at")
+      .select("*", { count: "exact", head: true })
       .eq("user_id", user_id);
 
     if (startDate) groupsQuery = groupsQuery.gte("created_at", startDate);
     if (endDate) groupsQuery = groupsQuery.lte("created_at", endDate);
 
-    const { data: groupsData, error: groupsError } = await groupsQuery;
+    const { count: totalGroups, error: groupsError } =
+      await groupsQuery;
 
     if (groupsError) throw groupsError;
-    const totalGroups = groupsData.length;
 
-    // 2️⃣ Total Contacts (filtered by uploaded_at if date range provided)
+    /* ======================================================
+       2️⃣ TOTAL CONTACTS (✅ FIXED 1000 ISSUE)
+    ====================================================== */
+
     let contactsQuery = supabase
       .from("group_contacts")
-      .select("contact_id, uploaded_at")
+      .select("*", { count: "exact", head: true })
       .eq("user_id", user_id);
 
     if (startDate) contactsQuery = contactsQuery.gte("uploaded_at", startDate);
     if (endDate) contactsQuery = contactsQuery.lte("uploaded_at", endDate);
 
-    const { data: contactsData, error: contactsError } = await contactsQuery;
+    const { count: totalContacts, error: contactsError } =
+      await contactsQuery;
 
     if (contactsError) throw contactsError;
-    const totalContacts = contactsData.length;
 
-    // 3️⃣ Total Messages from whatsapp_messages table
-    // Get user's WhatsApp accounts first
+    /* ======================================================
+       3️⃣ GET USER ACCOUNTS
+    ====================================================== */
+
     const { data: accounts } = await supabase
       .from("whatsapp_accounts")
       .select("wa_id")
       .eq("user_id", user_id);
 
-    const accountIds = accounts ? accounts.map((a) => a.wa_id) : [];
+    const accountIds = accounts?.map((a) => a.wa_id) || [];
+
+    /* ======================================================
+       4️⃣ TOTAL MESSAGES (✅ FIXED 1000 ISSUE)
+    ====================================================== */
 
     let totalMessages = 0;
 
     if (accountIds.length > 0) {
       let messagesQuery = supabase
         .from("whatsapp_messages")
-        .select("wm_id, created_at")
+        .select("*", { count: "exact", head: true })
         .in("account_id", accountIds);
 
       if (startDate) messagesQuery = messagesQuery.gte("created_at", startDate);
       if (endDate) messagesQuery = messagesQuery.lte("created_at", endDate);
 
-      const { data: messagesData } = await messagesQuery;
-      totalMessages = messagesData ? messagesData.length : 0;
+      const { count } = await messagesQuery;
+      totalMessages = count || 0;
     }
 
-    // 4️⃣ Active Chats (filtered by created_at if date range provided)
+    /* ======================================================
+       5️⃣ ACTIVE CHATS
+    ====================================================== */
+
     let chatsQuery = supabase
       .from("chats")
-      .select(
-        `
-        chat_id,
-        created_at,
-        groups!inner (
-          group_id,
-          user_id
-        )
-      `,
-      )
-      .eq("groups.user_id", user_id);
+      .select("*", { count: "exact", head: true })
+      .eq("user_id", user_id);
 
     if (startDate) chatsQuery = chatsQuery.gte("created_at", startDate);
     if (endDate) chatsQuery = chatsQuery.lte("created_at", endDate);
 
-    const { data: chatsData, error: chatsError } = await chatsQuery;
+    const { count: activeChats } = await chatsQuery;
 
-    if (chatsError) throw chatsError;
-    const activeChats = chatsData.length;
+    /* ======================================================
+       6️⃣ TRENDS
+    ====================================================== */
 
-    // 5️⃣ Calculate trends (for selected date range vs previous period)
-    let groupsTrend = 0;
-    let contactsTrend = 0;
-    let messagesTodayCount = 0;
-    let chatActivePercentage = 0;
-
-    // Groups trend - count from start of month
+    // Start of month
     const startOfMonth = new Date();
     startOfMonth.setDate(1);
     startOfMonth.setHours(0, 0, 0, 0);
 
-    const { data: newGroupsThisMonth } = await supabase
+    const { count: groupsTrend } = await supabase
       .from("groups")
-      .select("group_id")
+      .select("*", { count: "exact", head: true })
       .eq("user_id", user_id)
       .gte("created_at", startOfMonth.toISOString());
 
-    groupsTrend = newGroupsThisMonth ? newGroupsThisMonth.length : 0;
-
-    // Contacts added today
+    // Contacts today (✅ FIXED)
     const startOfDay = new Date();
     startOfDay.setHours(0, 0, 0, 0);
 
-    const { data: newContactsToday } = await supabase
+    const { count: contactsTrend } = await supabase
       .from("group_contacts")
-      .select("contact_id")
+      .select("*", { count: "exact", head: true })
       .eq("user_id", user_id)
       .gte("uploaded_at", startOfDay.toISOString());
 
-    contactsTrend = newContactsToday ? newContactsToday.length : 0;
+    // Messages today (✅ FIXED)
+    let messagesTodayCount = 0;
 
-    // Messages sent today
     if (accountIds.length > 0) {
-      const { data: messagesToday } = await supabase
+      const { count } = await supabase
         .from("whatsapp_messages")
-        .select("wm_id")
+        .select("*", { count: "exact", head: true })
         .in("account_id", accountIds)
         .gte("created_at", startOfDay.toISOString());
 
-      messagesTodayCount = messagesToday ? messagesToday.length : 0;
+      messagesTodayCount = count || 0;
     }
 
-    // Chat active percentage
-    // Calculate: (groups with at least 1 chat / total groups) * 100
-    // let chatActivePercentage = 0;
+    /* ======================================================
+       7️⃣ CHAT ACTIVE %
+    ====================================================== */
+
+    let chatActivePercentage = 0;
+
     if (totalGroups > 0) {
-      // Get groups that have chats
       const { data: groupsWithChats } = await supabase
         .from("chats")
-        .select("group_id")
-        .in(
-          "group_id",
-          groupsData.map((g) => g.group_id),
-        );
+        .select("group_id");
 
-      const uniqueGroupsWithChats = new Set(
-        groupsWithChats ? groupsWithChats.map((c) => c.group_id) : [],
+      const uniqueGroups = new Set(
+        groupsWithChats?.map((c) => c.group_id) || [],
       );
 
       chatActivePercentage = Math.round(
-        (uniqueGroupsWithChats.size / totalGroups) * 100,
+        (uniqueGroups.size / totalGroups) * 100,
       );
     }
+
+    /* ======================================================
+       RESPONSE
+    ====================================================== */
 
     return res.status(200).json({
       date_range: {
@@ -302,13 +320,13 @@ export const getOverviewStats = async (req, res) => {
         to: to_date || "All time",
       },
       overview: {
-        total_groups: totalGroups,
-        total_contacts: totalContacts,
+        total_groups: totalGroups || 0,
+        total_contacts: totalContacts || 0,
         total_messages: totalMessages,
-        active_chats: activeChats,
+        active_chats: activeChats || 0,
         trends: {
-          groups_this_month: groupsTrend,
-          contacts_today: contactsTrend,
+          groups_this_month: groupsTrend || 0,
+          contacts_today: contactsTrend || 0,
           messages_today: messagesTodayCount,
           chat_active_percentage: chatActivePercentage,
         },
@@ -335,81 +353,96 @@ export const getGroupsPerformance = async (req, res) => {
 
     const { startDate, endDate } = getDateRange(from_date, to_date);
 
-    // Get all groups for user
-    let groupsQuery = supabase
+    /* =====================================================
+       1️⃣ GET GROUPS
+    ===================================================== */
+
+    const { data: groups, error: groupsError } = await supabase
       .from("groups")
       .select("*")
       .eq("user_id", user_id)
       .order("created_at", { ascending: false });
 
-    // Note: We get all groups, but filter their data by date range
-    const { data: groups, error: groupsError } = await groupsQuery;
-
     if (groupsError) throw groupsError;
 
-    // Get user's WhatsApp accounts
-    const { data: accounts } = await supabase
-      .from("whatsapp_accounts")
-      .select("wa_id")
-      .eq("user_id", user_id);
+    /* =====================================================
+       2️⃣ PROCESS EACH GROUP (COUNT FIXED)
+    ===================================================== */
 
-    const accountIds = accounts ? accounts.map((a) => a.wa_id) : [];
-
-    // For each group, get contacts and messages count within date range
     const groupsPerformance = await Promise.all(
       groups.map(async (group) => {
-        // Count contacts (filtered by date if provided)
+        /* ---------------- CONTACT COUNT ---------------- */
+
         let contactsQuery = supabase
           .from("group_contacts")
-          .select("contact_id")
+          .select("*", { count: "exact", head: true })
           .eq("group_id", group.group_id);
 
         if (startDate)
           contactsQuery = contactsQuery.gte("uploaded_at", startDate);
-        if (endDate) contactsQuery = contactsQuery.lte("uploaded_at", endDate);
+        if (endDate)
+          contactsQuery = contactsQuery.lte("uploaded_at", endDate);
 
-        const { data: contacts } = await contactsQuery;
-        const contactCount = contacts ? contacts.length : 0;
+        const { count: contactCount } = await contactsQuery;
 
-        // Count messages from chats within this group
+        /* ---------------- GET CHAT IDS ---------------- */
+
         let chatsQuery = supabase
           .from("chats")
-          .select("chat_id, created_at")
+          .select("chat_id")
           .eq("group_id", group.group_id);
 
-        if (startDate) chatsQuery = chatsQuery.gte("created_at", startDate);
-        if (endDate) chatsQuery = chatsQuery.lte("created_at", endDate);
+        if (startDate)
+          chatsQuery = chatsQuery.gte("created_at", startDate);
+        if (endDate)
+          chatsQuery = chatsQuery.lte("created_at", endDate);
 
         const { data: chats } = await chatsQuery;
-        const chatIds = chats ? chats.map((c) => c.chat_id) : [];
+
+        const chatIds = chats?.map((c) => c.chat_id) || [];
 
         let messageCount = 0;
         let adminMessageCount = 0;
         let userMessageCount = 0;
 
-        // Count messages in chats
+        /* ---------------- MESSAGE COUNTS (FIXED) ---------------- */
+
         if (chatIds.length > 0) {
-          let messagesQuery = supabase
+          // TOTAL MESSAGES
+          let totalMsgQuery = supabase
             .from("messages")
-            .select("message_id, sender_type, created_at")
+            .select("*", { count: "exact", head: true })
             .in("chat_id", chatIds);
 
           if (startDate)
-            messagesQuery = messagesQuery.gte("created_at", startDate);
-          if (endDate) messagesQuery = messagesQuery.lte("created_at", endDate);
+            totalMsgQuery = totalMsgQuery.gte("created_at", startDate);
+          if (endDate)
+            totalMsgQuery = totalMsgQuery.lte("created_at", endDate);
 
-          const { data: messages } = await messagesQuery;
+          const { count } = await totalMsgQuery;
+          messageCount = count || 0;
 
-          messageCount = messages ? messages.length : 0;
-          adminMessageCount = messages
-            ? messages.filter((m) => m.sender_type === "admin").length
-            : 0;
-          userMessageCount = messages
-            ? messages.filter((m) => m.sender_type === "user").length
-            : 0;
+          // ADMIN MESSAGES
+          const { count: adminCount } = await supabase
+            .from("messages")
+            .select("*", { count: "exact", head: true })
+            .in("chat_id", chatIds)
+            .eq("sender_type", "admin");
+
+          adminMessageCount = adminCount || 0;
+
+          // USER MESSAGES
+          const { count: userCount } = await supabase
+            .from("messages")
+            .select("*", { count: "exact", head: true })
+            .in("chat_id", chatIds)
+            .eq("sender_type", "user");
+
+          userMessageCount = userCount || 0;
         }
 
-        // Calculate response rate (user replies / admin messages * 100)
+        /* ---------------- RESPONSE RATE ---------------- */
+
         const responseRate =
           adminMessageCount > 0
             ? Math.round((userMessageCount / adminMessageCount) * 100)
@@ -419,7 +452,7 @@ export const getGroupsPerformance = async (req, res) => {
           group_id: group.group_id,
           group_name: group.group_name,
           description: group.description,
-          contact_count: contactCount,
+          contact_count: contactCount || 0,
           message_count: messageCount,
           admin_messages: adminMessageCount,
           user_messages: userMessageCount,
@@ -429,6 +462,10 @@ export const getGroupsPerformance = async (req, res) => {
         };
       }),
     );
+
+    /* =====================================================
+       RESPONSE
+    ===================================================== */
 
     return res.status(200).json({
       date_range: {
@@ -460,7 +497,6 @@ export const getDashboardAnalytics = async (req, res) => {
 
     const { startDate, endDate } = getDateRange(from_date, to_date);
 
-    // Manually fetch both datasets
     const overviewData = await fetchOverviewData(
       user_id,
       from_date,
@@ -468,6 +504,7 @@ export const getDashboardAnalytics = async (req, res) => {
       startDate,
       endDate,
     );
+
     const groupsData = await fetchGroupsData(
       user_id,
       from_date,
@@ -500,131 +537,107 @@ async function fetchOverviewData(
   startDate,
   endDate,
 ) {
-  // Total Groups
+  // ✅ Total Groups
   let groupsQuery = supabase
     .from("groups")
-    .select("group_id")
+    .select("*", { count: "exact", head: true })
     .eq("user_id", user_id);
 
   if (startDate) groupsQuery = groupsQuery.gte("created_at", startDate);
   if (endDate) groupsQuery = groupsQuery.lte("created_at", endDate);
 
-  const { data: groupsData } = await groupsQuery;
-  const totalGroups = groupsData?.length || 0;
+  const { count: totalGroups } = await groupsQuery;
 
-  // Total Contacts
+  // ✅ Total Contacts
   let contactsQuery = supabase
     .from("group_contacts")
-    .select("contact_id")
+    .select("*", { count: "exact", head: true })
     .eq("user_id", user_id);
 
   if (startDate) contactsQuery = contactsQuery.gte("uploaded_at", startDate);
   if (endDate) contactsQuery = contactsQuery.lte("uploaded_at", endDate);
 
-  const { data: contactsData } = await contactsQuery;
-  const totalContacts = contactsData?.length || 0;
+  const { count: totalContacts } = await contactsQuery;
 
-  // Total Messages
+  // Accounts
   const { data: accounts } = await supabase
     .from("whatsapp_accounts")
     .select("wa_id")
     .eq("user_id", user_id);
 
-  const accountIds = accounts ? accounts.map((a) => a.wa_id) : [];
+  const accountIds = accounts?.map((a) => a.wa_id) || [];
+
+  // ✅ Total Messages
   let totalMessages = 0;
 
   if (accountIds.length > 0) {
     let messagesQuery = supabase
       .from("whatsapp_messages")
-      .select("wm_id")
+      .select("*", { count: "exact", head: true })
       .in("account_id", accountIds);
 
     if (startDate) messagesQuery = messagesQuery.gte("created_at", startDate);
     if (endDate) messagesQuery = messagesQuery.lte("created_at", endDate);
 
-    const { data: messagesData } = await messagesQuery;
-    totalMessages = messagesData?.length || 0;
+    const { count } = await messagesQuery;
+    totalMessages = count || 0;
   }
 
-  // Active Chats
+  // ✅ Active Chats
   let chatsQuery = supabase
     .from("chats")
-    .select(
-      `
-      chat_id,
-      groups!inner (
-        user_id
-      )
-    `,
-    )
-    .eq("groups.user_id", user_id);
+    .select("*", { count: "exact", head: true })
+    .eq("user_id", user_id);
 
   if (startDate) chatsQuery = chatsQuery.gte("created_at", startDate);
   if (endDate) chatsQuery = chatsQuery.lte("created_at", endDate);
 
-  const { data: chatsData } = await chatsQuery;
-  const activeChats = chatsData?.length || 0;
+  const { count: activeChats } = await chatsQuery;
 
-  // Calculate trends
-  let groupsTrend = 0;
-  let contactsTrend = 0;
-  let messagesTodayCount = 0;
-  let chatActivePercentage = 0;
+  /* ---------- Trends (FIXED) ---------- */
 
-  // Groups trend - count from start of month
   const startOfMonth = new Date();
   startOfMonth.setDate(1);
   startOfMonth.setHours(0, 0, 0, 0);
 
-  const { data: newGroupsThisMonth } = await supabase
+  const { count: groupsTrend } = await supabase
     .from("groups")
-    .select("group_id")
+    .select("*", { count: "exact", head: true })
     .eq("user_id", user_id)
     .gte("created_at", startOfMonth.toISOString());
 
-  groupsTrend = newGroupsThisMonth ? newGroupsThisMonth.length : 0;
-
-  // Contacts added today
   const startOfDay = new Date();
   startOfDay.setHours(0, 0, 0, 0);
 
-  const { data: newContactsToday } = await supabase
+  const { count: contactsTrend } = await supabase
     .from("group_contacts")
-    .select("contact_id")
+    .select("*", { count: "exact", head: true })
     .eq("user_id", user_id)
     .gte("uploaded_at", startOfDay.toISOString());
 
-  contactsTrend = newContactsToday ? newContactsToday.length : 0;
+  let messagesTodayCount = 0;
 
-  // Messages sent today
   if (accountIds.length > 0) {
-    const { data: messagesToday } = await supabase
+    const { count } = await supabase
       .from("whatsapp_messages")
-      .select("wm_id")
+      .select("*", { count: "exact", head: true })
       .in("account_id", accountIds)
       .gte("created_at", startOfDay.toISOString());
 
-    messagesTodayCount = messagesToday ? messagesToday.length : 0;
+    messagesTodayCount = count || 0;
   }
 
-  // Chat active percentage - Calculate: (groups with at least 1 chat / total groups) * 100
-  if (totalGroups > 0 && chatsData && chatsData.length > 0) {
-    // Get all groups from chats
-    const { data: allChats } = await supabase
+  // Chat active %
+  let chatActivePercentage = 0;
+
+  if (totalGroups > 0) {
+    const { data: groupsWithChats } = await supabase
       .from("chats")
-      .select(
-        `
-        chat_id,
-        group_id,
-        groups!inner (
-          user_id
-        )
-      `,
-      )
-      .eq("groups.user_id", user_id);
+      .select("group_id")
+      .eq("user_id", user_id);
 
     const uniqueGroupsWithChats = new Set(
-      allChats ? allChats.map((c) => c.group_id) : [],
+      groupsWithChats?.map((c) => c.group_id) || [],
     );
 
     chatActivePercentage = Math.round(
@@ -633,13 +646,13 @@ async function fetchOverviewData(
   }
 
   return {
-    total_groups: totalGroups,
-    total_contacts: totalContacts,
+    total_groups: totalGroups || 0,
+    total_contacts: totalContacts || 0,
     total_messages: totalMessages,
-    active_chats: activeChats,
+    active_chats: activeChats || 0,
     trends: {
-      groups_this_month: groupsTrend,
-      contacts_today: contactsTrend,
+      groups_this_month: groupsTrend || 0,
+      contacts_today: contactsTrend || 0,
       messages_today: messagesTodayCount,
       chat_active_percentage: chatActivePercentage,
     },
@@ -664,44 +677,35 @@ async function fetchGroupsData(
 
   const groupsPerformance = await Promise.all(
     groups.map(async (group) => {
+      // ✅ contacts count (FIX)
       let contactsQuery = supabase
         .from("group_contacts")
-        .select("contact_id")
+        .select("*", { count: "exact", head: true })
         .eq("group_id", group.group_id);
 
       if (startDate)
         contactsQuery = contactsQuery.gte("uploaded_at", startDate);
       if (endDate) contactsQuery = contactsQuery.lte("uploaded_at", endDate);
 
-      const { data: contacts } = await contactsQuery;
-      const contactCount = contacts?.length || 0;
+      const { count: contactCount } = await contactsQuery;
 
-      let chatsQuery = supabase
+      // chats
+      const { data: chats } = await supabase
         .from("chats")
         .select("chat_id")
         .eq("group_id", group.group_id);
 
-      if (startDate) chatsQuery = chatsQuery.gte("created_at", startDate);
-      if (endDate) chatsQuery = chatsQuery.lte("created_at", endDate);
-
-      const { data: chats } = await chatsQuery;
-      const chatIds = chats ? chats.map((c) => c.chat_id) : [];
+      const chatIds = chats?.map((c) => c.chat_id) || [];
 
       let messageCount = 0;
       let adminMessageCount = 0;
       let userMessageCount = 0;
 
       if (chatIds.length > 0) {
-        let messagesQuery = supabase
+        const { data: messages } = await supabase
           .from("messages")
-          .select("message_id, sender_type")
+          .select("sender_type")
           .in("chat_id", chatIds);
-
-        if (startDate)
-          messagesQuery = messagesQuery.gte("created_at", startDate);
-        if (endDate) messagesQuery = messagesQuery.lte("created_at", endDate);
-
-        const { data: messages } = await messagesQuery;
 
         messageCount = messages?.length || 0;
         adminMessageCount =
@@ -719,7 +723,7 @@ async function fetchGroupsData(
         group_id: group.group_id,
         group_name: group.group_name,
         description: group.description,
-        contact_count: contactCount,
+        contact_count: contactCount || 0,
         message_count: messageCount,
         admin_messages: adminMessageCount,
         user_messages: userMessageCount,
