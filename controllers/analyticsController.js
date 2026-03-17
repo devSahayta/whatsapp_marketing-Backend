@@ -21,37 +21,60 @@ export const getMessageStatsAndChart = async (req, res) => {
 
     const account_id = account.wa_id;
 
-    // Fetch filtered messages
-    let query = supabase
-      .from("whatsapp_messages")
-      .select(
-        `
-    wm_id,
-    status,
-    sent_at,
-    delivered_at,
-    read_at,
-    created_at
-  `,
-      )
-      .eq("account_id", account_id);
+    /* =====================================================
+       ✅ FETCH ALL MESSAGES (AUTO PAGINATION FIX)
+    ====================================================== */
 
-    if (from && to) {
-      query = query
-        .gte("created_at", `${from} 00:00:00`)
-        .lte("created_at", `${to} 23:59:59`);
+    const PAGE_SIZE = 1000;
+    let allMessages = [];
+    let fromIndex = 0;
+    let toIndex = PAGE_SIZE - 1;
+
+    while (true) {
+      let query = supabase
+        .from("whatsapp_messages")
+        .select(`
+          wm_id,
+          status,
+          sent_at,
+          delivered_at,
+          read_at,
+          created_at
+        `)
+        .eq("account_id", account_id)
+        .range(fromIndex, toIndex);
+
+      if (from && to) {
+        query = query
+          .gte("created_at", `${from} 00:00:00`)
+          .lte("created_at", `${to} 23:59:59`);
+      }
+
+      const { data, error } = await query;
+
+      if (error) throw error;
+
+      if (!data || data.length === 0) break;
+
+      allMessages = [...allMessages, ...data];
+
+      // stop when last page reached
+      if (data.length < PAGE_SIZE) break;
+
+      fromIndex += PAGE_SIZE;
+      toIndex += PAGE_SIZE;
     }
 
-    const { data: messages, error } = await query;
+    const messages = allMessages;
 
-    if (error) throw error;
+    /* =====================================================
+       SECTION 2: STATUS COUNTS
+    ====================================================== */
 
-    // -------- SECTION 2: STATUS COUNTS --------
     let sent = 0;
     let delivered = 0;
     let read = 0;
 
-    // -------- SECTION 2.1: DAILY CHART --------
     const dailyStats = {};
 
     messages.forEach((msg) => {
@@ -87,22 +110,16 @@ export const getMessageStatsAndChart = async (req, res) => {
 
     return res.json({
       success: true,
-
-      //date range
       date_range: {
-        from: from ? from : "All time",
-        to: to ? to : "All time",
+        from: from || "All time",
+        to: to || "All time",
       },
-
-      // SECTION 2
       overview: {
         sent,
         delivered,
         read,
         open_rate: openRate,
       },
-
-      // SECTION 2.1
       daily_chart: Object.values(dailyStats).sort(
         (a, b) => new Date(a.date) - new Date(b.date),
       ),
