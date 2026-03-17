@@ -1001,7 +1001,7 @@ export const retryCampaign = async (req, res) => {
       });
     }
 
-    if (campaign.status === 'processing' && campaign.started_at) {
+    if (campaign.status === "processing" && campaign.started_at) {
       return res.status(400).json({
         success: false,
         error: "Campaign is currently processing. Retry is not allowed.",
@@ -1015,19 +1015,53 @@ export const retryCampaign = async (req, res) => {
       });
     }
 
+    // /* -------------------------------------
+    //    2. Find FAILED messages (retry < 3)
+    // ------------------------------------- */
+    // const { data: failedMessages, error: fmError } = await supabase
+    //   .from("campaign_messages")
+    //   .select("cm_id, retry_count")
+    //   .eq("campaign_id", campaign_id)
+    //   .eq("status", "failed")
+    //   .lt("retry_count", 3);
+
+    // if (fmError) throw fmError;
+
+    // if (!failedMessages || failedMessages.length === 0) {
+    //   return res.status(400).json({
+    //     success: false,
+    //     error: "No failed messages eligible for retry",
+    //   });
+    // }
+
     /* -------------------------------------
-       2. Find FAILED messages (retry < 3)
-    ------------------------------------- */
-    const { data: failedMessages, error: fmError } = await supabase
-      .from("campaign_messages")
-      .select("cm_id, retry_count")
-      .eq("campaign_id", campaign_id)
-      .eq("status", "failed")
-      .lt("retry_count", 3);
+   2. Find FAILED messages (retry < 3)
+------------------------------------- */
 
-    if (fmError) throw fmError;
+    let failedMessages = [];
+    let offset = 0;
+    const batchSize = 500;
 
-    if (!failedMessages || failedMessages.length === 0) {
+    while (true) {
+      const { data, error } = await supabase
+        .from("campaign_messages")
+        .select("cm_id, retry_count")
+        .eq("campaign_id", campaign_id)
+        .eq("status", "failed")
+        .lt("retry_count", 3)
+        .range(offset, offset + batchSize - 1);
+
+      if (error) throw error;
+
+      if (!data.length) break;
+
+      failedMessages.push(...data);
+      offset += batchSize;
+    }
+
+    console.log("Retry messages:", failedMessages.length);
+
+    if (failedMessages.length === 0) {
       return res.status(400).json({
         success: false,
         error: "No failed messages eligible for retry",
@@ -1036,30 +1070,65 @@ export const retryCampaign = async (req, res) => {
 
     const failedIds = failedMessages.map((m) => m.cm_id);
 
-    /* -------------------------------------
-       3. Reset failed → pending
-    ------------------------------------- */
-    await supabase
-      .from("campaign_messages")
-      .update({
-        status: "pending",
-        failed_at: null,
-        error_message: null,
-        error_code: null,
-        updated_at: new Date().toISOString(),
-      })
-      .in("cm_id", failedIds);
+    // /* -------------------------------------
+    //    3. Reset failed → pending
+    // ------------------------------------- */
+    // await supabase
+    //   .from("campaign_messages")
+    //   .update({
+    //     status: "pending",
+    //     failed_at: null,
+    //     error_message: null,
+    //     error_code: null,
+    //     updated_at: new Date().toISOString(),
+    //   })
+    //   .in("cm_id", failedIds);
+
+    // /* -------------------------------------
+    //    4. Increment retry_count
+    // ------------------------------------- */
+    // for (const msg of failedMessages) {
+    //   await supabase
+    //     .from("campaign_messages")
+    //     .update({
+    //       retry_count: msg.retry_count + 1,
+    //     })
+    //     .eq("cm_id", msg.cm_id);
+    // }
 
     /* -------------------------------------
-       4. Increment retry_count
-    ------------------------------------- */
-    for (const msg of failedMessages) {
+   3. Reset failed → pending (batch safe)
+------------------------------------- */
+
+    const chunkSize = 100;
+
+    for (let i = 0; i < failedMessages.length; i += chunkSize) {
+      const chunk = failedMessages.slice(i, i + chunkSize);
+
+      const ids = chunk.map((m) => m.cm_id);
+
       await supabase
         .from("campaign_messages")
         .update({
-          retry_count: msg.retry_count + 1,
+          status: "pending",
+          failed_at: null,
+          error_message: null,
+          error_code: null,
+          updated_at: new Date().toISOString(),
         })
-        .eq("cm_id", msg.cm_id);
+        .in("cm_id", ids);
+
+      /* 4. increment retry count */
+      await Promise.all(
+        chunk.map((msg) =>
+          supabase
+            .from("campaign_messages")
+            .update({
+              retry_count: msg.retry_count + 1,
+            })
+            .eq("cm_id", msg.cm_id),
+        ),
+      );
     }
 
     /* -------------------------------------
@@ -1071,16 +1140,16 @@ export const retryCampaign = async (req, res) => {
     ).toISOString();
 
     await supabase
-  .from("campaigns")
-  .update({
-    status: "scheduled",
-    scheduled_at: retryAt,
-    started_at: null,   // ⭐ VERY IMPORTANT
-    completed_at: null, // optional but recommended
-    messages_failed: 0,
-    updated_at: new Date().toISOString(),
-  })
-  .eq("campaign_id", campaign_id);
+      .from("campaigns")
+      .update({
+        status: "scheduled",
+        scheduled_at: retryAt,
+        started_at: null, // ⭐ VERY IMPORTANT
+        completed_at: null, // optional but recommended
+        messages_failed: 0,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("campaign_id", campaign_id);
 
     return res.status(200).json({
       success: true,
