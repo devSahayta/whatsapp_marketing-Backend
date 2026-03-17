@@ -363,7 +363,14 @@ export const getCampaignById = async (req, res) => {
     const stats = {
       total: messages?.length || 0,
       pending: messages?.filter((m) => m.status === "pending").length || 0,
-      sent: messages?.filter((m) => m.sent_at !== null).length || 0,
+      // sent: messages?.filter((m) => m.sent_at !== null).length || 0,
+      sent:
+        messages?.filter(
+          (m) =>
+            m.status === "sent" ||
+            m.status === "delivered" ||
+            m.status === "read",
+        ).length || 0,
       delivered: messages?.filter((m) => m.delivered_at !== null).length || 0,
       read: messages?.filter((m) => m.read_at !== null).length || 0,
       failed: messages?.filter((m) => m.status === "failed").length || 0,
@@ -1111,6 +1118,7 @@ export const retryCampaign = async (req, res) => {
         .from("campaign_messages")
         .update({
           status: "pending",
+          sent_at: null,
           failed_at: null,
           error_message: null,
           error_code: null,
