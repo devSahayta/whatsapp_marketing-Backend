@@ -143,45 +143,71 @@ export const validateWarmup = async (req, res) => {
     // ========================================
     // CASE 3: WARM-UP COMPLETED - CHECK TIER LIMIT
     // ========================================
-    if (account.warmup_completed) {
-      console.log('✅ Warm-up completed - checking tier daily limit');
-      
-      const tier_daily_limit = account.messaging_limit_per_day;
-      const daily_remaining = tier_daily_limit - daily_sent;
+    // Case 3: Warm-up completed - check tier daily limit
+if (account.warmup_completed) {
+  // ✅ NEW: Use tier_daily_sent instead of warmup_daily_sent
+  const tierDailyLimit = account.messaging_limit_per_day || 0;
+  const tierDailySent = account.tier_daily_sent || 0;  // ← Changed!
+  
+  // Reset daily counter if new day
+  const now = new Date();
+  const lastResetDate = account.tier_daily_reset_at 
+    ? new Date(account.tier_daily_reset_at).toISOString().split('T')[0]
+    : null;
+  const todayDate = now.toISOString().split('T')[0];
 
-      // Check tier daily limit
-      if (contact_count > daily_remaining) {
-        return res.json({
-          success: true,
-          warmup_required: false,
-          warmup_completed: true,
-          can_send: false,
-          tier: account.messaging_limit_tier,
-          tier_daily_limit,
-          daily_sent,
-          daily_remaining,
-          contact_count,
-          message: `⚠️ Daily Tier Limit\n\n✅ Warm-up completed!\n\nYour tier (${account.messaging_limit_tier}) allows ${tier_daily_limit} messages per day.\n\nToday's usage: ${daily_sent}/${tier_daily_limit}\nRemaining: ${daily_remaining}\nYour campaign: ${contact_count}\n\nReduce to ${daily_remaining} or wait until tomorrow.`,
-          suggestion: daily_remaining > 0 
-            ? `Reduce to ${daily_remaining} contacts`
-            : 'Daily limit reached. Resets at midnight UTC.'
-        });
-      }
+  let currentTierDailySent = tierDailySent;
+  
+  if (!lastResetDate || lastResetDate !== todayDate) {
+    // New day - reset counter
+    currentTierDailySent = 0;
+    
+    // Update in database
+    const { error: resetError } = await supabase
+      .from('whatsapp_accounts')
+      .update({
+        tier_daily_sent: 0,
+        tier_daily_reset_at: now.toISOString()
+      })
+      .eq('wa_id', account_id);
 
-      return res.json({
-        success: true,
-        warmup_required: false,
-        warmup_completed: true,
-        can_send: true,
-        tier: account.messaging_limit_tier,
-        tier_daily_limit,
-        daily_sent: daily_sent + contact_count,
-        daily_remaining: daily_remaining - contact_count,
-        contact_count,
-        message: `✅ Warm-up completed! You can send ${contact_count} contacts.\n\nTier limit: ${tier_daily_limit}/day\nAfter campaign: ${daily_sent + contact_count}/${tier_daily_limit}`
-      });
+    if (resetError) {
+      console.error('Error resetting tier daily counter:', resetError);
     }
+  }
 
+  // Check if campaign exceeds tier limit
+  if (currentTierDailySent + contact_count > tierDailyLimit) {
+    return res.status(200).json({
+      success: true,
+      warmup_required: false,
+      warmup_completed: true,
+      can_send: false,
+      blocked_by: 'tier_limit',
+      tier_daily_limit: tierDailyLimit,
+      tier_daily_sent: currentTierDailySent,
+      daily_remaining: Math.max(0, tierDailyLimit - currentTierDailySent),
+      contact_count,
+      tier: account.messaging_limit_tier,
+      message: `✅ Warm-up completed!\n\nYour tier (${tierName}) allows ${tierDailyLimit.toLocaleString()} messages per day.\n\nToday's usage: ${currentTierDailySent.toLocaleString()}/${tierDailyLimit.toLocaleString()}\nRemaining: ${Math.max(0, tierDailyLimit - currentTierDailySent).toLocaleString()}\n\nYour campaign: ${contact_count.toLocaleString()}\n\nTo proceed:\n• Reduce campaign to ${Math.max(0, tierDailyLimit - currentTierDailySent).toLocaleString()} contacts\n• Wait until tomorrow (resets at midnight UTC)`,
+      suggestion: `Reduce campaign to ${Math.max(0, tierDailyLimit - currentTierDailySent).toLocaleString()} contacts or schedule for tomorrow`
+    });
+  }
+
+  // Within tier limit
+  return res.status(200).json({
+    success: true,
+    warmup_required: false,
+    warmup_completed: true,
+    can_send: true,
+    tier_daily_limit: tierDailyLimit,
+    tier_daily_sent: currentTierDailySent,
+    daily_remaining: tierDailyLimit - currentTierDailySent - contact_count,
+    contact_count,
+    tier: account.messaging_limit_tier,
+    message: `✅ Warm-up completed!\n\nTier limit check:\nCurrent: ${currentTierDailySent.toLocaleString()}/${tierDailyLimit.toLocaleString()}\nAfter campaign: ${(currentTierDailySent + contact_count).toLocaleString()}/${tierDailyLimit.toLocaleString()}\n\nYou can send this campaign.`
+  });
+}
     // ========================================
     // CASE 4: WARM-UP ACTIVE - CHECK WARM-UP LIMITS
     // ========================================
