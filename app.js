@@ -23,8 +23,7 @@ import campaignRoutes from "./routes/campaignRoutes.js";
 // import { startCampaignScheduler } from "./scheduler/campaignScheduler.js";
 import paymentRoutes from "./routes/paymentRoutes.js";
 import mediaRoutes from './routes/mediaRoutes.js';
-
-dotenv.config();
+import WarmupRoute from "./routes/warmup.js";
 
 const app = express();
 app.use(express.json());
@@ -75,6 +74,9 @@ app.use("/api/payment", paymentRoutes);
 
 //mediaforCampaigns
 app.use('/api/media', mediaRoutes);
+
+//warmup routes
+app.use("/api/warmup", WarmupRoute);
 
 // Start scheduler
 
