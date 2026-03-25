@@ -333,7 +333,7 @@ export const syncWhatsAppTier = async (req, res) => {
       account.system_user_access_token,
     );
 
-    const warmupConfig = getWarmupConfig(tier);
+    // const warmupConfig = getWarmupConfig(tier);
 
     const { error: updateError } = await supabase
       .from("whatsapp_accounts")
@@ -343,8 +343,8 @@ export const syncWhatsAppTier = async (req, res) => {
         quality_rating,
         last_tier_updated_at: new Date(),
 
-        //  Auto warmup update
-        ...warmupConfig,
+        // //  Auto warmup update
+        // ...warmupConfig,
       })
       .eq("wa_id", account.wa_id);
 
