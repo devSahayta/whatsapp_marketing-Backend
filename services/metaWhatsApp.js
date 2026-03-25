@@ -83,7 +83,7 @@ export const getWarmupConfig = (tier) => {
     return {
       warmup_enabled: false,
       warmup_completed: true,
-      warmup_stage: 3,
+      // warmup_stage: 3,
     };
   }
 
@@ -91,6 +91,6 @@ export const getWarmupConfig = (tier) => {
   return {
     warmup_enabled: true,
     warmup_completed: false,
-    warmup_stage: 1,
+    // warmup_stage: 1,
   };
 };
