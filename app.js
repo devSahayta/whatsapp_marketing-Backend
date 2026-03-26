@@ -22,8 +22,9 @@ import analyticsRoutes from "./routes/analyticsRoutes.js";
 import campaignRoutes from "./routes/campaignRoutes.js";
 // import { startCampaignScheduler } from "./scheduler/campaignScheduler.js";
 import paymentRoutes from "./routes/paymentRoutes.js";
-import mediaRoutes from './routes/mediaRoutes.js';
+import mediaRoutes from "./routes/mediaRoutes.js";
 import WarmupRoute from "./routes/warmup.js";
+import googleRoutes from "./routes/google.routes.js";
 
 const app = express();
 app.use(express.json());
@@ -73,10 +74,13 @@ app.use("/api/campaigns", campaignRoutes);
 app.use("/api/payment", paymentRoutes);
 
 //mediaforCampaigns
-app.use('/api/media', mediaRoutes);
+app.use("/api/media", mediaRoutes);
 
 //warmup routes
 app.use("/api/warmup", WarmupRoute);
+
+//google integration routes
+app.use("/api/integrations/google", googleRoutes);
 
 // Start scheduler
 
