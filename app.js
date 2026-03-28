@@ -25,6 +25,7 @@ import paymentRoutes from "./routes/paymentRoutes.js";
 import mediaRoutes from "./routes/mediaRoutes.js";
 import WarmupRoute from "./routes/warmup.js";
 import googleRoutes from "./routes/google.routes.js";
+import integrationsRoutes from "./routes/integrations.routes.js";
 
 const app = express();
 app.use(express.json());
@@ -81,6 +82,9 @@ app.use("/api/warmup", WarmupRoute);
 
 //google integration routes
 app.use("/api/integrations/google", googleRoutes);
+
+//integration status route
+app.use("/api/integrations", integrationsRoutes);
 
 // Start scheduler
 

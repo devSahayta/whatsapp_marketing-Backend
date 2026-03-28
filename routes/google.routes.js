@@ -4,16 +4,19 @@ import {
   googleCallback,
   importContactsFromSheet,
   exportCampaignToSheet,
+  getGoogleSheets,
 } from "../controllers/google.controller.js";
 import { authenticateUser } from "../middleware/authMiddleware.js";
 
 const router = express.Router();
 
-// 🔐 protected routes
-router.get("/connect", connectGoogle, authenticateUser);
+// Public — called by Google redirect, no auth token present
 router.get("/callback", googleCallback);
 
-router.post("/import-contacts", importContactsFromSheet);
-router.post("/export-campaign", exportCampaignToSheet);
+// Protected routes
+router.get("/connect", authenticateUser, connectGoogle);
+router.get("/sheets", authenticateUser, getGoogleSheets);
+router.post("/import-contacts", authenticateUser, importContactsFromSheet);
+router.post("/export-campaign", authenticateUser, exportCampaignToSheet);
 
 export default router;
