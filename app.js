@@ -22,8 +22,11 @@ import analyticsRoutes from "./routes/analyticsRoutes.js";
 import campaignRoutes from "./routes/campaignRoutes.js";
 // import { startCampaignScheduler } from "./scheduler/campaignScheduler.js";
 import paymentRoutes from "./routes/paymentRoutes.js";
-import mediaRoutes from './routes/mediaRoutes.js';
+import mediaRoutes from "./routes/mediaRoutes.js";
 import WarmupRoute from "./routes/warmup.js";
+
+import woocommerceRoutes from "./routes/woocommerceRoutes.js";
+import woocommerceWebhookRoutes from "./routes/woocommerceWebhookRoutes.js";
 
 const app = express();
 app.use(express.json());
@@ -73,10 +76,14 @@ app.use("/api/campaigns", campaignRoutes);
 app.use("/api/payment", paymentRoutes);
 
 //mediaforCampaigns
-app.use('/api/media', mediaRoutes);
+app.use("/api/media", mediaRoutes);
 
 //warmup routes
 app.use("/api/warmup", WarmupRoute);
+
+//routes for woocommerce integration
+app.use("/api/woocommerce", woocommerceRoutes);
+app.use("/webhooks/woocommerce", woocommerceWebhookRoutes);
 
 // Start scheduler
 
