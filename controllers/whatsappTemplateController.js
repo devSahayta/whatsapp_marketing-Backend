@@ -21,6 +21,38 @@ export async function createTemplate(req, res) {
     const payload = req.body;
     const wt_id = uuidv4();
 
+    // fetch account row (reads system_user_access_token, waba_id, phone_number_id)
+    const { data: account, error: acctErr } = await supabase
+      .from("whatsapp_accounts")
+      .select("*")
+      .eq("user_id", payload.user_id)
+      .limit(1)
+      .single();
+
+    if (acctErr || !account) {
+      return res.status(201).json({
+        template: insert,
+        note: "Saved locally. whatsapp_accounts row not found or missing tokens.",
+      });
+    }
+
+    // Check for duplicate template name if account exists
+    if (account) {
+      const { data: existingTemplate } = await supabase
+        .from("whatsapp_templates")
+        .select("wt_id")
+        .eq("account_id", account.wa_id)
+        .eq("name", payload.name)
+        .limit(1)
+        .single();
+
+      if (existingTemplate) {
+        return res.status(409).json({
+          error: `A template with the name "${payload.name}" already exists.`,
+        });
+      }
+    }
+
     // Extract BODY example variables safely
     let bodyVariables = [];
     const bodyComponent = payload.components?.find((c) => c.type === "BODY");
@@ -54,27 +86,13 @@ export async function createTemplate(req, res) {
       buttons: payload.buttons || buttonList,
       preview: payload.preview || {},
       status: "PENDING",
+      media_id: payload.media_id || null,
     };
 
     const { error: insertErr } = await supabase
       .from("whatsapp_templates")
       .insert(insert);
     if (insertErr) throw insertErr;
-
-    // fetch account row (reads system_user_access_token, waba_id, phone_number_id)
-    const { data: account, error: acctErr } = await supabase
-      .from("whatsapp_accounts")
-      .select("*")
-      .eq("user_id", payload.user_id)
-      .limit(1)
-      .single();
-
-    if (acctErr || !account) {
-      return res.status(201).json({
-        template: insert,
-        note: "Saved locally. whatsapp_accounts row not found or missing tokens.",
-      });
-    }
 
     if (account.system_user_access_token && account.waba_id) {
       try {
