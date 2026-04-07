@@ -2,7 +2,7 @@
 
 import { log } from "console";
 import { supabase } from "../config/supabase.js";
-import { requiresWarmup, getWarmupLimits } from '../utils/warmupHelper.js';
+import { requiresWarmup, getWarmupLimits } from "../utils/warmupHelper.js";
 
 /* =====================================
    1️⃣ CREATE CAMPAIGN - WITH DAILY LIMIT CHECK
@@ -22,7 +22,7 @@ export const createCampaign = async (req, res) => {
       template_variables,
       media_id,
     } = req.body;
- 
+
     // Validate required fields
     if (
       !user_id ||
@@ -38,36 +38,36 @@ export const createCampaign = async (req, res) => {
           "Missing required fields: user_id, campaign_name, group_id, wt_id, account_id, scheduled_at",
       });
     }
- 
+
     // Check if scheduled_at is in the future
     const scheduledDate = new Date(scheduled_at);
     const now = new Date();
- 
+
     if (scheduledDate <= now) {
       return res.status(400).json({
         success: false,
         error: "Scheduled time must be in the future",
       });
     }
- 
+
     // Validate media if template requires it
     const { data: template } = await supabase
       .from("whatsapp_templates")
       .select("components")
       .eq("wt_id", wt_id)
       .single();
- 
+
     if (template) {
       let components = template.components;
       if (typeof components === "string") {
         components = JSON.parse(components);
       }
- 
+
       const headerComp = components.find((c) => c.type === "HEADER");
       const hasMedia =
         headerComp &&
         ["IMAGE", "VIDEO", "DOCUMENT"].includes(headerComp.format);
- 
+
       if (hasMedia && !media_id) {
         return res.status(400).json({
           success: false,
@@ -75,128 +75,135 @@ export const createCampaign = async (req, res) => {
         });
       }
     }
- 
+
     console.log(`📊 Fetching contacts for group: ${group_id}`);
- 
+
     // 🔥 STEP 1: Get total count first (fast, no data fetched)
     const { count: totalContacts, error: countError } = await supabase
       .from("group_contacts")
       .select("contact_id", { count: "exact", head: true })
       .eq("group_id", group_id)
       .eq("user_id", user_id);
- 
+
     if (countError) throw countError;
- 
+
     console.log(`✅ Total contacts in group: ${totalContacts}`);
- 
+
     if (totalContacts === 0) {
       return res.status(400).json({
         success: false,
         error: "No contacts found in this group",
       });
     }
- 
-// ✅ WARM-UP & DAILY LIMIT VALIDATION
-// Get WhatsApp account details
-const { data: account, error: accountError } = await supabase
-  .from("whatsapp_accounts")
-  .select("*")
-  .eq("wa_id", account_id)
-  .single();
 
-if (accountError || !account) {
-  return res.status(404).json({
-    success: false,
-    error: "WhatsApp account not found",
-  });
-}
+    // ✅ WARM-UP & DAILY LIMIT VALIDATION
+    // Get WhatsApp account details
+    const { data: account, error: accountError } = await supabase
+      .from("whatsapp_accounts")
+      .select("*")
+      .eq("wa_id", account_id)
+      .single();
 
-// ✅ HELPER: Reset daily counter if new day
-function shouldResetDailyCounter(last_reset) {
-  if (!last_reset) return true;
-  const now = new Date();
-  const lastReset = new Date(last_reset);
-  const nowDay = now.toISOString().split('T')[0];
-  const lastResetDay = lastReset.toISOString().split('T')[0];
-  return nowDay !== lastResetDay;
-}
+    if (accountError || !account) {
+      return res.status(404).json({
+        success: false,
+        error: "WhatsApp account not found",
+      });
+    }
 
-// ✅ Reset warmup daily counter if needed
-let daily_sent = account.warmup_daily_sent || 0;
-if (shouldResetDailyCounter(account.warmup_daily_reset_at)) {
-  console.log('🔄 Resetting warmup daily counter (new day)');
-  await supabase
-    .from('whatsapp_accounts')
-    .update({
-      warmup_daily_sent: 0,
-      warmup_daily_reset_at: new Date().toISOString()
-    })
-    .eq('wa_id', account_id);
-  daily_sent = 0;
-}
+    // ✅ HELPER: Reset daily counter if new day
+    function shouldResetDailyCounter(last_reset) {
+      if (!last_reset) return true;
+      const now = new Date();
+      const lastReset = new Date(last_reset);
+      const nowDay = now.toISOString().split("T")[0];
+      const lastResetDay = lastReset.toISOString().split("T")[0];
+      return nowDay !== lastResetDay;
+    }
 
-// ✅ NEW: Reset tier daily counter if needed (for post-warmup tracking)
-let tier_daily_sent = account.tier_daily_sent || 0;
-if (shouldResetDailyCounter(account.tier_daily_reset_at)) {
-  console.log('🔄 Resetting tier daily counter (new day)');
-  await supabase
-    .from('whatsapp_accounts')
-    .update({
-      tier_daily_sent: 0,
-      tier_daily_reset_at: new Date().toISOString()
-    })
-    .eq('wa_id', account_id);
-  tier_daily_sent = 0;
-}
+    // ✅ Reset warmup daily counter if needed
+    let daily_sent = account.warmup_daily_sent || 0;
+    if (shouldResetDailyCounter(account.warmup_daily_reset_at)) {
+      console.log("🔄 Resetting warmup daily counter (new day)");
+      await supabase
+        .from("whatsapp_accounts")
+        .update({
+          warmup_daily_sent: 0,
+          warmup_daily_reset_at: new Date().toISOString(),
+        })
+        .eq("wa_id", account_id);
+      daily_sent = 0;
+    }
+
+    // ✅ NEW: Reset tier daily counter if needed (for post-warmup tracking)
+    let tier_daily_sent = account.tier_daily_sent || 0;
+    if (shouldResetDailyCounter(account.tier_daily_reset_at)) {
+      console.log("🔄 Resetting tier daily counter (new day)");
+      await supabase
+        .from("whatsapp_accounts")
+        .update({
+          tier_daily_sent: 0,
+          tier_daily_reset_at: new Date().toISOString(),
+        })
+        .eq("wa_id", account_id);
+      tier_daily_sent = 0;
+    }
     // Check if tier requires warm-up and validate
     let warmupInfo = null;
-    
+
     if (requiresWarmup(account.messaging_limit_tier)) {
-      console.log(`🔥 Tier ${account.messaging_limit_tier} requires warm-up validation`);
-      
+      console.log(
+        `🔥 Tier ${account.messaging_limit_tier} requires warm-up validation`,
+      );
+
       // ========================================
-// CASE 1: WARM-UP COMPLETED - Check tier limit
-// ========================================
-if (account.warmup_completed) {
-  const tier_daily_limit = account.messaging_limit_per_day;
-  const daily_remaining = tier_daily_limit - tier_daily_sent;  // ✅ CHANGED: Use tier_daily_sent
+      // CASE 1: WARM-UP COMPLETED - Check tier limit
+      // ========================================
+      if (account.warmup_completed) {
+        const tier_daily_limit = account.messaging_limit_per_day;
+        const daily_remaining = tier_daily_limit - tier_daily_sent; // ✅ CHANGED: Use tier_daily_sent
 
-  console.log(`✅ Warm-up completed - checking tier daily limit`);
-  console.log(`   Tier limit: ${tier_daily_limit}/day`);
-  console.log(`   Tier daily sent: ${tier_daily_sent}`);  // ✅ CHANGED
-  console.log(`   Remaining: ${daily_remaining}`);
+        console.log(`✅ Warm-up completed - checking tier daily limit`);
+        console.log(`   Tier limit: ${tier_daily_limit}/day`);
+        console.log(`   Tier daily sent: ${tier_daily_sent}`); // ✅ CHANGED
+        console.log(`   Remaining: ${daily_remaining}`);
 
-  if (totalContacts > daily_remaining) {
-    return res.status(400).json({
-      success: false,
-      error: "TIER_DAILY_LIMIT_EXCEEDED",  // ✅ CHANGED: More specific error
-      warmup_completed: true,
-      tier: account.messaging_limit_tier,
-      tier_daily_limit,
-      tier_daily_sent,  // ✅ CHANGED: Return tier_daily_sent
-      daily_remaining,
-      contact_count: totalContacts,
-      message: `⚠️ Daily Tier Limit Exceeded!\n\n✅ Warm-up completed!\n\nYour tier (${account.messaging_limit_tier}) allows ${tier_daily_limit} messages per day.\n\nToday's usage: ${tier_daily_sent}/${tier_daily_limit}\nRemaining: ${daily_remaining}\nYour campaign: ${totalContacts}\n\nReduce to ${daily_remaining} contacts or wait until tomorrow.`,
-      suggestion: daily_remaining > 0 
-        ? `Reduce to ${daily_remaining} contacts`
-        : 'Daily limit reached. Resets at midnight UTC.'
-    });
-  }
+        if (totalContacts > daily_remaining) {
+          return res.status(400).json({
+            success: false,
+            error: "TIER_DAILY_LIMIT_EXCEEDED", // ✅ CHANGED: More specific error
+            warmup_completed: true,
+            tier: account.messaging_limit_tier,
+            tier_daily_limit,
+            tier_daily_sent, // ✅ CHANGED: Return tier_daily_sent
+            daily_remaining,
+            contact_count: totalContacts,
+            message: `⚠️ Daily Tier Limit Exceeded!\n\n✅ Warm-up completed!\n\nYour tier (${account.messaging_limit_tier}) allows ${tier_daily_limit} messages per day.\n\nToday's usage: ${tier_daily_sent}/${tier_daily_limit}\nRemaining: ${daily_remaining}\nYour campaign: ${totalContacts}\n\nReduce to ${daily_remaining} contacts or wait until tomorrow.`,
+            suggestion:
+              daily_remaining > 0
+                ? `Reduce to ${daily_remaining} contacts`
+                : "Daily limit reached. Resets at midnight UTC.",
+          });
+        }
 
-  warmupInfo = {
-    completed: true,
-    tier_limit: tier_daily_limit,
-    tier_daily_sent: tier_daily_sent,  // ✅ CHANGED
-    daily_remaining: daily_remaining - totalContacts
-  };
+        warmupInfo = {
+          completed: true,
+          tier_limit: tier_daily_limit,
+          tier_daily_sent: tier_daily_sent, // ✅ CHANGED
+          daily_remaining: daily_remaining - totalContacts,
+        };
 
-  console.log(`✅ Campaign (${totalContacts}) within tier limit (${daily_remaining} remaining)`);
-}
+        console.log(
+          `✅ Campaign (${totalContacts}) within tier limit (${daily_remaining} remaining)`,
+        );
+      }
       // ========================================
       // CASE 2: WARM-UP ACTIVE - Check warm-up limits + daily limit
       // ========================================
       else if (account.warmup_enabled && !account.warmup_completed) {
-        const warmup_limits = account.warmup_limits || getWarmupLimits(account.messaging_limit_tier);
+        const warmup_limits =
+          account.warmup_limits ||
+          getWarmupLimits(account.messaging_limit_tier);
         const current_stage = account.warmup_stage || 1;
         const current_limit = warmup_limits[current_stage - 1];
         const stage_progress = account.warmup_stage_progress || 0;
@@ -208,7 +215,7 @@ if (account.warmup_completed) {
 
         // ✅ CHECK 1: DAILY LIMIT (most important!)
         const daily_remaining = current_limit - daily_sent;
-        
+
         if (totalContacts > daily_remaining) {
           return res.status(400).json({
             success: false,
@@ -223,15 +230,16 @@ if (account.warmup_completed) {
             warmup_limits,
             tier: account.messaging_limit_tier,
             message: `⚠️ Daily Limit Reached!\n\nWarm-up Stage ${current_stage} allows ${current_limit} messages per day.\n\nToday's usage: ${daily_sent}/${current_limit}\nRemaining today: ${daily_remaining}\nYour campaign: ${totalContacts}\n\nYou can send ${daily_remaining} more contacts today, or wait until tomorrow.`,
-            suggestion: daily_remaining > 0 
-              ? `Reduce campaign to ${daily_remaining} contacts`
-              : 'Daily limit reached. Resets at midnight UTC.'
+            suggestion:
+              daily_remaining > 0
+                ? `Reduce campaign to ${daily_remaining} contacts`
+                : "Daily limit reached. Resets at midnight UTC.",
           });
         }
 
         // ✅ CHECK 2: STAGE LIMIT (for progression)
         const stage_remaining = current_limit - stage_progress;
-        
+
         if (totalContacts > stage_remaining) {
           return res.status(400).json({
             success: false,
@@ -247,11 +255,14 @@ if (account.warmup_completed) {
             tier: account.messaging_limit_tier,
             message: `⚠️ Warm-up Stage ${current_stage}: Maximum ${current_limit} contacts for stage completion.\n\nStage progress: ${stage_progress}/${current_limit}\nRemaining to complete stage: ${stage_remaining}\nYour campaign: ${totalContacts}\n\nNote: You've sent ${daily_sent} messages today.`,
             suggestion: `Reduce to ${stage_remaining} contacts to complete Stage ${current_stage}`,
-            next_stage: current_stage < warmup_limits.length ? {
-              stage: current_stage + 1,
-              limit: warmup_limits[current_stage],
-              message: `After ${current_limit} messages, unlock Stage ${current_stage + 1} (${warmup_limits[current_stage]}/day)`
-            } : null
+            next_stage:
+              current_stage < warmup_limits.length
+                ? {
+                    stage: current_stage + 1,
+                    limit: warmup_limits[current_stage],
+                    message: `After ${current_limit} messages, unlock Stage ${current_stage + 1} (${warmup_limits[current_stage]}/day)`,
+                  }
+                : null,
           });
         }
 
@@ -261,61 +272,66 @@ if (account.warmup_completed) {
           progress: stage_progress,
           limits: warmup_limits,
           daily_sent,
-          daily_remaining: daily_remaining - totalContacts
+          daily_remaining: daily_remaining - totalContacts,
         };
 
         console.log(`✅ Campaign (${totalContacts}) within limits`);
         console.log(`   Daily: ${daily_sent + totalContacts}/${current_limit}`);
-        console.log(`   Stage: ${stage_progress + totalContacts}/${current_limit}`);
+        console.log(
+          `   Stage: ${stage_progress + totalContacts}/${current_limit}`,
+        );
       } else {
         console.log(`ℹ️ Warm-up disabled for this account`);
       }
     } else {
-  // ========================================
-  // Tier doesn't require warm-up (Tier 10K+)
-  // BUT still check tier daily limit!
-  // ========================================
-  const tier_daily_limit = account.messaging_limit_per_day;
-  const daily_remaining = tier_daily_limit - tier_daily_sent;  // ✅ CHANGED
+      // ========================================
+      // Tier doesn't require warm-up (Tier 10K+)
+      // BUT still check tier daily limit!
+      // ========================================
+      const tier_daily_limit = account.messaging_limit_per_day;
+      const daily_remaining = tier_daily_limit - tier_daily_sent; // ✅ CHANGED
 
-  console.log(`⏭️  Tier ${account.messaging_limit_tier} - no warm-up required`);
-  console.log(`   Tier limit: ${tier_daily_limit}/day`);
-  console.log(`   Tier daily sent: ${tier_daily_sent}`);  // ✅ CHANGED
-  console.log(`   Remaining: ${daily_remaining}`);
+      console.log(
+        `⏭️  Tier ${account.messaging_limit_tier} - no warm-up required`,
+      );
+      console.log(`   Tier limit: ${tier_daily_limit}/day`);
+      console.log(`   Tier daily sent: ${tier_daily_sent}`); // ✅ CHANGED
+      console.log(`   Remaining: ${daily_remaining}`);
 
-  if (totalContacts > daily_remaining) {
-    return res.status(400).json({
-      success: false,
-      error: "TIER_DAILY_LIMIT_EXCEEDED",
-      tier: account.messaging_limit_tier,
-      tier_daily_limit,
-      tier_daily_sent,  // ✅ CHANGED
-      daily_remaining,
-      contact_count: totalContacts,
-      message: `⚠️ Daily Tier Limit Exceeded!\n\nYour tier (${account.messaging_limit_tier}) allows ${tier_daily_limit} messages per day.\n\nToday's usage: ${tier_daily_sent}/${tier_daily_limit}\nRemaining: ${daily_remaining}\nYour campaign: ${totalContacts}\n\nReduce to ${daily_remaining} or wait until tomorrow.`,
-      suggestion: daily_remaining > 0 
-        ? `Reduce to ${daily_remaining} contacts`
-        : 'Daily limit reached. Resets at midnight UTC.'
-    });
-  }
+      if (totalContacts > daily_remaining) {
+        return res.status(400).json({
+          success: false,
+          error: "TIER_DAILY_LIMIT_EXCEEDED",
+          tier: account.messaging_limit_tier,
+          tier_daily_limit,
+          tier_daily_sent, // ✅ CHANGED
+          daily_remaining,
+          contact_count: totalContacts,
+          message: `⚠️ Daily Tier Limit Exceeded!\n\nYour tier (${account.messaging_limit_tier}) allows ${tier_daily_limit} messages per day.\n\nToday's usage: ${tier_daily_sent}/${tier_daily_limit}\nRemaining: ${daily_remaining}\nYour campaign: ${totalContacts}\n\nReduce to ${daily_remaining} or wait until tomorrow.`,
+          suggestion:
+            daily_remaining > 0
+              ? `Reduce to ${daily_remaining} contacts`
+              : "Daily limit reached. Resets at midnight UTC.",
+        });
+      }
 
-  warmupInfo = {
-    no_warmup: true,
-    tier_limit: tier_daily_limit,
-    tier_daily_sent,  // ✅ CHANGED
-    daily_remaining: daily_remaining - totalContacts
-  };
+      warmupInfo = {
+        no_warmup: true,
+        tier_limit: tier_daily_limit,
+        tier_daily_sent, // ✅ CHANGED
+        daily_remaining: daily_remaining - totalContacts,
+      };
 
-  console.log(`✅ Campaign (${totalContacts}) within tier limit`);
-}
+      console.log(`✅ Campaign (${totalContacts}) within tier limit`);
+    }
     // ✅ END: VALIDATION
- 
+
     // 🔥 STEP 2: Fetch ALL contacts using pagination
     let allContacts = [];
     let page = 0;
     const pageSize = 1000;
     let hasMore = true;
- 
+
     while (hasMore) {
       const { data: contacts, error: contactsError } = await supabase
         .from("group_contacts")
@@ -323,9 +339,9 @@ if (account.warmup_completed) {
         .eq("group_id", group_id)
         .eq("user_id", user_id)
         .range(page * pageSize, (page + 1) * pageSize - 1);
- 
+
       if (contactsError) throw contactsError;
- 
+
       if (contacts && contacts.length > 0) {
         allContacts = allContacts.concat(contacts);
         console.log(
@@ -333,20 +349,20 @@ if (account.warmup_completed) {
         );
         page++;
       }
- 
+
       if (!contacts || contacts.length < pageSize) {
         hasMore = false;
       }
     }
- 
+
     console.log(`✅ Total contacts fetched: ${allContacts.length}`);
- 
+
     if (allContacts.length !== totalContacts) {
       console.warn(
         `⚠️ Mismatch: Expected ${totalContacts}, got ${allContacts.length}`,
       );
     }
- 
+
     // 🔥 STEP 3: Create campaign
     const { data: campaign, error: campaignError } = await supabase
       .from("campaigns")
@@ -363,23 +379,23 @@ if (account.warmup_completed) {
         media_id: media_id || null,
         status: "scheduled",
         total_recipients: allContacts.length,
-        warmup_stage: (warmupInfo && warmupInfo.stage) ? warmupInfo.stage : null,
+        warmup_stage: warmupInfo && warmupInfo.stage ? warmupInfo.stage : null,
       })
       .select()
       .single();
- 
+
     if (campaignError) throw campaignError;
- 
+
     console.log(`📤 Campaign created: ${campaign.campaign_id}`);
     console.log(`👥 Creating ${allContacts.length} campaign messages...`);
- 
+
     // 🔥 STEP 4: Insert campaign messages in BATCHES
     const batchSize = 1000;
     let insertedCount = 0;
- 
+
     for (let i = 0; i < allContacts.length; i += batchSize) {
       const batch = allContacts.slice(i, i + batchSize);
- 
+
       const campaignMessages = batch.map((contact) => ({
         campaign_id: campaign.campaign_id,
         contact_id: contact.contact_id,
@@ -387,11 +403,11 @@ if (account.warmup_completed) {
         contact_name: contact.full_name,
         status: "pending",
       }));
- 
+
       const { error: messagesError } = await supabase
         .from("campaign_messages")
         .insert(campaignMessages);
- 
+
       if (messagesError) {
         console.error(
           `❌ Error inserting batch ${i / batchSize + 1}:`,
@@ -399,15 +415,15 @@ if (account.warmup_completed) {
         );
         throw messagesError;
       }
- 
+
       insertedCount += batch.length;
       console.log(
         `✅ Inserted batch ${i / batchSize + 1}: ${batch.length} messages (Total: ${insertedCount}/${allContacts.length})`,
       );
     }
- 
+
     console.log(`✅ All ${insertedCount} campaign messages created!`);
- 
+
     // ✅ Build response with warm-up info
     const response = {
       success: true,
@@ -415,16 +431,16 @@ if (account.warmup_completed) {
       data: {
         ...campaign,
         total_contacts_processed: insertedCount,
-      }
+      },
     };
- 
+
     // Add warm-up/tier info
     if (warmupInfo) {
       if (warmupInfo.completed) {
         response.warmup_info = {
           completed: true,
           tier_limit: warmupInfo.tier_limit,
-          daily_remaining: warmupInfo.daily_remaining
+          daily_remaining: warmupInfo.daily_remaining,
         };
         response.info_message = `✅ Warm-up completed! Sent ${insertedCount} (${warmupInfo.daily_remaining} remaining today)`;
       } else if (warmupInfo.stage) {
@@ -433,13 +449,12 @@ if (account.warmup_completed) {
       } else if (warmupInfo.no_warmup) {
         response.tier_info = {
           tier_limit: warmupInfo.tier_limit,
-          daily_remaining: warmupInfo.daily_remaining
+          daily_remaining: warmupInfo.daily_remaining,
         };
       }
     }
- 
+
     return res.status(201).json(response);
-    
   } catch (err) {
     console.error("createCampaign error:", err);
     return res.status(500).json({
@@ -599,17 +614,21 @@ export const getCampaignById = async (req, res) => {
     const stats = {
       total: messages?.length || 0,
       pending: messages?.filter((m) => m.status === "pending").length || 0,
-      // sent: messages?.filter((m) => m.sent_at !== null).length || 0,
-      sent:
-        messages?.filter(
-          (m) =>
-            m.status === "sent" ||
-            m.status === "delivered" ||
-            m.status === "read",
-        ).length || 0,
+      sent: messages?.filter((m) => m.sent_at !== null).length || 0,
+      // sent:
+      //   messages?.filter(
+      //     (m) =>
+      //       m.status === "sent" ||
+      //       m.status === "delivered" ||
+      //       m.status === "read",
+      //   ).length || 0,
       delivered: messages?.filter((m) => m.delivered_at !== null).length || 0,
       read: messages?.filter((m) => m.read_at !== null).length || 0,
       failed: messages?.filter((m) => m.status === "failed").length || 0,
+      undelivered:
+        messages?.filter((m) => m.status === "assumed_failed").length || 0,
+
+      processing: messages?.filter((m) => m.status === "sent").length || 0,
     };
 
     return res.status(200).json({
@@ -1258,6 +1277,27 @@ export const retryCampaign = async (req, res) => {
       });
     }
 
+    /* -------------------------------------
+   🚫 Block retry if still processing
+------------------------------------- */
+
+    const { count: processingCount, error: processingError } = await supabase
+      .from("campaign_messages")
+      .select("cm_id", { count: "exact", head: true }) // ✅ lighter than "*"
+      .eq("campaign_id", campaign_id)
+      .eq("status", "sent");
+
+    if (processingError) throw processingError;
+
+    console.log(`Processing messages count: ${processingCount}`);
+
+    if ((processingCount || 0) > 0) {
+      return res.status(400).json({
+        success: false,
+        error: `Retry not allowed. ${processingCount} messages are still processing.`,
+      });
+    }
+
     // /* -------------------------------------
     //    2. Find FAILED messages (retry < 3)
     // ------------------------------------- */
@@ -1290,7 +1330,8 @@ export const retryCampaign = async (req, res) => {
         .from("campaign_messages")
         .select("cm_id, retry_count")
         .eq("campaign_id", campaign_id)
-        .eq("status", "failed")
+        // .eq("status", "failed")
+        .in("status", ["failed", "assumed_failed"])
         .lt("retry_count", 3)
         .range(offset, offset + batchSize - 1);
 
@@ -1355,6 +1396,8 @@ export const retryCampaign = async (req, res) => {
         .update({
           status: "pending",
           sent_at: null,
+          delivered_at: null,
+          read_at: null,
           failed_at: null,
           error_message: null,
           error_code: null,

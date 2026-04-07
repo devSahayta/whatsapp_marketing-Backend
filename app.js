@@ -24,6 +24,8 @@ import campaignRoutes from "./routes/campaignRoutes.js";
 import paymentRoutes from "./routes/paymentRoutes.js";
 import mediaRoutes from "./routes/mediaRoutes.js";
 import WarmupRoute from "./routes/warmup.js";
+import googleRoutes from "./routes/google.routes.js";
+import integrationsRoutes from "./routes/integrations.routes.js";
 
 import woocommerceRoutes from "./routes/woocommerceRoutes.js";
 import woocommerceWebhookRoutes from "./routes/woocommerceWebhookRoutes.js";
@@ -84,6 +86,11 @@ app.use("/api/warmup", WarmupRoute);
 //routes for woocommerce integration
 app.use("/api/woocommerce", woocommerceRoutes);
 app.use("/webhooks/woocommerce", woocommerceWebhookRoutes);
+//google integration routes
+app.use("/api/integrations/google", googleRoutes);
+
+//integration status route
+app.use("/api/integrations", integrationsRoutes);
 
 // Start scheduler
 

@@ -143,6 +143,26 @@ export const createGroupWithCsv = async (req, res) => {
   }
 };
 
+/* -------------------- CREATE EMPTY GROUP -------------------- */
+
+export const createEmptyGroup = async (req, res) => {
+  try {
+    const { user_id, group_name, description } = req.body;
+
+    const group = await createGroup({
+      user_id,
+      group_name,
+      description,
+      status: "active",
+    });
+
+    res.status(201).json({ group });
+  } catch (err) {
+    console.error("createEmptyGroup error:", err);
+    res.status(500).json({ error: "Failed to create group" });
+  }
+};
+
 /* -------------------- GET GROUPS -------------------- */
 
 export const getGroupsByUser = async (req, res) => {

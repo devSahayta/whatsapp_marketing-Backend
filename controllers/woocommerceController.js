@@ -1,6 +1,7 @@
 // controllers/woocommerceController.js
 
 import axios from "axios";
+import FormData from "form-data";
 import { supabase } from "../config/supabase.js";
 
 // ─── Helpers ────────────────────────────────────────────────────
@@ -97,6 +98,127 @@ function buildTemplateVariables(order, variableMap) {
   return variables;
 }
 
+// ─── NEW: Fetch product image from WooCommerce ──────────────────────────────
+
+async function fetchProductImage(order, connection) {
+  try {
+    const productId = order.line_items?.[0]?.product_id;
+    if (!productId) {
+      console.log("   ⚠️  No product_id in line items");
+      return null;
+    }
+
+    console.log(`   🖼️  Fetching image for product_id: ${productId}`);
+
+    const client = wcClient(
+      connection.store_url,
+      connection.consumer_key,
+      connection.consumer_secret,
+    );
+
+    const response = await client.get(`/products/${productId}`);
+    const imageUrl = response.data?.images?.[0]?.src;
+
+    if (!imageUrl) {
+      console.log("   ⚠️  No image found for this product");
+      return null;
+    }
+
+    console.log(`   ✅ Image URL found: ${imageUrl}`);
+    return imageUrl;
+  } catch (err) {
+    console.warn("   ⚠️  fetchProductImage failed:", err.message);
+    return null;
+  }
+}
+
+// ─── NEW: Download image and upload to Meta ─────────────────────────────────
+
+async function uploadImageToMeta(imageUrl, account) {
+  try {
+    console.log(`   📤 Uploading product image to Meta...`);
+
+    // Step 1 — Download image as buffer
+    const imageResponse = await axios.get(imageUrl, {
+      responseType: "arraybuffer",
+      timeout: 15000,
+    });
+
+    const imageBuffer = Buffer.from(imageResponse.data);
+    const contentType = imageResponse.headers["content-type"] || "image/jpeg";
+
+    console.log(
+      `   📎 Image type: ${contentType}, size: ${imageBuffer.length} bytes`,
+    );
+
+    // Step 2 — Skip WebP, Meta doesn't support it
+    if (contentType.includes("webp")) {
+      console.log(
+        "   ⚠️  WebP not supported by Meta — falling back to text-only",
+      );
+      return null;
+    }
+
+    // Step 3 — Upload directly to phone_number_id/media endpoint
+    const form = new FormData();
+    form.append("messaging_product", "whatsapp");
+    form.append("type", contentType);
+    form.append("file", imageBuffer, {
+      filename: "product-image.jpg",
+      contentType,
+    });
+
+    const uploadResponse = await axios.post(
+      `https://graph.facebook.com/v21.0/${account.phone_number_id}/media`,
+      form,
+      {
+        headers: {
+          Authorization: `Bearer ${account.system_user_access_token}`,
+          ...form.getHeaders(),
+        },
+        timeout: 30000,
+      },
+    );
+
+    const mediaId = uploadResponse.data?.id;
+
+    if (!mediaId) {
+      console.log("   ⚠️  Meta returned no media_id");
+      return null;
+    }
+
+    console.log(`   ✅ Media uploaded to Meta, media_id: ${mediaId}`);
+    return mediaId;
+  } catch (err) {
+    console.warn(
+      "   ⚠️  uploadImageToMeta failed:",
+      err.response?.data || err.message,
+    );
+    return null;
+  }
+}
+
+//account id for whatsapp account linked to the user
+
+export async function getAccountId(req, res) {
+  const { user_id } = req.user;
+  try {
+    const { data, error } = await supabase
+      .from("whatsapp_accounts")
+      .select("wa_id")
+      .eq("user_id", user_id)
+      .single();
+    if (error || !data) {
+      return res
+        .status(404)
+        .json({ success: false, message: "No WhatsApp account found" });
+    }
+    return res.json({ success: true, wa_id: data.wa_id });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+}
+
 // ─── Controllers ────────────────────────────────────────────────
 
 /**
@@ -123,9 +245,18 @@ export async function connectStore(req, res) {
     try {
       // Verify credentials + get store name from WP site info (no auth needed)
       const [wcResponse, wpResponse] = await Promise.allSettled([
-        client.get("/orders?per_page=1"), // just to verify credentials work
-        axios.get(`${store_url.replace(/\/$/, "")}/wp-json`), // store name (public)
+        client.get("/system_status"), // lighter call than orders
+        axios.get(`${store_url.replace(/\/$/, "")}/wp-json`, {
+          timeout: 10000,
+        }),
       ]);
+
+      // Log what we got for debugging
+      console.log("WC Response status:", wcResponse.status);
+      console.log(
+        "WC Response data:",
+        wcResponse.value?.data || wcResponse.reason?.message,
+      );
 
       if (wcResponse.status === "rejected") {
         throw wcResponse.reason;
@@ -136,12 +267,17 @@ export async function connectStore(req, res) {
           wpResponse.status === "fulfilled"
             ? wpResponse.value.data?.name || store_url
             : store_url,
-        currency: "INR", // we'll default this, user can set it
+        currency: wcResponse.value?.data?.environment?.currency || "INR",
       };
     } catch (wcError) {
       console.error(
         "WC verification failed:",
         wcError.response?.data || wcError.message,
+      );
+      console.error("Status:", wcError.response?.status);
+      console.error(
+        "URL tried:",
+        `${store_url.replace(/\/$/, "")}/wp-json/wc/v3/orders?per_page=1`,
       );
       return res.status(400).json({
         success: false,
@@ -297,7 +433,29 @@ export async function createAutomation(req, res) {
     trigger_event,
     delay_minutes = 0,
     template_variable_map = {},
+    include_product_image = false, // ✅ added
   } = req.body;
+
+  console.log("📥 createAutomation body:", JSON.stringify(req.body, null, 2));
+
+  // ✅ If account_id not provided, fetch from whatsapp_accounts
+  let resolvedAccountId = account_id;
+  if (!resolvedAccountId) {
+    const { data: account } = await supabase
+      .from("whatsapp_accounts")
+      .select("wa_id")
+      .eq("user_id", user_id)
+      .single();
+
+    if (!account) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "No WhatsApp account found. Please set up your WhatsApp account first.",
+      });
+    }
+    resolvedAccountId = account.wa_id;
+  }
 
   // Valid trigger events
   const validEvents = [
@@ -307,7 +465,8 @@ export async function createAutomation(req, res) {
     "order.cancelled",
     "order.refunded",
     "order.on-hold",
-    "order.shipped", // ✅ added
+    "order.shipped",
+    "cart.abandoned",
   ];
 
   if (!validEvents.includes(trigger_event)) {
@@ -317,10 +476,10 @@ export async function createAutomation(req, res) {
     });
   }
 
-  if (!connection_id || !wt_id || !account_id) {
+  if (!connection_id || !wt_id) {
     return res.status(400).json({
       success: false,
-      message: "connection_id, wt_id, and account_id are required",
+      message: "connection_id and wt_id are required",
     });
   }
 
@@ -331,11 +490,12 @@ export async function createAutomation(req, res) {
         user_id,
         connection_id,
         wt_id,
-        account_id,
+        account_id: resolvedAccountId,
         trigger_event,
         delay_minutes,
         template_variable_map,
         is_active: true,
+        include_product_image, // ✅ now uses destructured value
       })
       .select()
       .single();
@@ -405,6 +565,7 @@ export async function updateAutomation(req, res) {
     "delay_minutes",
     "template_variable_map",
     "trigger_event",
+    "include_product_image",
   ];
   const safeUpdates = {};
 
@@ -551,6 +712,24 @@ export async function handleWebhook(req, res) {
 
     console.log(`   Mapped trigger: ${triggerEvent}`);
 
+    // ✅ If order was created, check if it was an abandoned cart and mark recovered
+    if (mappedTrigger === "order.created") {
+      const { error: recErr } = await supabase
+        .from("woocommerce_cart_recovery")
+        .update({
+          status: "recovered",
+          recovered_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq("connection_id", connectionId)
+        .eq("wc_order_id", String(order.id))
+        .eq("status", "sent");
+
+      if (!recErr) {
+        console.log(`   🎉 Cart recovery detected for order ${order.id}`);
+      }
+    }
+
     // 3. Find active automations matching this connection + trigger
     const { data: automations, error: autoError } = await supabase
       .from("woocommerce_automations")
@@ -633,7 +812,6 @@ async function runAutomation(automation, order, phone, connection) {
       throw new Error("Template or WhatsApp account not found in automation");
     }
 
-    // Build template variables from order data
     const templateVariables = buildTemplateVariables(
       order,
       automation.template_variable_map || {},
@@ -643,14 +821,34 @@ async function runAutomation(automation, order, phone, connection) {
     console.log(`   📋 Template: ${template.name}`);
     console.log(`   📊 Variables:`, templateVariables);
 
-    // Build the WhatsApp message payload
+    // ✅ Fetch and upload product image if enabled on this automation
+    let mediaId = null;
+    if (automation.include_product_image) {
+      console.log(`   🖼️  Product image enabled for this automation`);
+      const imageUrl = await fetchProductImage(order, connection);
+      if (imageUrl) {
+        mediaId = await uploadImageToMeta(imageUrl, account);
+      }
+      if (!mediaId) {
+        console.log(
+          `   ⚠️  No media_id — sending text-only (graceful fallback)`,
+        );
+      }
+    }
+
+    // Build payload — passes mediaId if available
     const messageBody = buildWhatsAppPayload(
       template,
       phone,
       templateVariables,
+      mediaId,
     );
 
-    // Send via WhatsApp Business API (same logic as your campaign scheduler)
+    console.log(`   📤 Sending WhatsApp message...`);
+    if (mediaId) {
+      console.log(`   🖼️  With product image (media_id: ${mediaId})`);
+    }
+
     const waResponse = await axios.post(
       `https://graph.facebook.com/v21.0/${account.phone_number_id}/messages`,
       messageBody,
@@ -665,7 +863,6 @@ async function runAutomation(automation, order, phone, connection) {
 
     const wa_message_id = waResponse.data.messages?.[0]?.id;
 
-    // Log to whatsapp_messages table (same as campaigns)
     const { data: wmRecord } = await supabase
       .from("whatsapp_messages")
       .insert({
@@ -680,7 +877,6 @@ async function runAutomation(automation, order, phone, connection) {
       .select()
       .single();
 
-    // Mark log as sent
     await supabase.from("woocommerce_automation_logs").insert({
       ...logEntry,
       wm_id: wmRecord?.wm_id,
@@ -694,7 +890,6 @@ async function runAutomation(automation, order, phone, connection) {
       `   ❌ Automation failed:`,
       err.response?.data || err.message,
     );
-
     await supabase.from("woocommerce_automation_logs").insert({
       ...logEntry,
       status: "failed",
@@ -707,7 +902,12 @@ async function runAutomation(automation, order, phone, connection) {
  * Build the WhatsApp template message payload
  * Same structure as your campaign scheduler
  */
-function buildWhatsAppPayload(template, phoneNumber, variables) {
+function buildWhatsAppPayload(
+  template,
+  phoneNumber,
+  variables,
+  mediaId = null,
+) {
   let templateComponents = template.components;
   if (typeof templateComponents === "string") {
     try {
@@ -728,7 +928,21 @@ function buildWhatsAppPayload(template, phoneNumber, variables) {
     },
   };
 
-  // Add body variables if any
+  // ✅ Add image header if media_id provided
+  if (mediaId) {
+    messageBody.template.components.push({
+      type: "header",
+      parameters: [
+        {
+          type: "image",
+          image: { id: mediaId },
+        },
+      ],
+    });
+    console.log(`   🖼️  Image header added to payload`);
+  }
+
+  // Add body variables
   if (variables && Object.keys(variables).length > 0) {
     messageBody.template.components.push({
       type: "body",
@@ -740,4 +954,119 @@ function buildWhatsAppPayload(template, phoneNumber, variables) {
   }
 
   return messageBody;
+}
+
+// ─── Handle cache — refreshes every 6 hours ─────────────────────────────────
+let cachedHandle = null;
+let cacheExpiry = null;
+
+async function getPlaceholderHeaderHandle(account) {
+  try {
+    // Return cached handle if still valid
+    if (cachedHandle && cacheExpiry && Date.now() < cacheExpiry) {
+      console.log("✅ Using cached placeholder handle");
+      return cachedHandle;
+    }
+
+    const PLACEHOLDER_URL =
+      "https://ygynmoezdffuencztefl.supabase.co/storage/v1/object/public/default_templateImage/randomImg.jpg";
+
+    console.log("📷 Downloading placeholder image...");
+    const imageResponse = await axios.get(PLACEHOLDER_URL, {
+      responseType: "arraybuffer",
+      timeout: 15000,
+    });
+
+    const imageBuffer = Buffer.from(imageResponse.data);
+    const contentType = "image/jpeg";
+    console.log(`📷 Downloaded: ${imageBuffer.length} bytes`);
+
+    // Step 1 — Create upload session
+    const sessionResponse = await axios.post(
+      `https://graph.facebook.com/v21.0/${account.app_id}/uploads`,
+      null,
+      {
+        params: {
+          file_name: "placeholder.jpg",
+          file_length: imageBuffer.length,
+          file_type: contentType,
+          access_token: account.system_user_access_token,
+        },
+        timeout: 15000,
+      },
+    );
+
+    const sessionId = sessionResponse.data?.id;
+    if (!sessionId) throw new Error("No upload session ID returned");
+    console.log(`📷 Upload session: ${sessionId}`);
+
+    // Step 2 — Upload binary
+    const uploadResponse = await axios.post(
+      `https://graph.facebook.com/v21.0/${sessionId}`,
+      imageBuffer,
+      {
+        headers: {
+          Authorization: `OAuth ${account.system_user_access_token}`,
+          "Content-Type": contentType,
+          "Content-Length": imageBuffer.length,
+          file_offset: "0",
+        },
+        timeout: 30000,
+      },
+    );
+
+    const headerHandle = uploadResponse.data?.h;
+    if (!headerHandle) throw new Error("No header handle returned");
+
+    // Cache for 6 hours
+    cachedHandle = headerHandle;
+    cacheExpiry = Date.now() + 6 * 60 * 60 * 1000;
+
+    console.log(`✅ Fresh placeholder handle obtained and cached`);
+    return headerHandle;
+  } catch (err) {
+    console.error(
+      "❌ getPlaceholderHeaderHandle failed:",
+      err.response?.data || err.message,
+    );
+    throw err;
+  }
+}
+// ─── NEW ENDPOINT ────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/woocommerce/placeholder-handle
+ * Gets a Meta header_handle using a placeholder image
+ * Used by Template Guide when creating IMAGE header templates
+ */
+export async function getPlaceholderHandle(req, res) {
+  const { user_id } = req.user;
+
+  try {
+    // Get WhatsApp account
+    const { data: account, error: acctErr } = await supabase
+      .from("whatsapp_accounts")
+      .select("*")
+      .eq("user_id", user_id)
+      .single();
+
+    if (acctErr || !account) {
+      return res.status(400).json({
+        success: false,
+        message: "No WhatsApp account found",
+      });
+    }
+
+    const headerHandle = await getPlaceholderHeaderHandle(account);
+
+    return res.json({
+      success: true,
+      header_handle: headerHandle,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
 }

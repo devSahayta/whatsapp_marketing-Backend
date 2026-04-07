@@ -87,6 +87,7 @@ import {
   deleteContact,
   bulkDeleteContacts,
   deleteGroup,
+  createEmptyGroup,
 } from "../controllers/groupController.js";
 
 const router = express.Router();
@@ -98,6 +99,7 @@ router.post("/", upload.single("dataset"), createGroupWithCsv);
 router.get("/", getGroupsByUser);
 router.get("/:groupId", getGroupById);
 router.delete("/:groupId", deleteGroup);
+router.post("/create-empty", createEmptyGroup);
 
 // Participant routes
 router.get("/:groupId/participants", getGroupParticipants);
