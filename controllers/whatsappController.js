@@ -101,9 +101,13 @@ export const handleIncomingMessage = async (req, res) => {
 
       if (error) {
         console.error("❌ Failed to update message status:", error);
-      } else if (updatedMsg?.wm_id) {
+      }
+
+      console.log({ updatedMsg });
+
+      if (updatedMsg?.wm_id) {
         // 🔹 ALSO UPDATE CAMPAIGN MESSAGE
-        const { error: cmError } = await supabase
+        const { data: campaignMsg, error: cmError } = await supabase
           .from("campaign_messages")
           .update({
             status: status,
@@ -120,6 +124,12 @@ export const handleIncomingMessage = async (req, res) => {
         if (cmError) {
           console.error("❌ Failed to update campaign message:", cmError);
         }
+
+        console.log(
+          campaignMsg
+            ? { campaignMsg }
+            : `No campaign message linked to this WhatsApp message`,
+        );
       }
     }
 
