@@ -10,6 +10,11 @@ import {
 import { supabase } from "../config/supabase.js";
 import * as chatCtrl from "./chatController.js";
 import { downloadWhatsAppMedia } from "../utils/whatsappMedia.js";
+import {
+  handleBotMessage,
+  startBotSession,
+  matchKeywordTrigger,
+} from "../services/chatbotEngine.js";
 
 const BUCKET_NAME = process.env.SUPABASE_BUCKET || "message_media";
 const TEMPLATE_URL = process.env.TEMPLATE_BASE_URL;
@@ -171,7 +176,7 @@ export const handleIncomingMessage = async (req, res) => {
     // Get user id from whatsapp account table
     const { data: waAccounts, error: waErr } = await supabase
       .from("whatsapp_accounts")
-      .select("user_id")
+      .select("user_id, wa_id")
       .eq("waba_id", wabaId)
       .eq("phone_number_id", phoneNumberId);
 
@@ -216,11 +221,12 @@ export const handleIncomingMessage = async (req, res) => {
     // loop through every user to store message in their chat dashboard
     for (const acc of waAccounts) {
       const user_id = acc.user_id;
+      const account_id = acc.wa_id;
 
       // find chat
       const { data: chatRow } = await supabase
         .from("chats")
-        .select("chat_id")
+        .select("chat_id, mode, active_flow_id")
         .eq("user_id", user_id)
         .eq("phone_number", from)
         .order("created_at", { ascending: false })
@@ -229,10 +235,10 @@ export const handleIncomingMessage = async (req, res) => {
 
       if (!chatRow?.chat_id) {
         console.warn("⚠️ No chat found for", { user_id, from });
-        continue; // skip this user, but continue others
+        continue;
       }
 
-      // save message
+      // save incoming user message to chat dashboard
       await chatCtrl.saveMessage({
         chat_id: chatRow.chat_id,
         sender_type: "user",
@@ -243,6 +249,32 @@ export const handleIncomingMessage = async (req, res) => {
       });
 
       console.log("✅ Message saved for user:", user_id);
+
+      // ── Chatbot routing ──────────────────────────────────────────────────
+      if (chatRow.mode === "BOT" && chatRow.active_flow_id) {
+        // Chat is already in an active bot session — continue it
+        console.log("🤖 Routing to chatbot engine for chat:", chatRow.chat_id);
+        await handleBotMessage({
+          chat_id: chatRow.chat_id,
+          phone_number: from,
+          user_text: userText,
+          account_id,
+        });
+      } else if (chatRow.mode !== "BOT") {
+        // Chat is in MANUAL mode — check if user text matches a keyword trigger
+        const matchedFlowId = await matchKeywordTrigger(userText, account_id);
+        if (matchedFlowId) {
+          console.log("🤖 Keyword matched — starting bot session, flow:", matchedFlowId);
+          await startBotSession({
+            chat_id: chatRow.chat_id,
+            phone_number: from,
+            flow_id: matchedFlowId,
+            account_id,
+            user_text: userText,
+          });
+        }
+      }
+      // ─────────────────────────────────────────────────────────────────────
     }
 
     // 🔹 SAVE USER MESSAGE
