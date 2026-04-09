@@ -26,6 +26,7 @@ import mediaRoutes from "./routes/mediaRoutes.js";
 import WarmupRoute from "./routes/warmup.js";
 import googleRoutes from "./routes/google.routes.js";
 import integrationsRoutes from "./routes/integrations.routes.js";
+import chatbotRoutes from "./routes/chatbotRoutes.js";
 
 const app = express();
 app.use(express.json());
@@ -85,6 +86,9 @@ app.use("/api/integrations/google", googleRoutes);
 
 //integration status route
 app.use("/api/integrations", integrationsRoutes);
+
+//chatbot builder routes
+app.use("/api/chatbot", chatbotRoutes);
 
 // Start scheduler
 

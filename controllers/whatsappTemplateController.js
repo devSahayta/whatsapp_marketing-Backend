@@ -288,6 +288,55 @@ export async function listTemplates(req, res) {
   }
 }
 
+export async function getAllTemplates(req, res) {
+  try {
+    const user_id = req.query.user_id;
+
+    if (!user_id) {
+      return res.status(400).json({ error: "user_id required" });
+    }
+
+    const account = await getWhatsappAccount(user_id);
+
+    const { data, error } = await supabase
+      .from("whatsapp_templates")
+      .select("*")
+      .eq("account_id", account.wa_id)
+      .order("created_at", { ascending: false });
+
+    if (error) throw error;
+    return res.json(data);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message || err });
+  }
+}
+
+export async function getTemplateById(req, res) {
+  try {
+    const { wt_id } = req.params;
+
+    if (!wt_id) {
+      return res.status(400).json({ error: "wt_id is required" });
+    }
+
+    const { data, error } = await supabase
+      .from("whatsapp_templates")
+      .select("*")
+      .eq("wt_id", wt_id)
+      .single();
+
+    if (error || !data) {
+      return res.status(404).json({ error: "Template not found" });
+    }
+
+    return res.json(data);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message || err });
+  }
+}
+
 // export async function sendTemplate(req, res) {
 //   try {
 //     const wt_id = req.params.wt_id;
@@ -1197,6 +1246,41 @@ export async function deleteMetaTemplate(req, res) {
       templateId,
       template_name,
     );
+
+    // Fetch template from DB to get media_id before deleting
+    const { data: templateRow } = await supabase
+      .from("whatsapp_templates")
+      .select("media_id")
+      .eq("template_id", templateId)
+      .single();
+
+    // If template has a linked media, delete it from Meta and DB
+    if (templateRow?.media_id) {
+      try {
+        const mediaId = templateRow.media_id;
+
+        // Delete from Meta
+        const mediaMetaResult = await wsService.deleteMediaFromMeta(
+          mediaId,
+          account.system_user_access_token,
+        );
+        if (!mediaMetaResult.success) {
+          console.warn(
+            "META MEDIA DELETE FAILED → continuing:",
+            mediaMetaResult.error,
+          );
+        }
+
+        // Delete from whatsapp_media_uploads table
+        await supabase
+          .from("whatsapp_media_uploads")
+          .delete()
+          .eq("media_id", mediaId)
+          .eq("account_id", account.wa_id);
+      } catch (mediaErr) {
+        console.warn("Could not delete linked media:", mediaErr.message);
+      }
+    }
 
     // Optionally delete it from your supabase DB also (if stored)
     try {

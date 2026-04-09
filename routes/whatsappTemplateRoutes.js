@@ -18,6 +18,8 @@ import {
   getSingleMetaTemplate,
   deleteMetaTemplate,
   getBulkProgress,
+  getTemplateById,
+  getAllTemplates,
 } from "../controllers/whatsappTemplateController.js";
 // import fetch from "node-fetch";
 
@@ -32,6 +34,8 @@ router.post("/upload-binary", upload.single("file"), uploadBinaryToSession);
 router.post("/upload-media", upload.single("file"), uploadMedia);
 router.get("/:wt_id/status", checkTemplateStatus);
 router.get("/", listTemplates);
+router.get("/all", getAllTemplates);
+router.get("/:wt_id", getTemplateById);
 // sending template;
 router.post("/send/:templateId", sendTemplate);
 
