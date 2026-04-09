@@ -367,3 +367,118 @@ export const syncWhatsAppTier = async (req, res) => {
     });
   }
 };
+
+// ------------------------------------------------------
+// 5️⃣ EMBEDDED SIGNUP — Exchange code and create account
+// ------------------------------------------------------
+import {
+  exchangeCodeForToken,
+  getLongLivedToken,
+  fetchWABADetails,
+} from "../services/metaEmbeddedSignup.js";
+
+export const embeddedSignupHandler = async (req, res) => {
+  try {
+    const { code, user_id } = req.body;
+
+    if (!code || !user_id) {
+      return res.status(400).json({
+        success: false,
+        message: "code and user_id are required",
+      });
+    }
+
+    // -------------------------------------
+    // Check if account already exists
+    // -------------------------------------
+    const { data: existing } = await supabase
+      .from("whatsapp_accounts")
+      .select("*")
+      .eq("user_id", user_id)
+      .single();
+
+    if (existing) {
+      return res.status(200).json({
+        success: false,
+        message: "WhatsApp account already connected. Use update instead.",
+        data: existing,
+      });
+    }
+
+    // -------------------------------------
+    // Step 1: Exchange code → short token
+    // -------------------------------------
+    const shortLivedToken = await exchangeCodeForToken(code);
+
+    // -------------------------------------
+    // Step 2: Exchange short → long-lived token (60 days)
+    // -------------------------------------
+    const { token: longLivedToken, expiresAt } =
+      await getLongLivedToken(shortLivedToken);
+
+    // -------------------------------------
+    // Step 3: Fetch WABA + Phone details
+    // -------------------------------------
+    const { waba_id, phone_number_id, business_phone_number } =
+      await fetchWABADetails(longLivedToken);
+
+    // -------------------------------------
+    // Step 4: Fetch tier + quality from Meta
+    // (reuse your existing service functions)
+    // -------------------------------------
+    const { tier, limit } = await fetchMessagingTier(waba_id, longLivedToken);
+
+    const quality_rating = await fetchQualityRating(
+      phone_number_id,
+      longLivedToken,
+    );
+
+    const warmupConfig = getWarmupConfig(tier);
+
+    // -------------------------------------
+    // Step 5: Save to DB
+    // -------------------------------------
+    // Step 5: Save to DB
+    const { data, error } = await supabase
+      .from("whatsapp_accounts")
+      .insert([
+        {
+          user_id,
+          app_id: process.env.META_APP_ID, // ← add this
+          app_secret: process.env.META_APP_SECRET, // ← add this
+          waba_id,
+          phone_number_id,
+          business_phone_number,
+          system_user_access_token: longLivedToken,
+          access_token_expires_at: expiresAt,
+
+          // Tier + quality
+          messaging_limit_tier: tier,
+          messaging_limit_per_day: limit,
+          quality_rating,
+          last_tier_updated_at: new Date(),
+
+          // Warmup
+          ...warmupConfig,
+        },
+      ])
+      .select();
+
+    if (error) {
+      console.error("Supabase Insert Error:", error);
+      return res.status(400).json({ success: false, message: error.message });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "WhatsApp account connected successfully via Embedded Signup!",
+      data,
+    });
+  } catch (err) {
+    console.error("Embedded Signup Error:", err.message);
+    return res.status(500).json({
+      success: false,
+      message: err.message || "Server error during embedded signup",
+    });
+  }
+};
