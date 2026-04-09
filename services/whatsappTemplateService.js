@@ -13,6 +13,7 @@ export async function createTemplateOnMeta(wabaId, systemToken, payload) {
       Authorization: `Bearer ${systemToken}`,
       "Content-Type": "application/json",
     },
+    timeout: 60000, // ← increase to 60s
   });
   return resp.data;
 }
@@ -31,7 +32,7 @@ export async function createTemplateOnMeta(wabaId, systemToken, payload) {
 export async function checkTemplateStatusOnMeta(
   wabaId,
   templateName,
-  systemToken
+  systemToken,
 ) {
   const url = `${GRAPH}/${wabaId}/message_templates`;
 
@@ -69,7 +70,7 @@ export async function checkTemplateStatusOnMeta(
 export async function createUploadSession(
   appId,
   userToken,
-  { file_name, file_type }
+  { file_name, file_type },
 ) {
   const url = `${GRAPH}/${appId}/uploads`;
   const params = { file_name, file_type, access_token: userToken };
@@ -81,7 +82,7 @@ export async function uploadBinaryToSession(
   sessionId,
   buffer,
   contentType = "application/octet-stream",
-  accessToken
+  accessToken,
 ) {
   const url = `${GRAPH}/${sessionId}`;
   const headers = {
@@ -96,7 +97,7 @@ export async function uploadBinaryToSession(
 export async function uploadMediaForMessage(
   phoneNumberId,
   userToken,
-  formData
+  formData,
 ) {
   const url = `https://graph.facebook.com/v20.0/${phoneNumberId}/media`;
 
@@ -208,7 +209,7 @@ export async function listTemplatesFromMeta(wabaId, userToken) {
     } catch (err) {
       console.error(
         "Meta template fetch failed:",
-        err.response?.data || err.message
+        err.response?.data || err.message,
       );
       throw err;
     }
@@ -263,7 +264,7 @@ export async function listTemplatesFromDb(accountId, wabaId, systemToken) {
         const metaStatus = await checkTemplateStatusOnMeta(
           wabaId,
           preview.name,
-          systemToken
+          systemToken,
         );
 
         if (metaStatus.exists) {
@@ -282,7 +283,7 @@ export async function listTemplatesFromDb(accountId, wabaId, systemToken) {
       } catch (e) {
         console.warn(
           `Template status check failed for ${preview?.name}:`,
-          e.message
+          e.message,
         );
       }
     }

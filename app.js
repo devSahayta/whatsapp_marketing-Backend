@@ -28,6 +28,9 @@ import googleRoutes from "./routes/google.routes.js";
 import integrationsRoutes from "./routes/integrations.routes.js";
 import chatbotRoutes from "./routes/chatbotRoutes.js";
 
+import woocommerceRoutes from "./routes/woocommerceRoutes.js";
+import woocommerceWebhookRoutes from "./routes/woocommerceWebhookRoutes.js";
+
 const app = express();
 app.use(express.json());
 
@@ -81,6 +84,9 @@ app.use("/api/media", mediaRoutes);
 //warmup routes
 app.use("/api/warmup", WarmupRoute);
 
+//routes for woocommerce integration
+app.use("/api/woocommerce", woocommerceRoutes);
+app.use("/webhooks/woocommerce", woocommerceWebhookRoutes);
 //google integration routes
 app.use("/api/integrations/google", googleRoutes);
 

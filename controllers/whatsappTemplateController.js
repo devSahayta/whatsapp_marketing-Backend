@@ -22,18 +22,22 @@ export async function createTemplate(req, res) {
     const wt_id = uuidv4();
 
     // fetch account row (reads system_user_access_token, waba_id, phone_number_id)
-    const { data: account, error: acctErr } = await supabase
-      .from("whatsapp_accounts")
-      .select("*")
-      .eq("user_id", payload.user_id)
-      .limit(1)
-      .single();
-
-    if (acctErr || !account) {
-      return res.status(201).json({
-        template: insert,
-        note: "Saved locally. whatsapp_accounts row not found or missing tokens.",
-      });
+    let account;
+    if (payload.account_id) {
+      const { data } = await supabase
+        .from("whatsapp_accounts")
+        .select("*")
+        .eq("wa_id", payload.account_id)
+        .single();
+      account = data;
+    } else {
+      const { data } = await supabase
+        .from("whatsapp_accounts")
+        .select("*")
+        .eq("user_id", payload.user_id)
+        .limit(1)
+        .single();
+      account = data;
     }
 
     // Check for duplicate template name if account exists
@@ -73,7 +77,7 @@ export async function createTemplate(req, res) {
 
     const insert = {
       wt_id,
-      account_id: null,
+      account_id: payload.account_id || null,
       template_id: null,
       name: payload.name,
       language: payload.language || "en_US",
@@ -94,20 +98,44 @@ export async function createTemplate(req, res) {
       .insert(insert);
     if (insertErr) throw insertErr;
 
-    if (account.system_user_access_token && account.waba_id) {
+    if (account?.system_user_access_token && account.waba_id) {
       try {
-        const metaResp = await wsService.createTemplateOnMeta(
-          account.waba_id,
-          account.system_user_access_token,
-          {
-            name: payload.name,
-            language: payload.language,
-            category: payload.category,
-            parameter_format: payload.parameter_format || "positional",
-            components: payload.components,
-          },
+        console.log(
+          "📤 Sending to Meta:",
+          JSON.stringify(
+            {
+              name: payload.name,
+              components: payload.components,
+            },
+            null,
+            2,
+          ),
         );
 
+        let metaResp;
+        let attempts = 0;
+        while (attempts < 3) {
+          try {
+            attempts++;
+            console.log(`📤 Meta API attempt ${attempts}...`);
+            metaResp = await wsService.createTemplateOnMeta(
+              account.waba_id,
+              account.system_user_access_token,
+              {
+                name: payload.name,
+                language: payload.language,
+                category: payload.category,
+                parameter_format: payload.parameter_format || "positional",
+                components: payload.components,
+              },
+            );
+            break; // success — exit loop
+          } catch (retryErr) {
+            console.warn(`⚠️  Attempt ${attempts} failed:`, retryErr.message);
+            if (attempts >= 3) throw retryErr;
+            await new Promise((r) => setTimeout(r, 2000 * attempts)); // wait 2s, 4s
+          }
+        }
         let preview = null;
         const templateId = metaResp?.id;
         const templateName = payload.name;
@@ -147,9 +175,19 @@ export async function createTemplate(req, res) {
           .eq("wt_id", wt_id);
         return res.status(201).json({ template: insert, meta: metaResp });
       } catch (metaErr) {
-        return res
-          .status(201)
-          .json({ template: insert, meta_error: metaErr.message });
+        console.error("❌ Meta template creation failed:");
+        console.error("Status:", metaErr.response?.status);
+        console.error(
+          "Error:",
+          JSON.stringify(metaErr.response?.data, null, 2),
+        );
+        console.error("Full error:", metaErr.message);
+        console.error("Stack:", metaErr.stack?.split("\n")[0]);
+        return res.status(201).json({
+          template: insert,
+          meta_error: metaErr.message,
+          meta_error_detail: metaErr.response?.data,
+        });
       }
     }
 
