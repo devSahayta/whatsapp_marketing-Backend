@@ -713,7 +713,10 @@ export async function handleWebhook(req, res) {
     console.log(`   Mapped trigger: ${triggerEvent}`);
 
     // ✅ If order was created, check if it was an abandoned cart and mark recovered
-    if (mappedTrigger === "order.created") {
+    if (
+      triggerEvent === "order.created" ||
+      triggerEvent === "order.processing"
+    ) {
       const { error: recErr } = await supabase
         .from("woocommerce_cart_recovery")
         .update({
@@ -721,12 +724,12 @@ export async function handleWebhook(req, res) {
           recovered_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         })
-        .eq("connection_id", connectionId)
-        .eq("wc_order_id", String(order.id))
+        .eq("connection_id", connection_id)
+        .eq("wc_order_id", String(payload.id))
         .eq("status", "sent");
 
       if (!recErr) {
-        console.log(`   🎉 Cart recovery detected for order ${order.id}`);
+        console.log(`   🎉 Cart recovery detected for order ${payload.id}`);
       }
     }
 
