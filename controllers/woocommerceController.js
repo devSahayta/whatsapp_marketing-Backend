@@ -518,22 +518,23 @@ export async function createAutomation(req, res) {
  */
 export async function getAutomations(req, res) {
   const { user_id } = req.user;
+  const { connection_id } = req.query; // ✅ optional filter
 
   try {
-    const { data, error } = await supabase
+    let query = supabase
       .from("woocommerce_automations")
       .select(
-        `
-        *,
-        user_woocommerce_connections ( store_name, store_url ),
-        whatsapp_templates ( name, language )
-      `,
+        `*, user_woocommerce_connections(store_name, store_url), whatsapp_templates(name, language)`,
       )
       .eq("user_id", user_id)
       .order("created_at", { ascending: false });
 
-    if (error) throw error;
+    if (connection_id) {
+      query = query.eq("connection_id", connection_id); // ✅ filter by store
+    }
 
+    const { data, error } = await query;
+    if (error) throw error;
     return res.json({ success: true, automations: data });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
@@ -633,18 +634,22 @@ export async function deleteAutomation(req, res) {
  */
 export async function getLogs(req, res) {
   const { user_id } = req.user;
-  const { limit = 50, offset = 0 } = req.query;
+  const { connection_id, limit = 50, offset = 0 } = req.query;
 
   try {
-    const { data, error } = await supabase
+    let query = supabase
       .from("woocommerce_automation_logs")
       .select("*")
       .eq("user_id", user_id)
       .order("triggered_at", { ascending: false })
       .range(Number(offset), Number(offset) + Number(limit) - 1);
 
-    if (error) throw error;
+    if (connection_id) {
+      query = query.eq("connection_id", connection_id);
+    }
 
+    const { data, error } = await query;
+    if (error) throw error;
     return res.json({ success: true, logs: data });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
