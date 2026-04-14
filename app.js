@@ -43,6 +43,7 @@ app.use(
       "http://localhost:5173",
       "https://whatsapp-marketing-frontend-three.vercel.app",
       "https://samvaadik.com",
+      "https://deloras-pained-esthetically.ngrok-free.dev",
     ],
     credentials: true,
   }),
