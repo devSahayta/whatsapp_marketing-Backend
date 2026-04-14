@@ -1332,7 +1332,7 @@ export const retryCampaign = async (req, res) => {
         .eq("campaign_id", campaign_id)
         // .eq("status", "failed")
         .in("status", ["failed", "assumed_failed"])
-        .lt("retry_count", 3)
+        // .lt("retry_count", 3)
         .range(offset, offset + batchSize - 1);
 
       if (error) throw error;

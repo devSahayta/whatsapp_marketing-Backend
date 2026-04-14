@@ -16,6 +16,43 @@ import {
   matchKeywordTrigger,
 } from "../services/chatbotEngine.js";
 
+/* ─── Webhook Forwarding ────────────────────────────────────────────────────
+   Forward incoming messages to any external app that has registered a
+   webhook_url on their API key for this WhatsApp account.
+   Runs fire-and-forget — never blocks the main webhook response.
+   ─────────────────────────────────────────────────────────────────────────── */
+async function forwardToApiWebhooks(account_id, payload) {
+  try {
+    const { data: apiKeys } = await supabase
+      .from("api_keys")
+      .select("webhook_url, key_name")
+      .eq("account_id", account_id)
+      .eq("is_active", true)
+      .not("webhook_url", "is", null);
+
+    if (!apiKeys?.length) return;
+
+    for (const key of apiKeys) {
+      axios
+        .post(key.webhook_url, payload, {
+          headers: { "Content-Type": "application/json" },
+          timeout: 10000,
+        })
+        .then(() => {
+          console.log(`✅ Webhook forwarded to [${key.key_name}]: ${key.webhook_url}`);
+        })
+        .catch((err) => {
+          console.error(
+            `❌ Webhook forward failed for [${key.key_name}]:`,
+            err.message,
+          );
+        });
+    }
+  } catch (err) {
+    console.error("forwardToApiWebhooks error:", err.message);
+  }
+}
+
 const BUCKET_NAME = process.env.SUPABASE_BUCKET || "message_media";
 const TEMPLATE_URL = process.env.TEMPLATE_BASE_URL;
 
@@ -249,6 +286,17 @@ export const handleIncomingMessage = async (req, res) => {
       });
 
       console.log("✅ Message saved for user:", user_id);
+
+      // ── Forward to external API webhooks (fire-and-forget) ───────────────
+      forwardToApiWebhooks(account_id, {
+        event: "message.received",
+        account_id,
+        from: from,
+        message: userText || `[${message.type?.toUpperCase()}]`,
+        message_type: message.type || "text",
+        media_url: storedMediaPath || null,
+        timestamp: new Date().toISOString(),
+      });
 
       // ── Chatbot routing ──────────────────────────────────────────────────
       if (chatRow.mode === "BOT" && chatRow.active_flow_id) {

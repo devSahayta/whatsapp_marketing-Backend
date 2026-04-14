@@ -30,6 +30,8 @@ import chatbotRoutes from "./routes/chatbotRoutes.js";
 
 import woocommerceRoutes from "./routes/woocommerceRoutes.js";
 import woocommerceWebhookRoutes from "./routes/woocommerceWebhookRoutes.js";
+import apiKeyRoutes from "./routes/apiKeyRoutes.js";
+import publicApiRoutes from "./routes/publicApiRoutes.js";
 
 const app = express();
 app.use(express.json());
@@ -95,6 +97,12 @@ app.use("/api/integrations", integrationsRoutes);
 
 //chatbot builder routes
 app.use("/api/chatbot", chatbotRoutes);
+
+// ── Samvaadik API Service Layer ──────────────────────────────────────────────
+// Key management (Kinde-auth): create/list/revoke API keys
+app.use("/api/apikeys", apiKeyRoutes);
+// Public API (API-key-auth): send messages, get templates, upload media
+app.use("/v1", publicApiRoutes);
 
 // Start scheduler
 
