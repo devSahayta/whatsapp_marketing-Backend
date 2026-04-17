@@ -40,13 +40,9 @@ router.get("/chats", async (req, res) => {
       return res.status(400).json({ ok: false, error: "user_id is required" });
     }
 
-    const chats = await chatCtrl.getChatsForUser({
-      user_id,
-      limit,
-      offset,
-    });
+    const result = await chatCtrl.getChatsForUser({ user_id, limit, offset });
 
-    return res.json({ ok: true, chats });
+    return res.json({ ok: true, chats: result.chats, total: result.total });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ ok: false, error: err.message });
