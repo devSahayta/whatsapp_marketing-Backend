@@ -102,8 +102,8 @@ app.use("/api/chatbot", chatbotRoutes);
 //route for flight tracking
 // app.use("/api/flight-tracking", flightTrackingRoutes);
 
-//for elevenlabs agent
-// app.use("/api/agents", agentRoutes);
+//agent routes
+app.use("/api/agents", agentRoutes);
 
 app.get("/", (req, res) => res.send("API is running..."));
 
