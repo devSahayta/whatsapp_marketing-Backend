@@ -184,6 +184,7 @@ export const importContactsFromSheet = async (req, res) => {
       group_name,
       description,
       status: "active",
+      google_sheet_id: spreadsheetId,
     });
     createdGroupId = group.group_id;
 
@@ -278,12 +279,10 @@ export const exportCampaignToSheet = async (req, res) => {
     try {
       sheets = await getSheetsClient(userId);
     } catch {
-      return res
-        .status(400)
-        .json({
-          error:
-            "Google account is not connected. Please connect your Google account first.",
-        });
+      return res.status(400).json({
+        error:
+          "Google account is not connected. Please connect your Google account first.",
+      });
     }
 
     // Create a new spreadsheet named after the campaign
@@ -336,5 +335,138 @@ export const exportCampaignToSheet = async (req, res) => {
   } catch (err) {
     console.error("exportCampaign error:", err);
     res.status(500).json({ error: "Export failed" });
+  }
+};
+
+export const syncContactsFromSheet = async (req, res) => {
+  try {
+    const { group_id } = req.body;
+    const userId = req.user.user_id;
+
+    if (!group_id) {
+      return res.status(400).json({ error: "group_id is required" });
+    }
+
+    // Fetch the group and verify ownership + google_sheet_id
+    const { data: group, error: groupError } = await supabase
+      .from("groups")
+      .select("group_id, google_sheet_id")
+      .eq("group_id", group_id)
+      .eq("user_id", userId)
+      .single();
+
+    if (groupError || !group) {
+      return res.status(404).json({ error: "Group not found" });
+    }
+
+    if (!group.google_sheet_id) {
+      return res
+        .status(400)
+        .json({ error: "This group is not linked to a Google Sheet" });
+    }
+
+    const spreadsheetId = group.google_sheet_id;
+
+    const sheets = await getSheetsClient(userId);
+
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: "Sheet1!A1:C1000",
+    });
+
+    const rows = response.data.values;
+
+    if (!rows || rows.length < 2) {
+      return res.status(400).json({ error: "No data found in the sheet" });
+    }
+
+    // Validate headers
+    const headers = rows[0].map((h) => h?.toString().trim().toLowerCase());
+    if (headers[0] !== "name") {
+      return res.status(400).json({
+        error: "Invalid column format: first column header must be 'name'",
+      });
+    }
+    if (headers[1] !== "phoneno") {
+      return res.status(400).json({
+        error: "Invalid column format: second column header must be 'phoneno'",
+      });
+    }
+    if (headers.length >= 3 && headers[2] !== "email") {
+      return res.status(400).json({
+        error: "Invalid column format: third column header must be 'email'",
+      });
+    }
+
+    // Fetch existing phone numbers in this group to skip duplicates
+    const { data: existingContacts, error: existingError } = await supabase
+      .from("group_contacts")
+      .select("phone_number")
+      .eq("group_id", group_id);
+
+    if (existingError) throw existingError;
+
+    const existingPhones = new Set(existingContacts.map((c) => c.phone_number));
+
+    const invalidRows = [];
+    const seenPhones = new Set();
+    const newContacts = [];
+
+    rows.slice(1).forEach((row, index) => {
+      const rowNumber = index + 2;
+      const name = row[0]?.toString().trim();
+      const rawPhone = row[1]?.toString().trim();
+      const email = row[2]?.toString().trim() || null;
+
+      if (!name || !rawPhone) return; // skip empty rows
+
+      const phoneDigits = rawPhone.replace(/^\+/, "");
+      if (!/^\d+$/.test(phoneDigits)) {
+        invalidRows.push({
+          row: rowNumber,
+          phone: rawPhone,
+          reason: "Invalid phone number",
+        });
+        return;
+      }
+
+      // Skip if already in the group or seen twice in this sheet
+      if (existingPhones.has(rawPhone) || seenPhones.has(rawPhone)) return;
+      seenPhones.add(rawPhone);
+
+      newContacts.push({ name, phone: rawPhone, email });
+    });
+
+    if (newContacts.length === 0) {
+      return res.json({
+        success: true,
+        added: 0,
+        message: "No new contacts to add",
+        ...(invalidRows.length > 0 && { skippedRows: invalidRows }),
+      });
+    }
+
+    const contactRows = newContacts.map(({ name, phone, email }) => ({
+      group_id,
+      user_id: userId,
+      full_name: name,
+      phone_number: phone,
+      email,
+    }));
+
+    const { error: insertError } = await supabase
+      .from("group_contacts")
+      .insert(contactRows);
+
+    if (insertError) throw insertError;
+
+    res.json({
+      success: true,
+      added: newContacts.length,
+      ...(invalidRows.length > 0 && { skippedRows: invalidRows }),
+    });
+  } catch (err) {
+    console.error("syncContactsFromSheet error:", err);
+    res.status(500).json({ error: "Sync failed" });
   }
 };

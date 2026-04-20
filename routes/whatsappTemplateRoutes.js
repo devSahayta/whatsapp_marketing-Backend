@@ -32,10 +32,7 @@ router.post("/create", createTemplate);
 router.post("/create-upload-session", createUploadSession);
 router.post("/upload-binary", upload.single("file"), uploadBinaryToSession);
 router.post("/upload-media", upload.single("file"), uploadMedia);
-router.get("/:wt_id/status", checkTemplateStatus);
-router.get("/", listTemplates);
-router.get("/all", getAllTemplates);
-router.get("/:wt_id", getTemplateById);
+
 // sending template;
 router.post("/send/:templateId", sendTemplate);
 
@@ -57,6 +54,12 @@ router.get("/media-proxy/:mediaId", mediaProxy);
 
 //get url for the template placeholder image
 router.get("/media-proxy-url", mediaProxyUrl);
+
+//check template status
+router.get("/:wt_id/status", checkTemplateStatus);
+router.get("/", listTemplates);
+router.get("/all", getAllTemplates);
+router.get("/:wt_id", getTemplateById);
 
 // DELETE template from Meta
 router.delete("/meta/:templateId", deleteMetaTemplate);
