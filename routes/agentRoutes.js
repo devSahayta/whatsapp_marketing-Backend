@@ -1,16 +1,29 @@
+// routes/agentRoutes.js
+
 import express from "express";
 import {
-  getAgentConfig,
-  duplicateAgentForEvent,
-  updateAgentKnowledgeBase,
-  deleteAgentById,
+  createAgent,
+  getAgents,
+  getAgentById,
+  updateAgent,
+  deleteAgent,
+  testAgent,
+  getModelInfo,
 } from "../controllers/agentController.js";
 
 const router = express.Router();
 
-router.get("/:agentId", getAgentConfig);
-router.post("/duplicate", duplicateAgentForEvent);
-router.patch("/:agentId/knowledge-base", updateAgentKnowledgeBase);
-router.delete("/:agentId", deleteAgentById);
+// Model info (for frontend warnings)
+router.get("/models", getModelInfo);
+
+// Agent CRUD
+router.post("/", createAgent);
+router.get("/", getAgents);
+router.get("/:agent_id", getAgentById);
+router.put("/:agent_id", updateAgent);
+router.delete("/:agent_id", deleteAgent);
+
+// Test agent in isolation
+router.post("/:agent_id/test", testAgent);
 
 export default router;

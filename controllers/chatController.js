@@ -68,7 +68,7 @@ async function getPersonNameFromContacts(group_id, phone_number) {
       .from("group_contacts")
       .select("full_name, phone_number")
       .eq("group_id", group_id)
-      .limit(100); // Get all contacts for this group
+      .limit(1000); // ← was 100, bumped to 1000
 
     if (error || !data) return null;
 
@@ -160,55 +160,58 @@ export async function saveMessage({
  * Fetch chats for a group — useful for left sidebar.
  * Returns chats ordered by last_message_at desc.
  */
+
 export async function getChatsForGroup({ group_id, limit = 100, offset = 0 }) {
-  const { data, error } = await supabase
+  // Supabase max is 1000 per query — clamp to be safe
+  const safeLimit = Math.min(limit, 1000);
+
+  const { data, error, count } = await supabase
     .from("chats")
     .select(
       "chat_id, group_id, phone_number, person_name, last_message, created_at, last_message_at, mode",
+      { count: "exact" }, // ← get total count too
     )
     .eq("group_id", group_id)
     .order("last_message_at", { ascending: false })
     .order("created_at", { ascending: false })
-    .range(offset, offset + limit - 1);
+    .range(offset, offset + safeLimit - 1);
 
   if (error) throw error;
+  return { chats: data || [], total: count };
+}
 
-  // 🔍 Enhance with actual names from group_contacts
-  const enhanced = await Promise.all(
-    (data || []).map(async (chat) => {
-      // If person_name is missing or is a phone number, fetch from contacts
-      if (
-        !chat.person_name ||
-        chat.person_name === chat.phone_number ||
-        /^\d+$/.test(chat.person_name)
-      ) {
-        const actualName = await getPersonNameFromContacts(
-          group_id,
-          chat.phone_number,
-        );
+export async function getAllChatsForGroup(group_id) {
+  const PAGE_SIZE = 1000;
+  let allChats = [];
+  let offset = 0;
 
-        if (actualName) {
-          // Update the chat with actual name
-          await supabase
-            .from("chats")
-            .update({ person_name: actualName })
-            .eq("chat_id", chat.chat_id);
+  while (true) {
+    const { data, error } = await supabase
+      .from("chats")
+      .select(
+        "chat_id, group_id, phone_number, person_name, last_message, created_at, last_message_at, mode",
+      )
+      .eq("group_id", group_id)
+      .order("last_message_at", { ascending: false })
+      .range(offset, offset + PAGE_SIZE - 1);
 
-          chat.person_name = actualName;
-        }
-      }
-      return chat;
-    }),
-  );
+    if (error) throw error;
+    if (!data || data.length === 0) break;
 
-  return enhanced;
+    allChats = [...allChats, ...data];
+    if (data.length < PAGE_SIZE) break; // last page
+    offset += PAGE_SIZE;
+  }
+
+  return allChats;
 }
 
 export async function getChatsForUser({ user_id, limit = 100, offset = 0 }) {
-  const { data, error } = await supabase
+  const { data, error, count } = await supabase
     .from("chats")
     .select(
       "chat_id, user_id, phone_number, person_name, last_message, last_message_at, created_at, mode",
+      { count: "exact" }, // ← add this
     )
     .eq("user_id", user_id)
     .order("last_message_at", { ascending: false })
@@ -217,7 +220,7 @@ export async function getChatsForUser({ user_id, limit = 100, offset = 0 }) {
 
   if (error) throw error;
 
-  return data || [];
+  return { chats: data || [], total: count };
 }
 
 /**

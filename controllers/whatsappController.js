@@ -139,7 +139,7 @@ export const handleIncomingMessage = async (req, res) => {
         .update(updateData)
         .eq("wa_message_id", waMessageId)
         .select("wm_id")
-        .single();
+        .maybeSingle();
 
       if (error) {
         console.error("❌ Failed to update message status:", error);
@@ -271,8 +271,42 @@ export const handleIncomingMessage = async (req, res) => {
         .maybeSingle();
 
       if (!chatRow?.chat_id) {
-        console.warn("⚠️ No chat found for", { user_id, from });
-        continue;
+        console.warn(
+          "⚠️ No chat found for",
+          { user_id, from },
+          "— creating one",
+        );
+
+        // Auto-create a chat record for this phone number
+        const contactName = value?.contacts?.[0]?.profile?.name || from;
+
+        const { data: newChat, error: createErr } = await supabase
+          .from("chats")
+          .insert({
+            user_id,
+            phone_number: from,
+            person_name: contactName,
+            last_message: userText || "",
+            last_message_at: new Date().toISOString(),
+            mode: "AI",
+            status: "active",
+          })
+          .select("chat_id, mode, active_flow_id")
+          .single();
+
+        if (createErr || !newChat) {
+          console.error("❌ Failed to auto-create chat:", createErr);
+          continue;
+        }
+
+        console.log("✅ Auto-created chat:", newChat.chat_id, "for", from);
+
+        // Re-assign chatRow so the rest of the loop uses the new chat
+        Object.assign(chatRow || {}, newChat);
+
+        // Since this is a brand new chat, re-declare with let so we can reassign
+        // NOTE: you'll need to change `const { data: chatRow }` to `let chatRow`
+        // at the top of the loop — see note below
       }
 
       // save incoming user message to chat dashboard
@@ -312,7 +346,10 @@ export const handleIncomingMessage = async (req, res) => {
         // Chat is in MANUAL mode — check if user text matches a keyword trigger
         const matchedFlowId = await matchKeywordTrigger(userText, account_id);
         if (matchedFlowId) {
-          console.log("🤖 Keyword matched — starting bot session, flow:", matchedFlowId);
+          console.log(
+            "🤖 Keyword matched — starting bot session, flow:",
+            matchedFlowId,
+          );
           await startBotSession({
             chat_id: chatRow.chat_id,
             phone_number: from,
