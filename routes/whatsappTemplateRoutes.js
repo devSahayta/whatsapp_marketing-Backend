@@ -22,6 +22,7 @@ import {
   getAllTemplates,
   getSupabaseUploadUrl,
   uploadBinaryFromStorage,
+  uploadMediaFromStorage,
 } from "../controllers/whatsappTemplateController.js";
 // import fetch from "node-fetch";
 
@@ -38,6 +39,7 @@ router.post("/upload-media", upload.single("file"), uploadMedia);
 // For direct upload to Supabase storage
 router.post("/media/upload-url", getSupabaseUploadUrl);
 router.post("/media/upload-binary-from-storage", uploadBinaryFromStorage);
+router.post("/media/upload-media-from-storage", uploadMediaFromStorage);
 
 // sending template;
 router.post("/send/:templateId", sendTemplate);
