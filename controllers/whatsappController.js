@@ -39,7 +39,9 @@ async function forwardToApiWebhooks(account_id, payload) {
           timeout: 10000,
         })
         .then(() => {
-          console.log(`✅ Webhook forwarded to [${key.key_name}]: ${key.webhook_url}`);
+          console.log(
+            `✅ Webhook forwarded to [${key.key_name}]: ${key.webhook_url}`,
+          );
         })
         .catch((err) => {
           console.error(
@@ -191,6 +193,11 @@ export const handleIncomingMessage = async (req, res) => {
     let userText = message.text?.body?.trim() || "";
     if (message.type === "button") {
       userText = message?.button?.payload || message?.button?.text || userText;
+    }
+
+    // Handle incoming IMAGE from customer (e.g. payment screenshot)
+    if (message.type === "image" || message.type === "document") {
+      userText = "__CUSTOMER_SENT_IMAGE__";
     }
 
     let mediaId =
