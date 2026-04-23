@@ -248,6 +248,182 @@ export async function uploadBinaryToSession(req, res) {
   }
 }
 
+// NEW APPROACH for large file uploads using Supabase signed URLs
+const BUCKET = "template-media"; // bucket in Supabase storage for uploaded media
+
+export async function getSupabaseUploadUrl(req, res) {
+  try {
+    const { user_id, file_name, file_type } = req.body;
+    if (!user_id || !file_name) {
+      return res.status(400).json({ error: "user_id and file_name required" });
+    }
+
+    // Unique path per upload
+    const ext = file_name.split(".").pop();
+    const storagePath = `uploads/${user_id}/${Date.now()}.${ext}`;
+
+    const { data, error } = await supabase.storage
+      .from(BUCKET)
+      .createSignedUploadUrl(storagePath);
+
+    if (error) throw error;
+
+    return res.json({
+      signed_url: data.signedUrl, // frontend PUTs file here directly
+      token: data.token,
+      storage_path: storagePath, // frontend sends this back after upload
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message });
+  }
+}
+
+// This REPLACES the multer-based uploadBinaryToSession for large files
+
+export async function uploadBinaryFromStorage(req, res) {
+  try {
+    const { user_id, session_id, storage_path } = req.body;
+
+    if (!user_id || !session_id || !storage_path) {
+      return res.status(400).json({
+        error: "user_id, session_id, and storage_path required",
+      });
+    }
+
+    const account = await getWhatsappAccount(user_id);
+
+    // Download file from Supabase (outgoing request — no Vercel size limit)
+    const { data, error } = await supabase.storage
+      .from(BUCKET)
+      .download(storage_path);
+
+    if (error || !data) {
+      throw new Error("Failed to download from Supabase: " + error?.message);
+    }
+
+    // Convert Blob to Buffer
+    const arrayBuffer = await data.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    // Detect mime type from path
+    const ext = storage_path.split(".").pop().toLowerCase();
+    const mimeMap = {
+      jpg: "image/jpeg",
+      jpeg: "image/jpeg",
+      png: "image/png",
+      mp4: "video/mp4",
+      "3gp": "video/3gpp",
+      pdf: "application/pdf",
+      doc: "application/msword",
+      docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    };
+    const mimeType = mimeMap[ext] || "application/octet-stream";
+
+    // Forward buffer to Meta — same logic as your existing controller
+    const resp = await wsService.uploadBinaryToSession(
+      session_id,
+      buffer,
+      mimeType,
+      account.system_user_access_token,
+    );
+
+    // Clean up from Supabase after successful Meta upload (optional but recommended)
+    // await supabase.storage.from(BUCKET).remove([storage_path]);
+
+    return res.json(resp);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message || err });
+  }
+}
+
+// New endpoint to upload media from Supabase storage directly to used in templates (not sessions) — useful for media templates and template components
+export async function uploadMediaFromStorage(req, res) {
+  try {
+    const { user_id, type, storage_path, file_name, file_size } = req.body;
+
+    if (!user_id) return res.status(400).json({ error: "user_id required" });
+    if (!storage_path)
+      return res.status(400).json({ error: "storage_path required" });
+
+    const account = await getWhatsappAccount(user_id);
+    if (!account)
+      return res.status(404).json({ error: "WhatsApp account not found" });
+
+    // Download from Supabase — outgoing request, no Vercel size limit
+    const { data, error } = await supabase.storage
+      .from(BUCKET)
+      .download(storage_path);
+
+    if (error || !data) {
+      throw new Error("Failed to download from Supabase: " + error?.message);
+    }
+
+    const arrayBuffer = await data.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    // Detect mime type
+    const ext = storage_path.split(".").pop().toLowerCase();
+    const mimeMap = {
+      jpg: "image/jpeg",
+      jpeg: "image/jpeg",
+      png: "image/png",
+      mp4: "video/mp4",
+      "3gp": "video/3gpp",
+      pdf: "application/pdf",
+      doc: "application/msword",
+      docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      xls: "application/vnd.ms-excel",
+      xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      ppt: "application/vnd.ms-powerpoint",
+      pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      txt: "text/plain",
+    };
+    const mimeType = mimeMap[ext] || type || "application/octet-stream";
+    const originalName = file_name || storage_path.split("/").pop();
+
+    // Build FormData and forward to Meta — same logic as your original uploadMedia
+    const blob = new Blob([buffer], { type: mimeType });
+    const form = new FormData();
+    form.set("messaging_product", "whatsapp");
+    form.set("type", type || mimeType);
+    form.set("file", blob, originalName);
+
+    const metaResp = await wsService.uploadMediaForMessage(
+      account.phone_number_id,
+      account.system_user_access_token,
+      form,
+    );
+
+    // Save in database
+    const insertRow = {
+      account_id: account.wa_id,
+      media_id: metaResp.id,
+      file_name: originalName,
+      type: type || mimeType,
+      mime_type: mimeType,
+      size_bytes: file_size || buffer.byteLength,
+    };
+
+    await supabase.from("whatsapp_media_uploads").insert(insertRow);
+
+    // ✅ Now safe to clean up from Supabase — both Meta uploads are done
+    await supabase.storage.from(BUCKET).remove([storage_path]);
+
+    return res.json({
+      success: true,
+      media: metaResp,
+      saved: insertRow,
+    });
+  } catch (err) {
+    console.error("UPLOAD MEDIA FROM STORAGE ERROR:", err);
+    return res.status(500).json({
+      error: err.response?.data || err.message,
+    });
+  }
+}
+
 export async function checkTemplateStatus(req, res) {
   try {
     const wt_id = req.params.wt_id;

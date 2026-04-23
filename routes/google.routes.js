@@ -5,6 +5,7 @@ import {
   importContactsFromSheet,
   exportCampaignToSheet,
   getGoogleSheets,
+  syncContactsFromSheet,
 } from "../controllers/google.controller.js";
 import { authenticateUser } from "../middleware/authMiddleware.js";
 
@@ -18,5 +19,6 @@ router.get("/connect", authenticateUser, connectGoogle);
 router.get("/sheets", authenticateUser, getGoogleSheets);
 router.post("/import-contacts", authenticateUser, importContactsFromSheet);
 router.post("/export-campaign", authenticateUser, exportCampaignToSheet);
+router.post("/sync-contacts", authenticateUser, syncContactsFromSheet);
 
 export default router;
