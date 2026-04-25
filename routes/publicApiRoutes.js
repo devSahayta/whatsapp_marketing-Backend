@@ -8,6 +8,7 @@
 //   POST /v1/messages/template
 //   POST /v1/messages/text
 //   POST /v1/messages/interactive
+//   POST /v1/messages/schedule
 //   POST /v1/media/upload
 
 import express from "express";
@@ -19,6 +20,7 @@ import {
   sendTemplateMessage,
   sendTextMessage,
   sendInteractiveMessage,
+  scheduleTemplateMessage,
   uploadMedia,
 } from "../controllers/publicApiController.js";
 
@@ -57,6 +59,13 @@ router.post(
   "/messages/interactive",
   scopeGuard("send_message"),
   sendInteractiveMessage,
+);
+
+// POST /v1/messages/schedule  — schedule a template for a future datetime
+router.post(
+  "/messages/schedule",
+  scopeGuard("send_template"),
+  scheduleTemplateMessage,
 );
 
 // ── Media ─────────────────────────────────────────────────────────────────────

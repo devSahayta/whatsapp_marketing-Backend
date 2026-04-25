@@ -225,7 +225,7 @@ export async function getChatsForUser({ user_id, limit = 100, offset = 0 }) {
 
 /**
  * Fetch messages for a chat with pagination.
- * Returns messages in chronological order (oldest -> newest)
+ * Returns messages in chronological order (newest -> oldest)
  */
 export async function getMessagesForChat({
   chat_id,
@@ -238,7 +238,7 @@ export async function getMessagesForChat({
       "message_id, chat_id, sender_type, message, message_type, media_path, created_at, buttons",
     )
     .eq("chat_id", chat_id)
-    .order("created_at", { ascending: true })
+    .order("created_at", { ascending: false })
     .limit(limit);
 
   if (before) {
