@@ -446,6 +446,11 @@ async function execEndFlow(
 // messages until an exit condition is met
 // ─────────────────────────────────────────────────────────────────────────────
 
+// REPLACE the existing execAiAgent function in services/chatbotEngine.js
+// with this updated version
+
+// REPLACE the entire execAiAgent function in services/chatbotEngine.js with this
+
 async function execAiAgent(
   node,
   variables,
@@ -474,48 +479,263 @@ async function execAiAgent(
     return { advance: true, variables };
   }
 
-  // ── Check exit keywords first ──────────────────────────────────────────────
+  const upperText = userText.toUpperCase().trim();
+
+  // ── Handle incoming image from customer ───────────────────────────────────
+  if (userText === "__CUSTOMER_SENT_IMAGE__") {
+    const orderStage = variables._order_stage;
+
+    if (orderStage === "awaiting_payment_screenshot") {
+      // ── Extract order details from conversation history ──────────────────────
+      const history = variables._agent_history || [];
+
+      // Extract product name — use last product context first, then scan history
+      let productName = variables._last_product_name || "Unknown Product";
+      let totalAmount = 0;
+      let deliveryAddress = "To be confirmed";
+      let customerName = "Customer";
+
+      // Helper to extract field from Claude's messages in history
+      const extractFromHistory = (label) => {
+        for (let i = history.length - 1; i >= 0; i--) {
+          const msg = history[i];
+          if (msg.role === "assistant") {
+            const match = msg.content.match(
+              new RegExp(`${label}[:\\s*]+([^\\n]+)`, "i"),
+            );
+            if (match) return match[1].replace(/\*+/g, "").trim();
+          }
+        }
+        return null;
+      };
+
+      // Extract amount from history — look for ₹ followed by numbers
+      for (let i = history.length - 1; i >= 0; i--) {
+        const msg = history[i];
+        if (msg.role === "assistant") {
+          const amountMatch = msg.content.match(/₹\s*([\d,]+)/);
+          if (amountMatch) {
+            totalAmount = parseFloat(amountMatch[1].replace(/,/g, "")) || 0;
+            break;
+          }
+        }
+      }
+
+      // Extract product from history
+      const extractedProduct = extractFromHistory("product");
+      if (extractedProduct) productName = extractedProduct;
+
+      // Extract address from history
+      const extractedAddress = extractFromHistory("address");
+      if (extractedAddress) deliveryAddress = extractedAddress;
+
+      // Extract customer name — find where agent asked for name, next user message is the name
+      for (let i = 0; i < history.length; i++) {
+        const msg = history[i];
+        if (
+          msg.role === "assistant" &&
+          (msg.content.toLowerCase().includes("what's your name") ||
+            msg.content.toLowerCase().includes("your name") ||
+            msg.content.toLowerCase().includes("may i know your name"))
+        ) {
+          const nextMsg = history[i + 1];
+          if (nextMsg?.role === "user" && nextMsg.content.trim().length < 40) {
+            customerName = nextMsg.content.trim();
+            break;
+          }
+        }
+      }
+
+      // Save order to DB
+      await saveShopOrder({
+        chat_id,
+        account_id,
+        phone_number,
+        customer_name: customerName,
+        product_name: productName,
+        quantity: 1,
+        total_amount: totalAmount,
+        payment_method: "UPI",
+        delivery_address: deliveryAddress,
+        notes: "Payment screenshot received — verify manually",
+      });
+
+      // Reply to customer with full details
+      const confirmMsg =
+        `✅ Thank you! Your payment screenshot has been received.\n\n` +
+        `We will verify your payment and confirm your order within *30 minutes*. 🙏\n\n` +
+        `*Order Summary:*\n` +
+        `📦 ${productName}\n` +
+        `💰 ₹${totalAmount}\n` +
+        `📍 ${deliveryAddress}\n` +
+        `👤 ${customerName}\n\n` +
+        `Thank you for shopping with Baby's Shop! 👶🛍️`;
+
+      await sendWhatsAppText(phone_number, confirmMsg, account_id);
+      await saveBotMessage(chat_id, confirmMsg);
+
+      // Update session — order done, clear stage
+      return {
+        advance: false,
+        variables: {
+          ...variables,
+          _order_stage: "completed",
+          _agent_turns_left:
+            (variables._agent_turns_left ?? agent.max_turns) - 1,
+        },
+      };
+    }
+
+    // Image received but not in payment flow — ignore gracefully
+    const msg = "I can only process text messages. Please type your reply! 😊";
+    await sendWhatsAppText(phone_number, msg, account_id);
+    await saveBotMessage(chat_id, msg);
+    return { advance: false, variables };
+  }
+
+  // ── Fix 1: Broad photo request detection ─────────────────────────────────
+  const PHOTO_TRIGGERS = [
+    "PHOTO",
+    "PIC",
+    "PICTURE",
+    "IMAGE",
+    "SHOW ME",
+    "SEND PHOTO",
+    "SEND IMAGE",
+    "SEND PIC",
+    "CAN YOU SHARE",
+    "SHARE THE PIC",
+    "SHARE THE PHOTO",
+    "SHARE THE IMAGE",
+    "SEE THE PRODUCT",
+    "SHOW THE PRODUCT",
+    "PRODUCT PHOTO",
+    "PRODUCT IMAGE",
+    "PRODUCT PIC",
+    "CAN I SEE",
+  ];
+
+  const isPhotoRequest = PHOTO_TRIGGERS.some((t) => upperText.includes(t));
+
+  if (isPhotoRequest) {
+    const lastProduct = variables._last_product_name;
+
+    if (!lastProduct) {
+      // Ask Claude to clarify which product — don't hardcode a response
+      // Fall through to Claude below with a note injected
+    } else {
+      // Look up the product image
+      const { data: products } = await supabase
+        .from("shop_products")
+        .select("name, image_url, price, description")
+        .eq("account_id", account_id)
+        .ilike("name", `%${lastProduct}%`)
+        .limit(1);
+
+      const product = products?.[0];
+
+      if (product?.image_url) {
+        // Send acknowledgement text first
+        const ackMsg = `Here's the photo of *${product.name}*! 📸`;
+        await sendWhatsAppText(phone_number, ackMsg, account_id);
+        await saveBotMessage(chat_id, ackMsg);
+
+        // Send the actual image
+        const caption = `${product.name} — ₹${product.price}`;
+        await sendWhatsAppImage(
+          phone_number,
+          product.image_url,
+          caption,
+          account_id,
+        );
+        await saveBotMessage(chat_id, `[Image: ${product.name}]`);
+
+        // Follow up
+        const followUp = `Would you like to *ORDER* this, or shall I show you more products? 😊`;
+        await sendWhatsAppText(phone_number, followUp, account_id);
+        await saveBotMessage(chat_id, followUp);
+
+        console.log(`📸 [Engine] Image sent for: ${product.name}`);
+
+        // Update history so Claude knows what happened
+        const newHistory = [
+          ...(variables._agent_history || []),
+          { role: "user", content: userText },
+          {
+            role: "assistant",
+            content: `${ackMsg}\n[Product image sent]\n${followUp}`,
+          },
+        ];
+
+        return {
+          advance: false,
+          variables: {
+            ...variables,
+            _agent_history: newHistory,
+            _agent_turns_left:
+              (variables._agent_turns_left ?? agent.max_turns) - 1,
+          },
+        };
+      } else {
+        // No image in DB — let Claude respond naturally
+        const noPhotoMsg = `Sorry, I don't have a photo for *${product?.name || lastProduct}* right now. Would you like to ORDER it or see other products? 😊`;
+        await sendWhatsAppText(phone_number, noPhotoMsg, account_id);
+        await saveBotMessage(chat_id, noPhotoMsg);
+
+        const newHistory = [
+          ...(variables._agent_history || []),
+          { role: "user", content: userText },
+          { role: "assistant", content: noPhotoMsg },
+        ];
+
+        return {
+          advance: false,
+          variables: {
+            ...variables,
+            _agent_history: newHistory,
+            _agent_turns_left:
+              (variables._agent_turns_left ?? agent.max_turns) - 1,
+          },
+        };
+      }
+    }
+  }
+
+  // ── Check exit keywords ───────────────────────────────────────────────────
   const exitKeywords = (agent.exit_keywords || []).map((k) => k.toUpperCase());
-  if (
-    exitKeywords.length > 0 &&
-    exitKeywords.includes(userText.toUpperCase().trim())
-  ) {
+  if (exitKeywords.length > 0 && exitKeywords.includes(upperText)) {
     console.log("🚪 [Engine] Exit keyword detected:", userText);
     return { advance: true, variables };
   }
 
-  // ── Check turn limit ───────────────────────────────────────────────────────
+  // ── Check turn limit ──────────────────────────────────────────────────────
   const turnsLeft = variables._agent_turns_left ?? agent.max_turns;
 
   if (turnsLeft <= 0) {
-    console.log("⚠️ [Engine] Agent max turns reached — triggering fallback");
-
+    console.log("⚠️ [Engine] Agent max turns reached");
     if (agent.fallback_action === "handoff_to_agent") {
-      const handoffMsg = "I'm connecting you with a human agent. Please wait…";
-      await sendWhatsAppText(phone_number, handoffMsg, account_id);
-      await saveBotMessage(chat_id, handoffMsg);
+      const msg =
+        "Let me connect you with our team directly. Please wait a moment! 🙏";
+      await sendWhatsAppText(phone_number, msg, account_id);
+      await saveBotMessage(chat_id, msg);
       await handoffSession(session_id, chat_id);
       return { advance: false, variables };
     } else {
-      // end_flow
       await endSession(session_id, chat_id);
       return { advance: false, variables };
     }
   }
 
-  // ── Build conversation history ─────────────────────────────────────────────
+  // ── Build conversation history ────────────────────────────────────────────
   const agentHistory = variables._agent_history || [];
-
-  // Inject session variables into system prompt
   const systemPrompt = interpolate(
     agent.system_prompt || "You are a helpful assistant.",
     variables,
   );
 
-  // Add the new user message
   const updatedHistory = [...agentHistory, { role: "user", content: userText }];
 
-  // ── Call Claude API ────────────────────────────────────────────────────────
+  // ── Call Claude ───────────────────────────────────────────────────────────
   let reply = "";
   try {
     const response = await anthropic.messages.create({
@@ -533,35 +753,405 @@ async function execAiAgent(
     );
   } catch (err) {
     console.error("❌ [Engine] Claude API error:", err.message);
-
-    // Handle rate limit gracefully
     if (err.status === 429) {
-      reply = "I'm a bit busy right now. Please try again in a moment.";
+      reply = "I'm a little busy right now. Please try again in a moment! 🙏";
     } else {
-      reply = "Sorry, I'm having trouble right now. Please try again.";
+      reply = "Sorry, I'm having a little trouble. Please try again!";
     }
   }
 
-  // ── Send reply ─────────────────────────────────────────────────────────────
+  // ── Send Claude's text reply ──────────────────────────────────────────────
   await sendWhatsAppText(phone_number, reply, account_id);
   await saveBotMessage(chat_id, reply);
 
-  // ── Update variables ───────────────────────────────────────────────────────
+  // After the UPI stage detection above
+
+  // ── Fix 2: If Claude promised a photo, actually send it ───────────────────
+  const PHOTO_PROMISE_PHRASES = [
+    "sending you the photo",
+    "sending the photo",
+    "photo is being sent",
+    "image is being sent",
+    "sending the image",
+    "here's the photo",
+    "here is the photo",
+    "sending now",
+    "photo now",
+    "sending you a photo",
+    "the photo is on its way",
+    "dispatching the photo",
+  ];
+
+  const claudePromisedPhoto = PHOTO_PROMISE_PHRASES.some((phrase) =>
+    reply.toLowerCase().includes(phrase),
+  );
+
+  if (claudePromisedPhoto) {
+    const lastProduct = variables._last_product_name;
+
+    if (lastProduct) {
+      const { data: products } = await supabase
+        .from("shop_products")
+        .select("name, image_url, price")
+        .eq("account_id", account_id)
+        .ilike("name", `%${lastProduct}%`)
+        .limit(1);
+
+      const product = products?.[0];
+
+      if (product?.image_url) {
+        const caption = `${product.name} — ₹${product.price}`;
+        await sendWhatsAppImage(
+          phone_number,
+          product.image_url,
+          caption,
+          account_id,
+        );
+        await saveBotMessage(chat_id, `[Image sent: ${product.name}]`);
+        console.log(
+          `📸 [Engine] Auto-sent promised image for: ${product.name}`,
+        );
+      }
+    }
+  }
+
+  // ── Detect product name from Claude's reply → update context ─────────────
+  let newLastProduct = variables._last_product_name;
+  try {
+    const { data: allProducts } = await supabase
+      .from("shop_products")
+      .select("name")
+      .eq("account_id", account_id);
+
+    if (allProducts) {
+      const replyLower = reply.toLowerCase();
+      const found = allProducts.find((p) =>
+        replyLower.includes(p.name.toLowerCase()),
+      );
+      if (found) {
+        newLastProduct = found.name;
+        console.log(`📦 [Engine] Product context updated: ${found.name}`);
+      }
+    }
+  } catch {
+    // Non-critical
+  }
+
+  // ── Detect and save order ─────────────────────────────────────────────────
+  // ── Detect order confirmation from Claude's reply ─────────────────────────
+  // Works for both COD and UPI — detects when Claude confirms an order
+  const ORDER_CONFIRMED_PHRASES = [
+    "order confirmed",
+    "✅ order confirmed",
+    "order is confirmed",
+    "your order has been confirmed",
+    "thank you for shopping",
+  ];
+
+  const isOrderConfirmed = ORDER_CONFIRMED_PHRASES.some((phrase) =>
+    reply.toLowerCase().includes(phrase),
+  );
+
+  if (isOrderConfirmed) {
+    try {
+      // Extract details from Claude's reply using regex
+      const extractField = (label, text) => {
+        const match = text.match(new RegExp(`${label}[:\\s*]+([^\\n]+)`, "i"));
+        return match ? match[1].replace(/\*+/g, "").trim() : null;
+      };
+
+      const productName =
+        extractField("product", reply) ||
+        variables._last_product_name ||
+        "Unknown Product";
+      const amountStr = extractField("amount", reply) || "0";
+      const amount = parseFloat(amountStr.replace(/[₹,\s]/g, "")) || 0;
+      const paymentMethod =
+        extractField("payment", reply) || (upperText === "COD" ? "COD" : "UPI");
+      const address =
+        extractField("address", reply) ||
+        variables.delivery_address ||
+        "To be confirmed";
+
+      // Extract customer name from conversation history
+      const history = variables._agent_history || [];
+      let customerName = "Customer";
+      for (let i = 0; i < history.length; i++) {
+        const msg = history[i];
+        if (
+          msg.role === "assistant" &&
+          msg.content.toLowerCase().includes("name")
+        ) {
+          const nextMsg = history[i + 1];
+          if (nextMsg?.role === "user" && nextMsg.content.length < 40) {
+            customerName = nextMsg.content.trim();
+            break;
+          }
+        }
+      }
+
+      console.log("🛍️ [Engine] Order detected — saving:", {
+        productName,
+        amount,
+        paymentMethod,
+      });
+
+      await saveShopOrder({
+        chat_id,
+        account_id,
+        phone_number,
+        customer_name: customerName,
+        product_name: productName,
+        quantity: 1,
+        total_amount: amount,
+        payment_method: paymentMethod,
+        delivery_address: address,
+        notes: reply.includes("screenshot")
+          ? "Payment screenshot received — verify manually"
+          : `Session: ${session_id}`,
+      });
+
+      console.log("✅ [Engine] Order saved and owner notified");
+    } catch (err) {
+      console.error("❌ [Engine] Failed to save order:", err.message);
+    }
+  }
+
+  // ── Update session variables ──────────────────────────────────────────────
   const newHistory = [...updatedHistory, { role: "assistant", content: reply }];
 
+  // ── Detect UPI payment stage ──────────────────────────────────────────────
+  const UPI_SENT_PHRASES = [
+    "babyshop@ybl",
+    "upi id:",
+    "send ₹",
+    "once you've paid",
+    "once paid",
+    "reply paid",
+  ];
+
+  const justSentUpiDetails = UPI_SENT_PHRASES.some((phrase) =>
+    reply.toLowerCase().includes(phrase),
+  );
+
+  // Build new variables — declared HERE before any use
   const newVariables = {
     ...variables,
     _agent_history: newHistory,
     _agent_turns_left: turnsLeft - 1,
+    _last_product_name: newLastProduct,
   };
 
-  // Optionally save last reply to a named variable
+  // Now safely set UPI stage and send QR
+  if (justSentUpiDetails) {
+    newVariables._order_stage = "awaiting_payment_screenshot";
+    console.log("💳 [Engine] UPI payment stage set — waiting for screenshot");
+
+    // Send UPI QR image
+    const qrUrl = process.env.UPI_QR_URL;
+    console.log("💳 [Engine] QR URL being sent:", qrUrl);
+    if (qrUrl) {
+      await sendWhatsAppImage(
+        phone_number,
+        qrUrl,
+        "Scan to pay via UPI — babyshop@ybl",
+        account_id,
+      );
+      await saveBotMessage(chat_id, "[UPI QR sent]");
+      console.log("💳 [Engine] UPI QR image sent");
+    } else {
+      console.warn("⚠️ [Engine] UPI_QR_URL not set in .env");
+    }
+  }
+
   if (save_response_as) {
     newVariables[save_response_as] = reply;
   }
 
-  // Stay on this node — wait for next user message
   return { advance: false, variables: newVariables };
+}
+
+// ─── ADD THESE TWO HELPERS anywhere after sendWhatsAppText ───────────────────
+
+async function sendWhatsAppImage(phone_number, image_url, caption, account_id) {
+  try {
+    const { data: acc, error } = await supabase
+      .from("whatsapp_accounts")
+      .select("phone_number_id, system_user_access_token")
+      .eq("wa_id", account_id)
+      .single();
+
+    if (error || !acc) {
+      console.error(
+        "❌ [Engine] Could not fetch WA account for image send:",
+        error,
+      );
+      return;
+    }
+
+    const url = `https://graph.facebook.com/v19.0/${acc.phone_number_id}/messages`;
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${acc.system_user_access_token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        to: phone_number,
+        type: "image",
+        image: {
+          link: image_url,
+          caption: caption || "",
+        },
+      }),
+    });
+
+    const result = await response.json();
+
+    if (!response.ok) {
+      console.error(
+        "❌ [Engine] WA image send failed:",
+        JSON.stringify(result),
+      );
+    } else {
+      console.log("✅ [Engine] Image sent to", phone_number);
+    }
+  } catch (err) {
+    console.error("❌ [Engine] sendWhatsAppImage error:", err.message);
+  }
+}
+
+// ── Save a shop order to DB + notify shop owner via WhatsApp ──────────────────
+async function saveShopOrder({
+  chat_id,
+  account_id,
+  phone_number,
+  customer_name,
+  product_name,
+  quantity = 1,
+  total_amount,
+  payment_method,
+  delivery_address,
+  notes,
+}) {
+  try {
+    // 1. Save order to DB
+    const { data: order, error } = await supabase
+      .from("shop_orders")
+      .insert({
+        chat_id,
+        account_id,
+        customer_name,
+        customer_phone: phone_number,
+        product_name,
+        quantity,
+        total_amount,
+        payment_method,
+        delivery_address,
+        status: "pending",
+        notes,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      console.error("❌ [Engine] saveShopOrder DB error:", error);
+      return null;
+    }
+
+    console.log("✅ [Engine] Order saved:", order.order_id);
+
+    // 2. Notify shop owner via WhatsApp
+    const OWNER_PHONE = process.env.SHOP_OWNER_PHONE; // e.g. "919876543210"
+    const OWNER_ACCOUNT = account_id;
+
+    if (OWNER_PHONE) {
+      const notification =
+        `🛍️ *New Order — Baby's Shop*\n\n` +
+        `📦 Product: ${product_name}\n` +
+        `🔢 Qty: ${quantity}\n` +
+        `💰 Amount: ₹${total_amount}\n` +
+        `💳 Payment: ${payment_method}\n` +
+        `👤 Customer: ${customer_name}\n` +
+        `📞 Phone: ${phone_number}\n` +
+        `📍 Address: ${delivery_address}\n` +
+        `🕐 Time: ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}\n\n` +
+        `Order ID: ${order.order_id.slice(0, 8).toUpperCase()}`;
+
+      await sendWhatsAppText(OWNER_PHONE, notification, OWNER_ACCOUNT);
+      console.log("✅ [Engine] Owner notified about new order");
+    }
+
+    return order;
+  } catch (err) {
+    console.error("❌ [Engine] saveShopOrder error:", err.message);
+    return null;
+  }
+}
+
+// ── Detect if Claude's reply contains a PHOTO request and send image ──────────
+// Call this after Claude replies in execAiAgent
+// Claude will say something like: "SEND_PHOTO:Fisher-Price Activity Cube"
+// or we detect the word PHOTO in the user's message and look up the product
+async function handlePhotoRequest(
+  userText,
+  variables,
+  phone_number,
+  account_id,
+  chat_id,
+) {
+  const text = userText.toUpperCase().trim();
+
+  if (text !== "PHOTO" && !text.startsWith("PHOTO")) return false;
+
+  // Get the last product the user was looking at (stored in session variables)
+  const lastProduct = variables._last_product_name;
+  if (!lastProduct) {
+    await sendWhatsAppText(
+      phone_number,
+      "Which product would you like to see? Please tell me the product name first.",
+      account_id,
+    );
+    await saveBotMessage(chat_id, "Which product would you like to see?");
+    return true;
+  }
+
+  // Look up the product in DB by name (fuzzy match)
+  const { data: products } = await supabase
+    .from("shop_products")
+    .select("name, image_url, price, description")
+    .eq("account_id", account_id)
+    .ilike("name", `%${lastProduct}%`)
+    .limit(1);
+
+  const product = products?.[0];
+
+  if (!product?.image_url) {
+    await sendWhatsAppText(
+      phone_number,
+      `Sorry, no photo available for ${lastProduct} right now. Would you like to order it?`,
+      account_id,
+    );
+    await saveBotMessage(
+      chat_id,
+      `Sorry, no photo available for ${lastProduct}.`,
+    );
+    return true;
+  }
+
+  // Send the image
+  const caption = `${product.name}\n₹${product.price}\n${product.description || ""}`;
+  await sendWhatsAppImage(phone_number, product.image_url, caption, account_id);
+  await saveBotMessage(chat_id, `[Image: ${product.name}]`);
+
+  // Follow up with order prompt
+  const followUp = `Here's the photo of *${product.name}*! 😊\n\nWould you like to order it?\nReply *ORDER* to proceed or *BACK* to see more products.`;
+  await sendWhatsAppText(phone_number, followUp, account_id);
+  await saveBotMessage(chat_id, followUp);
+
+  return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
