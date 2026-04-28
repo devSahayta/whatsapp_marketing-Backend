@@ -232,7 +232,7 @@ async function execSendMessage(
   return { advance: true, variables };
 }
 
-// send_template: send a WhatsApp template message
+// send_template: send a WhatsApp template message with variable mapping and optional media
 async function execSendTemplate(
   node,
   variables,
@@ -241,19 +241,50 @@ async function execSendTemplate(
   chat_id,
 ) {
   try {
-    const { template_name, template_variable_map = {} } = node.config;
+    const {
+      template_name,
+      template_variable_map = {},
+      media_id,
+      header_format,
+    } = node.config;
+
     if (!template_name) return { advance: true, variables };
 
-    // Build template components with interpolated variables
     const components = [];
-    const mappedVars = Object.entries(template_variable_map);
+
+    /*
+      HEADER MEDIA SUPPORT
+    */
+    if (media_id) {
+      const type = header_format.toLowerCase();
+      components.push({
+        type: "header",
+        parameters: [
+          {
+            type,
+            [type]: { id: media_id },
+          },
+        ],
+      });
+    }
+
+    /*
+      BODY VARIABLES
+    */
+    const mappedVars = Object.entries(template_variable_map).sort(
+      (a, b) => Number(a[0]) - Number(b[0]),
+    );
 
     if (mappedVars.length > 0) {
       const bodyParams = mappedVars.map(([pos, varName]) => ({
         type: "text",
         text: interpolate(varName, variables) || "",
       }));
-      components.push({ type: "body", parameters: bodyParams });
+
+      components.push({
+        type: "body",
+        parameters: bodyParams,
+      });
     }
 
     const { data: acc } = await supabase
@@ -281,15 +312,15 @@ async function execSendTemplate(
           template: {
             name: template_name,
             language: { code: "en_US" },
-            components: components.length > 0 ? components : undefined,
+            components: components.length ? components : undefined,
           },
         }),
       },
     );
 
-    console.log("✅ [Engine] Template sent:", template_name);
+    console.log("✅ Template sent:", template_name);
   } catch (err) {
-    console.error("❌ [Engine] execSendTemplate error:", err.message);
+    console.error("❌ execSendTemplate error:", err.message);
   }
 
   return { advance: true, variables };
@@ -1154,6 +1185,114 @@ async function handlePhotoRequest(
   return true;
 }
 
+// schedule_message: schedule a WhatsApp template at now + delay_minutes
+async function execScheduleMessage(node, variables, phone_number, account_id) {
+  const {
+    template_id,
+    template_variable_map = {},
+    delay_minutes = 0,
+    timezone = "UTC",
+  } = node.config;
+
+  if (!template_id) {
+    console.warn(
+      "⚠️ [Engine] schedule_message node missing template_id — skipping",
+    );
+    return { advance: true, variables };
+  }
+
+  // Send at: now + delay_minutes
+  const resolvedScheduledAt = new Date(
+    Date.now() + Number(delay_minutes) * 60 * 1000,
+  ).toISOString();
+
+  console.log(
+    `⏰ [Engine] schedule_message: delay=${delay_minutes}m → scheduled at ${resolvedScheduledAt}`,
+  );
+
+  // ── Resolve template variable values against session variables ─────────────
+  const resolvedVars = {};
+  for (const [key, val] of Object.entries(template_variable_map)) {
+    resolvedVars[key] = interpolate(String(val || ""), variables);
+  }
+
+  // ── Get user_id + resolve wt_id — both scoped to the exact account_id ────────
+  const { data: waAccount } = await supabase
+    .from("whatsapp_accounts")
+    .select("user_id")
+    .eq("wa_id", account_id)
+    .single();
+
+  if (!waAccount?.user_id) {
+    console.error(
+      "❌ [Engine] schedule_message: could not get user_id for account:",
+      account_id,
+    );
+    return { advance: true, variables };
+  }
+
+  // Resolve wt_id from Meta's template_id using the exact account_id
+  let wt_id = node.config?.wt_id;
+  if (!wt_id) {
+    const { data: tpl } = await supabase
+      .from("whatsapp_templates")
+      .select("wt_id")
+      .eq("template_id", template_id)
+      .eq("account_id", account_id)
+      .single();
+
+    if (!tpl?.wt_id) {
+      console.error(
+        "❌ [Engine] schedule_message: template not found — template_id:",
+        template_id,
+        "account_id:",
+        account_id,
+      );
+      return { advance: true, variables };
+    }
+    wt_id = tpl.wt_id;
+  }
+
+  // ── Insert directly — avoids createScheduledMessage re-deriving account_id ──
+  // (createScheduledMessage calls getWhatsappAccount(user_id) internally, which
+  //  can pick the wrong account when a user has multiple WA accounts)
+  const scheduledDate = new Date(resolvedScheduledAt);
+  if (isNaN(scheduledDate.getTime())) {
+    console.error(
+      "❌ [Engine] schedule_message: invalid scheduled_at:",
+      resolvedScheduledAt,
+    );
+    return { advance: true, variables };
+  }
+
+  const { data: inserted, error: insertErr } = await supabase
+    .from("scheduled_messages")
+    .insert({
+      user_id: waAccount.user_id,
+      account_id,
+      phone_number,
+      wt_id,
+      template_variables: resolvedVars,
+      media_id: node.config.media_id || null,
+      scheduled_at: scheduledDate.toISOString(),
+      timezone,
+      status: "scheduled",
+    })
+    .select("sm_id")
+    .single();
+
+  if (insertErr) {
+    console.error(
+      "❌ [Engine] schedule_message DB insert failed:",
+      insertErr.message,
+    );
+  } else {
+    console.log("✅ [Engine] Message scheduled (sm_id):", inserted?.sm_id);
+  }
+
+  return { advance: true, variables };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SECTION 7 — Main node executor
 // Routes to the correct handler based on node type
@@ -1248,6 +1387,14 @@ async function executeNode({
         account_id,
         chat_id,
         session_id,
+      );
+
+    case "schedule_message":
+      return await execScheduleMessage(
+        node,
+        variables,
+        phone_number,
+        account_id,
       );
 
     case "trigger_campaign":

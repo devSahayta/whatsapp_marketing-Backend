@@ -155,6 +155,7 @@ export const createNode = async (req, res) => {
       "handoff_to_agent",
       "end_flow",
       "trigger_campaign",
+      "schedule_message",
     ];
 
     if (!node_type || !VALID_TYPES.includes(node_type)) {
