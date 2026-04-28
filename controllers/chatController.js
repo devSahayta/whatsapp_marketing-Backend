@@ -254,12 +254,23 @@ export async function getMessagesForChat({
   const messages = data || [];
 
   // 🔥 Auto-generate new signed URLs for messages with media_path
+  // Auto-generate signed URLs only for Supabase-stored media (not templates or bot images)
   for (let msg of messages) {
     if (!msg.media_path) continue;
 
+    // Skip templates — media_path is a Meta media ID, not a Supabase path
+    if (msg.message_type === "template") continue;
+
+    // Skip bot image messages — these are already public URLs
+    if (msg.sender_type === "bot") continue;
+
+    // Skip if it looks like a full URL already
+    if (msg.media_path.startsWith("http")) continue;
+
+    // Only generate signed URL for actual Supabase storage paths
     const { data: signed } = await supabase.storage
       .from("participant-docs")
-      .createSignedUrl(msg.media_path, 60 * 60 * 24); // 24 hours
+      .createSignedUrl(msg.media_path, 60 * 60 * 24);
 
     if (signed?.signedUrl) {
       msg.media_path = signed.signedUrl;

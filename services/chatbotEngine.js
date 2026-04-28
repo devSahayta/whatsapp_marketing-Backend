@@ -1,4 +1,4 @@
-// controllers/chatbotEngine.js
+// services/chatbotEngine.js
 // Runtime engine — executes chatbot flows node by node
 // Called from whatsappController.js
 
@@ -7,6 +7,24 @@ import Anthropic from "@anthropic-ai/sdk";
 import { ANTHROPIC_API_KEY } from "../config/anthropic.js";
 
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FIX 1 — In-memory processing lock
+// Prevents duplicate webhook execution (ngrok/local delivers same webhook 2-3×)
+// acquireLock returns false if chat is already being processed → caller returns early
+// ─────────────────────────────────────────────────────────────────────────────
+
+const processingLocks = new Map();
+
+function acquireLock(chat_id) {
+  if (processingLocks.get(chat_id)) return false;
+  processingLocks.set(chat_id, true);
+  return true;
+}
+
+function releaseLock(chat_id) {
+  processingLocks.delete(chat_id);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SECTION 1 — WhatsApp message sender
@@ -59,32 +77,37 @@ async function sendWhatsAppText(phone_number, text, account_id) {
 }
 
 // Save outgoing bot message to the chat dashboard
-async function saveBotMessage(chat_id, text) {
+async function saveBotMessage(
+  chat_id,
+  text,
+  message_type = "text",
+  media_path = null,
+) {
   try {
     const now = new Date().toISOString();
 
-    // Save message to messages table
     await supabase.from("messages").insert({
       chat_id,
       sender_type: "bot",
       message: text,
-      message_type: "text",
+      message_type,
+      media_path,
     });
 
-    // Also update the chat's last_message so the chat list shows the bot reply
     await supabase
       .from("chats")
       .update({
-        last_message: text.length > 80 ? text.slice(0, 80) + "…" : text,
+        last_message:
+          message_type === "image"
+            ? "📷 Image"
+            : text.length > 80
+              ? text.slice(0, 80) + "…"
+              : text,
         last_message_at: now,
       })
       .eq("chat_id", chat_id);
   } catch (err) {
-    // Non-critical — don't crash the engine if logging fails
-    console.warn(
-      "⚠️ [Engine] saveBotMessage failed (non-critical):",
-      err.message,
-    );
+    console.warn("⚠️ [Engine] saveBotMessage failed:", err.message);
   }
 }
 
@@ -679,7 +702,12 @@ async function execAiAgent(
           caption,
           account_id,
         );
-        await saveBotMessage(chat_id, `[Image: ${product.name}]`);
+        await saveBotMessage(
+          chat_id,
+          product.image_url,
+          "image",
+          product.image_url,
+        );
 
         // Follow up
         const followUp = `Would you like to *ORDER* this, or shall I show you more products? 😊`;
@@ -838,7 +866,12 @@ async function execAiAgent(
           caption,
           account_id,
         );
-        await saveBotMessage(chat_id, `[Image sent: ${product.name}]`);
+        await saveBotMessage(
+          chat_id,
+          product.image_url,
+          "image",
+          product.image_url,
+        );
         console.log(
           `📸 [Engine] Auto-sent promised image for: ${product.name}`,
         );
@@ -988,7 +1021,7 @@ async function execAiAgent(
         "Scan to pay via UPI — babyshop@ybl",
         account_id,
       );
-      await saveBotMessage(chat_id, "[UPI QR sent]");
+      await saveBotMessage(chat_id, qrUrl, "image", qrUrl);
       console.log("💳 [Engine] UPI QR image sent");
     } else {
       console.warn("⚠️ [Engine] UPI_QR_URL not set in .env");
@@ -1054,6 +1087,74 @@ async function sendWhatsAppImage(phone_number, image_url, caption, account_id) {
   }
 }
 
+async function sendWhatsAppTemplate(
+  phone_number,
+  account_id,
+  templateName,
+  variables = [],
+) {
+  try {
+    const { data: acc, error } = await supabase
+      .from("whatsapp_accounts")
+      .select("phone_number_id, system_user_access_token")
+      .eq("wa_id", account_id)
+      .single();
+
+    if (error || !acc) {
+      console.error(
+        "❌ [Engine] Could not fetch WA account for template send:",
+        error,
+      );
+      return;
+    }
+
+    const response = await fetch(
+      `https://graph.facebook.com/v19.0/${acc.phone_number_id}/messages`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${acc.system_user_access_token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          messaging_product: "whatsapp",
+          to: phone_number,
+          type: "template",
+          template: {
+            name: templateName,
+            language: { code: "en_US" },
+            components:
+              variables.length > 0
+                ? [
+                    {
+                      type: "body",
+                      parameters: variables.map((v) => ({
+                        type: "text",
+                        text: String(v),
+                      })),
+                    },
+                  ]
+                : [],
+          },
+        }),
+      },
+    );
+
+    const result = await response.json();
+
+    if (!response.ok) {
+      console.error(
+        "❌ [Engine] Template send failed:",
+        JSON.stringify(result),
+      );
+    } else {
+      console.log("✅ [Engine] Template notification sent to", phone_number);
+    }
+  } catch (err) {
+    console.error("❌ [Engine] sendWhatsAppTemplate error:", err.message);
+  }
+}
+
 // ── Save a shop order to DB + notify shop owner via WhatsApp ──────────────────
 async function saveShopOrder({
   chat_id,
@@ -1098,21 +1199,29 @@ async function saveShopOrder({
     const OWNER_PHONE = process.env.SHOP_OWNER_PHONE; // e.g. "919876543210"
     const OWNER_ACCOUNT = account_id;
 
+    // AFTER
     if (OWNER_PHONE) {
-      const notification =
-        `🛍️ *New Order — Baby's Shop*\n\n` +
-        `📦 Product: ${product_name}\n` +
-        `🔢 Qty: ${quantity}\n` +
-        `💰 Amount: ₹${total_amount}\n` +
-        `💳 Payment: ${payment_method}\n` +
-        `👤 Customer: ${customer_name}\n` +
-        `📞 Phone: ${phone_number}\n` +
-        `📍 Address: ${delivery_address}\n` +
-        `🕐 Time: ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}\n\n` +
-        `Order ID: ${order.order_id.slice(0, 8).toUpperCase()}`;
+      const timeStr = new Date().toLocaleString("en-IN", {
+        timeZone: "Asia/Kolkata",
+      });
+      const orderId = order.order_id.slice(0, 8).toUpperCase();
 
-      await sendWhatsAppText(OWNER_PHONE, notification, OWNER_ACCOUNT);
-      console.log("✅ [Engine] Owner notified about new order");
+      await sendWhatsAppTemplate(
+        OWNER_PHONE,
+        OWNER_ACCOUNT,
+        "order_notification", // ← must match template name exactly
+        [
+          product_name,
+          String(total_amount),
+          payment_method,
+          customer_name,
+          phone_number,
+          delivery_address,
+          timeStr,
+          orderId,
+        ],
+      );
+      console.log("✅ [Engine] Owner notified via template");
     }
 
     return order;
@@ -1175,7 +1284,7 @@ async function handlePhotoRequest(
   // Send the image
   const caption = `${product.name}\n₹${product.price}\n${product.description || ""}`;
   await sendWhatsAppImage(phone_number, product.image_url, caption, account_id);
-  await saveBotMessage(chat_id, `[Image: ${product.name}]`);
+  await saveBotMessage(chat_id, product.image_url, "image", product.image_url);
 
   // Follow up with order prompt
   const followUp = `Here's the photo of *${product.name}*! 😊\n\nWould you like to order it?\nReply *ORDER* to proceed or *BACK* to see more products.`;
@@ -1451,6 +1560,9 @@ async function runFlow({
       // Waiting nodes (wait_for_input, ai_agent) need state saved for next message
       const terminatedTypes = ["end_flow", "handoff_to_agent"];
       if (!terminatedTypes.includes(currentNode.node_type)) {
+        // FIX 2: Save session state IMMEDIATELY when pausing so that any
+        // duplicate webhook arriving within milliseconds reads the updated
+        // node/variables and doesn't re-execute this node.
         await updateSession(session_id, currentNode.node_id, variables);
         console.log(
           `[Engine] Paused at node: ${currentNode.node_type} — waiting for next message`,
@@ -1564,6 +1676,14 @@ export async function startBotSession({
   account_id,
   user_text,
 }) {
+  // FIX 3: Acquire lock — block duplicate webhook calls for the same chat
+  if (!acquireLock(chat_id)) {
+    console.warn(
+      `⚠️ [Engine] startBotSession blocked — already processing chat: ${chat_id}`,
+    );
+    return;
+  }
+
   try {
     console.log("🚀 [Engine] Starting bot session:", { chat_id, flow_id });
 
@@ -1617,6 +1737,8 @@ export async function startBotSession({
     });
   } catch (err) {
     console.error("❌ [Engine] startBotSession error:", err.message);
+  } finally {
+    releaseLock(chat_id); // always release, even on error
   }
 }
 
@@ -1631,6 +1753,14 @@ export async function handleBotMessage({
   user_text,
   account_id,
 }) {
+  // FIX 3: Acquire lock — block duplicate webhook calls for the same chat
+  if (!acquireLock(chat_id)) {
+    console.warn(
+      `⚠️ [Engine] handleBotMessage blocked — already processing chat: ${chat_id}`,
+    );
+    return;
+  }
+
   try {
     console.log("🤖 [Engine] Handling bot message for chat:", chat_id);
 
@@ -1673,5 +1803,7 @@ export async function handleBotMessage({
     });
   } catch (err) {
     console.error("❌ [Engine] handleBotMessage error:", err.message);
+  } finally {
+    releaseLock(chat_id); // always release, even on error
   }
 }
