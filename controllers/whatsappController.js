@@ -195,9 +195,15 @@ export const handleIncomingMessage = async (req, res) => {
       userText = message?.button?.payload || message?.button?.text || userText;
     }
 
-    // Handle incoming IMAGE from customer (e.g. payment screenshot)
-    if (message.type === "image" || message.type === "document") {
-      userText = "__CUSTOMER_SENT_IMAGE__";
+    // engineText is what gets sent to the bot engine
+    // userText stays as the real content for saving to messages table
+    let engineText = userText;
+    if (
+      message.type === "image" ||
+      message.type === "document" ||
+      message.type === "video"
+    ) {
+      engineText = "__CUSTOMER_SENT_IMAGE__";
     }
 
     let mediaId =
@@ -232,7 +238,7 @@ export const handleIncomingMessage = async (req, res) => {
       return res.sendStatus(200);
     }
 
-    let storedMediaPath = null;
+    let storedMediaPath = mediaId || null;
 
     if (mediaUrl) {
       try {
@@ -268,7 +274,7 @@ export const handleIncomingMessage = async (req, res) => {
       const account_id = acc.wa_id;
 
       // find chat
-      const { data: chatRow } = await supabase
+      let { data: chatRow } = await supabase
         .from("chats")
         .select("chat_id, mode, active_flow_id")
         .eq("user_id", user_id)
@@ -295,7 +301,7 @@ export const handleIncomingMessage = async (req, res) => {
             person_name: contactName,
             last_message: userText || "",
             last_message_at: new Date().toISOString(),
-            mode: "AI",
+            mode: "BOT",
             status: "active",
           })
           .select("chat_id, mode, active_flow_id")
@@ -309,7 +315,7 @@ export const handleIncomingMessage = async (req, res) => {
         console.log("✅ Auto-created chat:", newChat.chat_id, "for", from);
 
         // Re-assign chatRow so the rest of the loop uses the new chat
-        Object.assign(chatRow || {}, newChat);
+        chatRow = newChat;
 
         // Since this is a brand new chat, re-declare with let so we can reassign
         // NOTE: you'll need to change `const { data: chatRow }` to `let chatRow`
@@ -346,12 +352,12 @@ export const handleIncomingMessage = async (req, res) => {
         await handleBotMessage({
           chat_id: chatRow.chat_id,
           phone_number: from,
-          user_text: userText,
+          user_text: engineText, // ← engineText not userText
           account_id,
         });
       } else if (chatRow.mode !== "BOT") {
         // Chat is in MANUAL mode — check if user text matches a keyword trigger
-        const matchedFlowId = await matchKeywordTrigger(userText, account_id);
+        const matchedFlowId = await matchKeywordTrigger(engineText, account_id);
         if (matchedFlowId) {
           console.log(
             "🤖 Keyword matched — starting bot session, flow:",
@@ -362,24 +368,22 @@ export const handleIncomingMessage = async (req, res) => {
             phone_number: from,
             flow_id: matchedFlowId,
             account_id,
-            user_text: userText,
+            user_text: engineText, // ← engineText not userText
           });
         }
       }
       // ─────────────────────────────────────────────────────────────────────
     }
 
-    // 🔹 SAVE USER MESSAGE
+    // // MESSAGE SAVING — use real userText + media_path
     // await chatCtrl.saveMessage({
     //   chat_id: chatRow.chat_id,
     //   sender_type: "user",
     //   message:
-    //     userText || (mediaUrl ? `[${message.type.toUpperCase()}]` : "TEXT"),
+    //     userText || (storedMediaPath ? `[${message.type.toUpperCase()}]` : ""),
     //   message_type: message.type || "text",
     //   media_path: storedMediaPath,
     // });
-
-    // console.log("✅ Message saved for chat:", chatRow.chat_id);
 
     return res.sendStatus(200);
   } catch (err) {
