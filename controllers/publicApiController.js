@@ -5,6 +5,7 @@
 import axios from "axios";
 import FormData from "form-data";
 import { supabase } from "../config/supabase.js";
+import { createScheduledMessage } from "../services/scheduledMessageService.js";
 
 const GRAPH_API_VERSION = "v21.0";
 const GRAPH_BASE = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
@@ -489,5 +490,87 @@ export const sendInteractiveMessage = async (req, res) => {
     return res
       .status(500)
       .json({ error: "Failed to send interactive message", details: apiError });
+  }
+};
+
+/* ─── POST /v1/messages/schedule ────────────────────────────────────────── */
+/*
+  Schedule a WhatsApp template message to be sent at a future date/time.
+  The scheduler cron (runs every minute) picks it up automatically.
+
+  Body:
+  {
+    "phone":               "919876543210",
+    "contact_name":        "Rahul",             // optional
+    "wt_id":               "<template uuid>",
+    "template_variables":  { "1": "Rahul", "2": "Order #123" },  // if template needs vars
+    "media_id":            "<meta media id>",   // only if template has media header AND
+                                                // the template doesn't already have one stored
+    "scheduled_at":        "2026-04-25T18:30:00+05:30",
+    "timezone":            "Asia/Kolkata"        // optional, informational
+  }
+
+  Validation (done inside scheduledMessageService):
+  - Template must belong to this account and be APPROVED
+  - scheduled_at must be in the future
+  - If template HEADER is IMAGE/VIDEO/DOCUMENT → media_id required
+  - If template BODY has {{N}} vars → all must be provided in template_variables
+*/
+export const scheduleTemplateMessage = async (req, res) => {
+  try {
+    const { wa_id } = req.account;
+    const {
+      phone,
+      contact_name,
+      wt_id,
+      template_variables = {},
+      media_id = null,
+      scheduled_at,
+      timezone = "UTC",
+    } = req.body;
+
+    if (!phone || !wt_id || !scheduled_at) {
+      logUsage(req, 400, "Missing phone, wt_id, or scheduled_at");
+      return res.status(400).json({
+        error: "phone, wt_id, and scheduled_at are required",
+      });
+    }
+
+    const result = await createScheduledMessage({
+      user_id: req.apiKey.user_id,
+      account_id: wa_id,
+      phone_number: phone,
+      contact_name,
+      wt_id,
+      template_variables,
+      media_id,
+      scheduled_at,
+      timezone,
+    });
+
+    if (!result.success) {
+      logUsage(req, 400, result.code);
+      return res.status(400).json({
+        error: result.error,
+        code: result.code,
+        ...(result.hint && { hint: result.hint }),
+        ...(result.required_count !== undefined && { required_variable_count: result.required_count }),
+        ...(result.missing_indices && { missing_variables: result.missing_indices.map((i) => `{{${i}}}`) }),
+        ...(result.required_media_type && { required_media_type: result.required_media_type }),
+      });
+    }
+
+    logUsage(req, 201);
+    return res.status(201).json({
+      success: true,
+      message: "Message scheduled successfully.",
+      data: result.data,
+    });
+  } catch (err) {
+    console.error("scheduleTemplateMessage error:", err.message);
+    logUsage(req, 500, err.message);
+    return res
+      .status(500)
+      .json({ error: "Failed to schedule message", details: err.message });
   }
 };

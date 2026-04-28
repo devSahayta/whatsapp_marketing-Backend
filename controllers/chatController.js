@@ -225,7 +225,7 @@ export async function getChatsForUser({ user_id, limit = 100, offset = 0 }) {
 
 /**
  * Fetch messages for a chat with pagination.
- * Returns messages in chronological order (oldest -> newest)
+ * Returns messages in chronological order (newest -> oldest)
  */
 export async function getMessagesForChat({
   chat_id,
