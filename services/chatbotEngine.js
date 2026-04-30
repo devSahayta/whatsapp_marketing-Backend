@@ -1571,11 +1571,20 @@ export async function startBotSession({
       return;
     }
 
-    // Set chat mode to BOT
+    // Set mode based on whether flow uses an AI agent node
+    const hasAiNode = nodes.some((n) => n.node_type === "ai_agent");
+
     await supabase
       .from("chats")
-      .update({ mode: "BOT", active_flow_id: flow_id })
+      .update({
+        mode: hasAiNode ? "AI" : "BOT",
+        active_flow_id: flow_id,
+      })
       .eq("chat_id", chat_id);
+
+    console.log(
+      `🤖 [Engine] Chat mode set to ${hasAiNode ? "AI" : "BOT"} for flow: ${flow_id}`,
+    );
 
     // Run the flow starting from the trigger node
     await runFlow({

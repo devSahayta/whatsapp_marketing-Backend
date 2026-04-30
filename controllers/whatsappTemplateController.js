@@ -23,6 +23,67 @@ async function fetchMetaMediaUrl(mediaId, accessToken) {
   }
 }
 
+// ── Extract all display data from template components ─────────────────────────
+function extractTemplateDisplayData(template, finalComponents) {
+  const components = template.components || [];
+
+  // Body text
+  const renderedText = renderTemplateBody(template, finalComponents);
+
+  // Footer
+  const footerComp = components.find((c) => c.type === "FOOTER");
+  const footerText = footerComp?.text || null;
+  const fullMessage = footerText
+    ? `${renderedText}\n\n**${footerText}**`
+    : renderedText;
+
+  // Header
+  let mediaPath = null;
+  let msgType = "template";
+  const headerComp = components.find((c) => c.type === "HEADER");
+
+  if (headerComp) {
+    const fmt = headerComp.format;
+    if (fmt === "VIDEO") msgType = "template_video";
+    if (fmt === "DOCUMENT") msgType = "template_document";
+
+    // 1. Dynamic media ID from send components
+    const sendHeader = finalComponents.find((c) => c.type === "header");
+    const dynamicId =
+      sendHeader?.parameters?.[0]?.image?.id ||
+      sendHeader?.parameters?.[0]?.video?.id ||
+      sendHeader?.parameters?.[0]?.document?.id ||
+      null;
+    if (dynamicId) mediaPath = dynamicId;
+
+    // 2. Permanent URL from preview (best — doesn't expire)
+    if (!mediaPath) {
+      const previewHeader = (template.preview?.components || []).find(
+        (c) => c.type === "HEADER",
+      );
+      const permanentUrl = previewHeader?.example?.header_handle?.[0];
+      if (permanentUrl?.startsWith("http")) mediaPath = permanentUrl;
+    }
+
+    // 3. Static header handle from components definition
+    if (!mediaPath) {
+      const staticUrl = headerComp?.example?.header_handle?.[0];
+      if (staticUrl?.startsWith("http")) mediaPath = staticUrl;
+    }
+
+    // 4. Text header — prepend to message
+    if (!mediaPath && fmt === "TEXT" && headerComp.text) {
+      return {
+        fullMessage: `**${headerComp.text}**\n\n${fullMessage}`,
+        mediaPath: null,
+        msgType: "template",
+      };
+    }
+  }
+
+  return { fullMessage, mediaPath, msgType };
+}
+
 const { FormData, Blob } = global;
 
 // top of controller file
@@ -794,37 +855,10 @@ export async function sendTemplate(req, res) {
     // ── Save to messages table for chat dashboard ─────────────────────────────
     // ── Save to messages table ─────────────────────────────
     try {
-      const renderedText = renderTemplateBody(template, finalComponents);
-
-      // ✅ ADD THESE THREE LINES HERE — before anything else
-      const templateHeader = template.components?.find(
-        (c) => c.type === "HEADER",
+      const { fullMessage, mediaPath, msgType } = extractTemplateDisplayData(
+        template,
+        finalComponents,
       );
-      const headerFormat = templateHeader?.format; // "IMAGE", "VIDEO", "DOCUMENT", "TEXT"
-      const msgType =
-        headerFormat === "VIDEO"
-          ? "template_video"
-          : headerFormat === "DOCUMENT"
-            ? "template_document"
-            : "template";
-
-      const headerComp = finalComponents.find((c) => c.type === "header");
-      const mediaId =
-        headerComp?.parameters?.[0]?.image?.id ||
-        headerComp?.parameters?.[0]?.video?.id ||
-        headerComp?.parameters?.[0]?.document?.id ||
-        null;
-
-      let mediaPath = mediaId || null;
-
-      if (!mediaPath) {
-        const templateHeader = template.components?.find(
-          (c) => c.type === "HEADER",
-        );
-        if (templateHeader?.example?.header_handle?.[0]) {
-          mediaPath = templateHeader.example.header_handle[0];
-        }
-      }
 
       const chat = await getOrCreateChat({ phone_number: to, user_id });
       const buttons = extractTemplateButtons(template);
@@ -832,8 +866,8 @@ export async function sendTemplate(req, res) {
       await supabase.from("messages").insert({
         chat_id: chat.chat_id,
         sender_type: "admin",
-        message: renderedText,
-        message_type: msgType, // ✅ use msgType here
+        message: fullMessage,
+        message_type: msgType,
         media_path: mediaPath,
         buttons,
         created_at: new Date(),
@@ -841,7 +875,7 @@ export async function sendTemplate(req, res) {
 
       await supabase
         .from("chats")
-        .update({ last_message: renderedText, last_message_at: new Date() })
+        .update({ last_message: fullMessage, last_message_at: new Date() })
         .eq("chat_id", chat.chat_id);
     } catch (chatErr) {
       console.warn(
@@ -1095,92 +1129,25 @@ export async function sendTemplateBulk(req, res) {
               // --------------------------------------------
               // Render message text for DB
               // --------------------------------------------
-              const renderedText = renderTemplateBody(
-                template,
-                finalComponents,
-              );
+              const { fullMessage, mediaPath, msgType } =
+                extractTemplateDisplayData(template, finalComponents);
 
-              // ✅ Also extract footer
-              const footerComp = template.components?.find(
-                (c) => c.type === "FOOTER",
-              );
-              const footerText = footerComp?.text || null;
-
-              // ✅ Build full display text with footer
-              const fullMessage = footerText
-                ? `${renderedText}\n\n_${footerText}_` // italic-style footer
-                : renderedText;
-
-              // --------------------------------------------
-              // Detect media (optional)
-              // --------------------------------------------
-              // --------------------------------------------
-              // Detect media and fetch actual URL from Meta
-              // --------------------------------------------
-              const headerComp = finalComponents.find(
-                (c) => c.type === "header",
-              );
-
-              const mediaId =
-                headerComp?.parameters?.[0]?.image?.id ||
-                headerComp?.parameters?.[0]?.video?.id ||
-                headerComp?.parameters?.[0]?.document?.id ||
-                null;
-
-              // Store media ID directly (not expiring URL)
-              // Store media ID directly (not expiring URL)
-              let mediaPath = mediaId || null;
-
-              // Detect header format FIRST — outside any if block
-              const templateHeaderComp = template.components?.find(
-                (c) => c.type === "HEADER",
-              );
-              const headerFormat = templateHeaderComp?.format || null; // "IMAGE", "VIDEO", "DOCUMENT", "TEXT"
-
-              // Fallback: check if template itself has a static header image
-              if (
-                !mediaPath &&
-                templateHeaderComp?.example?.header_handle?.[0]
-              ) {
-                mediaPath = templateHeaderComp.example.header_handle[0];
-              }
-
-              // Determine message_type based on header format
-              const msgType =
-                headerFormat === "VIDEO"
-                  ? "template_video"
-                  : headerFormat === "DOCUMENT"
-                    ? "template_document"
-                    : "template";
-
-              // --------------------------------------------
-              // Create / Update Chat
-              // --------------------------------------------
               const chat = await getOrCreateChat({
                 phone_number: to,
                 user_id: user_id,
               });
-
-              // --------------------------------------------
-              // Insert message
-              // --------------------------------------------
-
-              //checking if any button available in template
               const buttons = extractTemplateButtons(template);
 
-              //write message
               await supabase.from("messages").insert({
                 chat_id: chat.chat_id,
                 sender_type: "admin",
-                message: fullMessage, // ← includes footer now
+                message: fullMessage,
                 message_type: msgType,
                 media_path: mediaPath,
                 buttons,
                 created_at: new Date(),
               });
-              // --------------------------------------------
-              // Update chat last message
-              // --------------------------------------------
+
               await supabase
                 .from("chats")
                 .update({

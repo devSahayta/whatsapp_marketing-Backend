@@ -346,29 +346,60 @@ export const handleIncomingMessage = async (req, res) => {
       });
 
       // ── Chatbot routing ──────────────────────────────────────────────────
+      // Check if the active flow is still active before resuming session
+      let shouldResume = false;
+
       if (chatRow.mode === "BOT" && chatRow.active_flow_id) {
-        // Chat is already in an active bot session — continue it
-        console.log("🤖 Routing to chatbot engine for chat:", chatRow.chat_id);
+        const { data: activeFlow } = await supabase
+          .from("chatbot_flows")
+          .select("status")
+          .eq("flow_id", chatRow.active_flow_id)
+          .maybeSingle();
+
+        if (activeFlow?.status === "active") {
+          // Flow is still active — resume the session normally
+          shouldResume = true;
+        } else {
+          // Flow was deactivated — reset chat so new triggers can fire
+          console.log(
+            "⚠️ [Controller] Active flow is inactive — resetting chat to AI mode",
+          );
+          await supabase
+            .from("chatbot_sessions")
+            .update({
+              status: "completed",
+              updated_at: new Date().toISOString(),
+            })
+            .eq("chat_id", chatRow.chat_id)
+            .in("status", ["active", "handed_off"]);
+
+          await supabase
+            .from("chats")
+            .update({ mode: "AI", active_flow_id: null })
+            .eq("chat_id", chatRow.chat_id);
+
+          // Update local chatRow so keyword matching proceeds below
+          chatRow.mode = "AI";
+          chatRow.active_flow_id = null;
+        }
+      }
+
+      if (shouldResume) {
         await handleBotMessage({
           chat_id: chatRow.chat_id,
-          phone_number: from,
-          user_text: engineText, // ← engineText not userText
+          phone_number: from, // ← same fix here
+          user_text: engineText,
           account_id,
         });
-      } else if (chatRow.mode !== "BOT") {
-        // Chat is in MANUAL mode — check if user text matches a keyword trigger
+      } else {
         const matchedFlowId = await matchKeywordTrigger(engineText, account_id);
         if (matchedFlowId) {
-          console.log(
-            "🤖 Keyword matched — starting bot session, flow:",
-            matchedFlowId,
-          );
           await startBotSession({
             chat_id: chatRow.chat_id,
-            phone_number: from,
+            phone_number: from, // ← use the actual variable name from your controller
             flow_id: matchedFlowId,
             account_id,
-            user_text: engineText, // ← engineText not userText
+            user_text: engineText,
           });
         }
       }
