@@ -56,7 +56,7 @@ function countRequiredVariables(components) {
  */
 export async function createScheduledMessage({
   user_id,
-  // account_id,
+  account_id,
   phone_number,
   contact_name = null,
   wt_id,
@@ -65,14 +65,14 @@ export async function createScheduledMessage({
   scheduled_at,
   timezone = "UTC",
 }) {
-  // checking whaatapp account existence and status is handled in the API route before calling this service.
-  const account = await getWhatsappAccount(user_id);
-  if (!account)
-    return {
-      success: false,
-      error: "WhatsApp account not found",
-      code: "ACCOUNT_NOT_FOUND",
-    };
+  // // checking whaatapp account existence and status is handled in the API route before calling this service.
+  // const account = await getWhatsappAccount(user_id);
+  // if (!account)
+  //   return {
+  //     success: false,
+  //     error: "WhatsApp account not found",
+  //     code: "ACCOUNT_NOT_FOUND",
+  //   };
 
   // ── 1. Resolve the template ────────────────────────────────────────────────
   const { data: template, error: tplErr } = await supabase
@@ -81,7 +81,7 @@ export async function createScheduledMessage({
       "wt_id, name, status, header_format, media_id, components, variables",
     )
     .eq("wt_id", wt_id)
-    .eq("account_id", account.wa_id)
+    .eq("account_id", account_id)
     .maybeSingle();
 
   if (tplErr || !template) {
@@ -166,7 +166,7 @@ export async function createScheduledMessage({
     .from("scheduled_messages")
     .insert({
       user_id,
-      account_id: account.wa_id,
+      account_id,
       phone_number,
       contact_name,
       wt_id,
