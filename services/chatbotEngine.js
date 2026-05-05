@@ -104,6 +104,7 @@ async function saveBotMessage(
               ? text.slice(0, 80) + "…"
               : text,
         last_message_at: now,
+        last_sender_type: "bot",
       })
       .eq("chat_id", chat_id);
   } catch (err) {

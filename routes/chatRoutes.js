@@ -30,9 +30,10 @@ router.get("/groups/:groupId/chats", async (req, res) => {
 });
 
 // GET /api/chats?user_id=xxx
+// GET /api/chats?user_id=xxx
 router.get("/chats", async (req, res) => {
   try {
-    const { user_id } = req.query;
+    const { user_id, filter } = req.query; // ← add filter here
     const limit = parseInt(req.query.limit || "100", 10);
     const offset = parseInt(req.query.offset || "0", 10);
 
@@ -40,7 +41,12 @@ router.get("/chats", async (req, res) => {
       return res.status(400).json({ ok: false, error: "user_id is required" });
     }
 
-    const result = await chatCtrl.getChatsForUser({ user_id, limit, offset });
+    const result = await chatCtrl.getChatsForUser({
+      user_id,
+      limit,
+      offset,
+      filter: filter || "all", // ← add this
+    });
 
     return res.json({ ok: true, chats: result.chats, total: result.total });
   } catch (err) {

@@ -150,6 +150,7 @@ export async function saveMessage({
     .update({
       last_message: message,
       last_message_at: new Date().toISOString(),
+      last_sender_type: sender_type,
     })
     .eq("chat_id", chat_id);
 
@@ -206,20 +207,36 @@ export async function getAllChatsForGroup(group_id) {
   return allChats;
 }
 
-export async function getChatsForUser({ user_id, limit = 100, offset = 0 }) {
-  const { data, error, count } = await supabase
+export async function getChatsForUser({
+  user_id,
+  limit = 100,
+  offset = 0,
+  filter = "all",
+}) {
+  // Base select
+  let query = supabase
     .from("chats")
     .select(
-      "chat_id, user_id, phone_number, person_name, last_message, last_message_at, created_at, mode",
-      { count: "exact" }, // ← add this
+      "chat_id, user_id, phone_number, person_name, last_message, last_message_at, last_sender_type, created_at, mode, active_flow_id",
+      { count: "exact" },
     )
     .eq("user_id", user_id)
     .order("last_message_at", { ascending: false })
     .order("created_at", { ascending: false })
     .range(offset, offset + limit - 1);
 
-  if (error) throw error;
+  // Apply filter
+  if (filter === "incoming") {
+    query = query.eq("last_sender_type", "user");
+  } else if (filter === "outgoing") {
+    query = query.in("last_sender_type", ["admin", "bot"]);
+  } else if (filter === "bot") {
+    query = query.in("mode", ["BOT", "AI"]);
+  }
+  // "all" → no additional filter
 
+  const { data, error, count } = await query;
+  if (error) throw error;
   return { chats: data || [], total: count };
 }
 
