@@ -15,6 +15,7 @@ import {
   startBotSession,
   matchKeywordTrigger,
 } from "../services/chatbotEngine.js";
+import { createNotification } from "../controllers/notificationController.js";
 
 /* ─── Webhook Forwarding ────────────────────────────────────────────────────
    Forward incoming messages to any external app that has registered a
@@ -276,7 +277,7 @@ export const handleIncomingMessage = async (req, res) => {
       // find chat
       let { data: chatRow } = await supabase
         .from("chats")
-        .select("chat_id, mode, active_flow_id")
+        .select("chat_id, mode, active_flow_id, user_id, person_name")
         .eq("user_id", user_id)
         .eq("phone_number", from)
         .order("created_at", { ascending: false })
@@ -304,7 +305,7 @@ export const handleIncomingMessage = async (req, res) => {
             mode: "BOT",
             status: "active",
           })
-          .select("chat_id, mode, active_flow_id")
+          .select("chat_id, mode, active_flow_id, user_id, person_name")
           .single();
 
         if (createErr || !newChat) {
@@ -333,6 +334,31 @@ export const handleIncomingMessage = async (req, res) => {
       });
 
       console.log("✅ Message saved for user:", user_id);
+
+      // Only create notification for the account that actually owns this WhatsApp number
+      // Prevents duplicate notifications when multiple accounts share the same waba_id
+      const { data: isOwner } = await supabase
+        .from("whatsapp_accounts")
+        .select("wa_id")
+        .eq("waba_id", wabaId)
+        .eq("phone_number_id", phoneNumberId)
+        .eq("wa_id", account_id)
+        .maybeSingle();
+
+      if (isOwner) {
+        await createNotification({
+          user_id,
+          chat_id: chatRow.chat_id,
+          phone_number: from,
+          person_name: chatRow.person_name || null,
+          message_preview: userText,
+          message_type: message.type || "text",
+          type: "incoming_message",
+        });
+        console.log("🔔 Notification created for account owner:", user_id);
+      } else {
+        console.log("⏭️ Skipping notification for non-owner account:", user_id);
+      }
 
       // ── Forward to external API webhooks (fire-and-forget) ───────────────
       forwardToApiWebhooks(account_id, {

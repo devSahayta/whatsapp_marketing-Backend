@@ -32,6 +32,7 @@ import woocommerceRoutes from "./routes/woocommerceRoutes.js";
 import woocommerceWebhookRoutes from "./routes/woocommerceWebhookRoutes.js";
 import apiKeyRoutes from "./routes/apiKeyRoutes.js";
 import publicApiRoutes from "./routes/publicApiRoutes.js";
+import notificationRoutes from "./routes/notificationRoutes.js";
 
 const app = express();
 app.use(express.json());
@@ -112,6 +113,9 @@ app.use("/v1", publicApiRoutes);
 
 //agent routes
 app.use("/api/agents", agentRoutes);
+
+//notification routes
+app.use("/api", notificationRoutes);
 
 app.get("/", (req, res) => res.send("API is running..."));
 
