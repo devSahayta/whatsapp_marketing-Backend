@@ -90,7 +90,7 @@ const { FormData, Blob } = global;
 const bulkProgress = new Map();
 // key: user_id + templateId
 
-// create template (store in DB and optionally submit to Meta)
+// create template (submit to Meta first, then insert into DB on success)
 export async function createTemplate(req, res) {
   try {
     const payload = req.body;
@@ -135,7 +135,6 @@ export async function createTemplate(req, res) {
     // Extract BODY example variables safely
     let bodyVariables = [];
     const bodyComponent = payload.components?.find((c) => c.type === "BODY");
-
     if (bodyComponent?.example?.body_text?.[0]) {
       bodyVariables = bodyComponent.example.body_text[0];
     }
@@ -145,130 +144,92 @@ export async function createTemplate(req, res) {
     const buttonComponent = payload.components?.find(
       (c) => c.type === "BUTTONS",
     );
-
     if (buttonComponent?.buttons) {
       buttonList = buttonComponent.buttons;
     }
 
-    const insert = {
-      wt_id,
-      account_id: payload.account_id || null,
-      template_id: null,
-      name: payload.name,
-      language: payload.language || "en_US",
-      category: payload.category || "MARKETING",
-      parameter_format: payload.parameter_format || "positional",
-      components: payload.components || [],
-      header_format: payload.header_format || null,
-      header_handle: payload.header_handle || null,
-      variables: payload.variables || bodyVariables,
-      buttons: payload.buttons || buttonList,
-      preview: payload.preview || {},
-      status: "PENDING",
-      media_id: payload.media_id || null,
-    };
-
-    const { error: insertErr } = await supabase
-      .from("whatsapp_templates")
-      .insert(insert);
-    if (insertErr) throw insertErr;
-
     if (account?.system_user_access_token && account.waba_id) {
-      try {
-        console.log(
-          "📤 Sending to Meta:",
-          JSON.stringify(
-            {
-              name: payload.name,
-              components: payload.components,
-            },
-            null,
-            2,
-          ),
-        );
-
-        let metaResp;
-        let attempts = 0;
-        while (attempts < 3) {
-          try {
-            attempts++;
-            console.log(`📤 Meta API attempt ${attempts}...`);
-            metaResp = await wsService.createTemplateOnMeta(
-              account.waba_id,
-              account.system_user_access_token,
-              {
-                name: payload.name,
-                language: payload.language,
-                category: payload.category,
-                parameter_format: payload.parameter_format || "positional",
-                components: payload.components,
-              },
-            );
-            break; // success — exit loop
-          } catch (retryErr) {
-            console.warn(`⚠️  Attempt ${attempts} failed:`, retryErr.message);
-            if (attempts >= 3) throw retryErr;
-            await new Promise((r) => setTimeout(r, 2000 * attempts)); // wait 2s, 4s
-          }
-        }
-        let preview = null;
-        const templateId = metaResp?.id;
-        const templateName = payload.name;
-
+      // ── Step 1: Create on Meta (with retry) ──────────────────────────────────
+      let metaResp;
+      let attempts = 0;
+      while (attempts < 3) {
         try {
-          // Fetch all templates from Meta
-          const data = await wsService.listTemplatesFromMeta(
+          attempts++;
+          console.log(`📤 Meta API attempt ${attempts}...`);
+          metaResp = await wsService.createTemplateOnMeta(
             account.waba_id,
             account.system_user_access_token,
+            {
+              name: payload.name,
+              language: payload.language,
+              category: payload.category,
+              parameter_format: payload.parameter_format || "positional",
+              components: payload.components,
+            },
           );
-
-          const templates = data.data || data || [];
-
-          // Find template by id or name
-          if (templateId) {
-            preview = templates.find((tpl) => tpl.id === templateId);
+          break;
+        } catch (retryErr) {
+          console.warn(`⚠️  Attempt ${attempts} failed:`, retryErr.message);
+          if (attempts >= 3) {
+            console.error("❌ Meta template creation failed:");
+            console.error("Status:", retryErr.response?.status);
+            console.error("Error:", JSON.stringify(retryErr.response?.data, null, 2));
+            return res
+              .status(retryErr.response?.status || 400)
+              .json(retryErr.response?.data || { error: retryErr.message });
           }
-
-          if (!preview && templateName) {
-            preview = templates.find((tpl) => tpl.name === templateName);
-          }
-        } catch (e) {
-          console.warn("Template created but preview fetch failed:", e.message);
+          await new Promise((r) => setTimeout(r, 2000 * attempts));
         }
-
-        // console.log({ preview, previewComponent: preview.components });
-
-        // update row with template_id and status
-        await supabase
-          .from("whatsapp_templates")
-          .update({
-            account_id: account.wa_id,
-            template_id: metaResp.id || null,
-            status: metaResp.status || "PENDING",
-            preview, // 👈 stored as jsonb
-          })
-          .eq("wt_id", wt_id);
-        return res.status(201).json({ template: insert, meta: metaResp });
-      } catch (metaErr) {
-        console.error("❌ Meta template creation failed:");
-        console.error("Status:", metaErr.response?.status);
-        console.error(
-          "Error:",
-          JSON.stringify(metaErr.response?.data, null, 2),
-        );
-        console.error("Full error:", metaErr.message);
-        console.error("Stack:", metaErr.stack?.split("\n")[0]);
-        return res.status(201).json({
-          template: insert,
-          meta_error: metaErr.message,
-          meta_error_detail: metaErr.response?.data,
-        });
       }
+
+      // ── Step 2: Fetch the created template from Meta for preview & status ────
+      let preview = null;
+      const templateId = metaResp?.id;
+      try {
+        const data = await wsService.listTemplatesFromMeta(
+          account.waba_id,
+          account.system_user_access_token,
+        );
+        const templates = data.data || data || [];
+        if (templateId) {
+          preview = templates.find((tpl) => tpl.id === templateId);
+        }
+        if (!preview) {
+          preview = templates.find((tpl) => tpl.name === payload.name);
+        }
+      } catch (e) {
+        console.warn("Template created but preview fetch failed:", e.message);
+      }
+
+      // ── Step 3: Insert into DB with all fields in one shot ───────────────────
+      const insert = {
+        wt_id,
+        account_id: account.wa_id,
+        template_id: metaResp.id || null,
+        name: payload.name,
+        language: payload.language || "en_US",
+        category: payload.category || "MARKETING",
+        parameter_format: payload.parameter_format || "positional",
+        components: payload.components || [],
+        header_format: payload.header_format || null,
+        header_handle: payload.header_handle || null,
+        variables: payload.variables || bodyVariables,
+        buttons: payload.buttons || buttonList,
+        preview: preview || {},
+        status: preview?.status || metaResp.status || "PENDING",
+        media_id: payload.media_id || null,
+      };
+
+      const { error: insertErr } = await supabase
+        .from("whatsapp_templates")
+        .insert(insert);
+      if (insertErr) throw insertErr;
+
+      return res.status(201).json({ template: insert, meta: metaResp });
     }
 
-    return res.status(201).json({
-      template: insert,
-      note: "Saved locally. No system_user_access_token or waba_id present.",
+    return res.status(400).json({
+      error: "WhatsApp account not configured. Cannot create template without Meta credentials.",
     });
   } catch (err) {
     console.error(err);
