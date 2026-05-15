@@ -86,6 +86,42 @@ export const CAMPAIGN_TOOLS = [
           description:
             "Example values for body variables in order. Required by Meta if body_text contains {{1}}, {{2}}, etc. Example: ['John', 'ORD-1234'].",
         },
+        buttons: {
+          type: "array",
+          description:
+            "Optional buttons to attach to the template. Max 3 buttons total. Each button is an object with a 'type' field.",
+          items: {
+            type: "object",
+            properties: {
+              type: {
+                type: "string",
+                enum: ["QUICK_REPLY", "URL", "PHONE_NUMBER"],
+                description:
+                  "QUICK_REPLY: a simple reply button. URL: opens a webpage. PHONE_NUMBER: calls a number.",
+              },
+              text: {
+                type: "string",
+                description: "Button label shown to the user. Max 25 characters.",
+              },
+              url: {
+                type: "string",
+                description:
+                  "Required for URL buttons. The link to open. Can end with {{1}} for a dynamic part. Example: 'https://example.com/order/{{1}}'.",
+              },
+              url_example: {
+                type: "string",
+                description:
+                  "Required by Meta when the URL contains {{1}}. A full example URL. Example: 'https://example.com/order/ORD-1234'.",
+              },
+              phone_number: {
+                type: "string",
+                description:
+                  "Required for PHONE_NUMBER buttons. Must include country code. Example: '+911234567890'.",
+              },
+            },
+            required: ["type", "text"],
+          },
+        },
       },
       required: ["name", "category", "language", "body_text"],
     },
@@ -493,6 +529,7 @@ async function createTemplateTool(userId, input) {
       header_text,
       footer_text,
       body_examples = [],
+      buttons = [],
     } = input;
 
     // Normalize: lowercase, spaces → underscores, strip invalid chars
@@ -567,6 +604,26 @@ async function createTemplateTool(userId, input) {
       components.push({ type: "FOOTER", text: footer_text.trim() });
     }
 
+    if (buttons.length > 0) {
+      const builtButtons = buttons.map((btn) => {
+        if (btn.type === "QUICK_REPLY") {
+          return { type: "QUICK_REPLY", text: btn.text };
+        }
+        if (btn.type === "PHONE_NUMBER") {
+          return { type: "PHONE_NUMBER", text: btn.text, phone_number: btn.phone_number };
+        }
+        if (btn.type === "URL") {
+          const urlBtn = { type: "URL", text: btn.text, url: btn.url };
+          if (btn.url?.includes("{{1}}") && btn.url_example) {
+            urlBtn.example = [btn.url_example];
+          }
+          return urlBtn;
+        }
+        return btn;
+      });
+      components.push({ type: "BUTTONS", buttons: builtButtons });
+    }
+
     // Submit to Meta with retry
     let metaResp;
     let attempts = 0;
@@ -625,7 +682,7 @@ async function createTemplateTool(userId, input) {
       header_format: header_text?.trim() ? "TEXT" : null,
       header_handle: null,
       variables: body_examples,
-      buttons: [],
+      buttons: buttons.length > 0 ? buttons : [],
       preview,
       status: preview?.status || metaResp.status || "PENDING",
       media_id: null,

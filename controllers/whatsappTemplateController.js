@@ -173,7 +173,10 @@ export async function createTemplate(req, res) {
           if (attempts >= 3) {
             console.error("❌ Meta template creation failed:");
             console.error("Status:", retryErr.response?.status);
-            console.error("Error:", JSON.stringify(retryErr.response?.data, null, 2));
+            console.error(
+              "Error:",
+              JSON.stringify(retryErr.response?.data, null, 2),
+            );
             return res
               .status(retryErr.response?.status || 400)
               .json(retryErr.response?.data || { error: retryErr.message });
@@ -229,7 +232,8 @@ export async function createTemplate(req, res) {
     }
 
     return res.status(400).json({
-      error: "WhatsApp account not configured. Cannot create template without Meta credentials.",
+      error:
+        "WhatsApp account not configured. Cannot create template without Meta credentials.",
     });
   } catch (err) {
     console.error(err);
@@ -1454,6 +1458,36 @@ export async function mediaProxyUrl(req, res) {
   } catch (err) {
     console.error("Media Proxy URL Error:", err);
     res.status(500).json({ error: err.message });
+  }
+}
+
+export async function updateTemplateMediaId(req, res) {
+  try {
+    const { wt_id } = req.params;
+    const { media_id, user_id } = req.body;
+
+    if (!wt_id) return res.status(400).json({ error: "wt_id is required" });
+    if (!media_id)
+      return res.status(400).json({ error: "media_id is required" });
+    if (!user_id) return res.status(400).json({ error: "user_id is required" });
+
+    const account = await getWhatsappAccount(user_id);
+
+    const { data, error } = await supabase
+      .from("whatsapp_templates")
+      .update({ media_id })
+      .eq("wt_id", wt_id)
+      .eq("account_id", account.wa_id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: "Template not found" });
+
+    return res.json({ success: true, template: data });
+  } catch (err) {
+    console.error("UPDATE TEMPLATE MEDIA ID ERROR:", err);
+    return res.status(500).json({ error: err.message || err });
   }
 }
 

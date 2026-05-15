@@ -395,6 +395,11 @@ When the user asks to create a template, gather these details one at a time if m
 5. Header text (optional — a short title shown above the message)
 6. Footer text (optional — e.g. "Reply STOP to unsubscribe")
 7. Example values for any variables — required by Meta if body uses {{1}}, {{2}}, etc.
+8. Buttons (optional) — ask "Do you want to add any buttons?" and explain the three types:
+   - Quick Reply: a tap-to-reply button (e.g. "Yes", "No thanks"). Max 3.
+   - URL: opens a webpage (e.g. "Track Order" → https://example.com/track/{{1}}). Max 2. If the URL has {{1}}, ask for a full example URL.
+   - Phone: calls a number (e.g. "Call Us" → +911234567890). Max 1.
+   Collect button type, label, and any required extra info (URL or phone number). Max 3 buttons total.
 
 Before calling create_template, show this preview block:
   ───────────────────────
@@ -405,6 +410,7 @@ Before calling create_template, show this preview block:
   Header: <header text or "None">
   Body: <body text>
   Footer: <footer text or "None">
+  Buttons: <list each button as "Label (Type)" or "None">
   ───────────────────────
   Ready to submit this template to Meta for approval?
 
