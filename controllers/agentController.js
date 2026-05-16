@@ -353,6 +353,14 @@ ID RULES (critical):
 DUPLICATE PREVENTION:
 - Once create_campaign returns a campaign_id, the campaign exists. Stop. Never call create_campaign again.
 
+GROUP CREATION FLOW:
+- When the user wants to create a group, DO NOT call any tool. Just reply asking for:
+  1. The group name (if not already given)
+  2. Tell them to upload their CSV or Excel file using the + button in the chat
+- The CSV must have these columns: name, phone number (phoneno / phone / mobile), and optionally email
+- Once the user uploads a file, the system handles it automatically outside the tool loop. You will receive a confirmation message. Just relay that confirmation to the user naturally.
+- Never create an empty group. Never call any tool for group creation.
+
 CONVERSATION FLOW:
 
 Step 1 - Resolve group and template
@@ -526,6 +534,270 @@ export const handleSamvaadikChat = async (req, res) => {
       });
     }
 
+    return res.status(500).json({ success: false, error: err.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ─── GROUP PREVIEW (parse CSV, return summary, NO DB writes) ─────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+//
+//  Route:  POST /api/agents/samvaadik/preview-group
+//  Body:   multipart/form-data: user_id, group_name, file
+//  Returns: { group_name, contact_count, columns, sample, contacts }
+//           contacts[] is returned so frontend can send it back on confirm
+//           without re-uploading the file.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const handleGroupPreview = async (req, res) => {
+  try {
+    const { user_id, group_name } = req.body;
+    const file = req.file;
+
+    if (!user_id)
+      return res
+        .status(400)
+        .json({ success: false, error: "user_id is required" });
+    if (!group_name?.trim())
+      return res
+        .status(400)
+        .json({ success: false, error: "group_name is required" });
+    if (!file)
+      return res
+        .status(400)
+        .json({ success: false, error: "A CSV or Excel file is required" });
+
+    // Parse CSV
+    const rows = [];
+    const headers = [];
+
+    try {
+      await new Promise((resolve, reject) => {
+        Readable.from(file.buffer)
+          .pipe(parseCsv({ headers: true, ignoreEmpty: true, trim: true }))
+          .on("headers", (h) => headers.push(...h))
+          .on("data", (row) => rows.push(row))
+          .on("error", reject)
+          .on("end", resolve);
+      });
+    } catch (parseErr) {
+      return res.status(400).json({
+        success: false,
+        error:
+          "Could not parse the file. Make sure it is a valid CSV with headers.",
+      });
+    }
+
+    if (!rows.length) {
+      return res
+        .status(400)
+        .json({ success: false, error: "The file has no data rows." });
+    }
+
+    // Detect columns
+    const nameCol = findColumn(headers, ["name", "full_name", "fullname"]);
+    const phoneCol = findColumn(headers, [
+      "phone",
+      "phone_number",
+      "phoneno",
+      "mobile",
+      "contact",
+    ]);
+    const emailCol = findColumn(headers, ["email", "email_address"]);
+
+    if (!phoneCol) {
+      return res.status(400).json({
+        success: false,
+        error: `No phone column found. Columns in your file: ${headers.join(", ")}. Rename one to "phone", "phoneno", or "mobile".`,
+      });
+    }
+
+    // Build contacts array
+    const contacts = rows
+      .map((r) => ({
+        user_id,
+        full_name: nameCol ? r[nameCol]?.trim() || null : null,
+        email: emailCol ? r[emailCol]?.trim() || null : null,
+        phone_number: r[phoneCol]?.trim(),
+      }))
+      .filter((c) => c.phone_number);
+
+    if (!contacts.length) {
+      return res
+        .status(400)
+        .json({
+          success: false,
+          error: "No valid phone numbers found in the file.",
+        });
+    }
+
+    // ── Upload CSV to Supabase storage ───────────────────────────────────────
+    // Upload now while we have the file buffer. Store URL and pass it to
+    // the create step so it gets saved in groups.uploaded_csv.
+    let csvUrl = null;
+    try {
+      const slug = (s) =>
+        String(s || "")
+          .toLowerCase()
+          .replace(/\s+/g, "-")
+          .replace(/[^a-z0-9-_]/g, "")
+          .slice(0, 60);
+      const storageKey = `${user_id}/${Date.now()}_${slug(group_name)}.csv`;
+
+      const { error: uploadErr } = await supabase.storage
+        .from("group-csvs")
+        .upload(storageKey, file.buffer, { contentType: "text/csv" });
+
+      if (!uploadErr) {
+        const { data: urlData } = supabase.storage
+          .from("group-csvs")
+          .getPublicUrl(storageKey);
+        csvUrl = urlData?.publicUrl || null;
+      } else {
+        console.warn(
+          "[AgentGroup] CSV storage upload failed:",
+          uploadErr.message,
+        );
+        // Non-fatal — group creation proceeds without the stored CSV
+      }
+    } catch (storageErr) {
+      console.warn("[AgentGroup] CSV storage error:", storageErr.message);
+    }
+
+    return res.status(200).json({
+      success: true,
+      group_name: group_name.trim(),
+      contact_count: contacts.length,
+      skipped: rows.length - contacts.length,
+      columns_found: {
+        name: nameCol || null,
+        phone: phoneCol,
+        email: emailCol || null,
+      },
+      sample: contacts.slice(0, 3),
+      contacts, // full list — frontend holds and sends back on confirm
+      csv_url: csvUrl, // storage URL — frontend sends back on confirm
+    });
+  } catch (err) {
+    console.error("❌ handleGroupPreview:", err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ─── GROUP CREATION FROM CSV/EXCEL ───────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+//
+//  Route:  POST /api/agents/samvaadik/create-group
+//  Accepts: multipart/form-data
+//  Fields:
+//    - user_id (string)
+//    - group_name (string)
+//    - description (string, optional)
+//    - file (CSV or Excel — field name: "file")
+//
+//  Flow:
+//    1. Creates the group row in Supabase
+//    2. Parses the CSV/Excel file in memory
+//    3. Bulk-inserts contacts into group_contacts
+//    4. Returns summary for the frontend to display as an AI message
+//
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { Readable } from "stream";
+import { parse as parseCsv } from "@fast-csv/parse";
+
+const findColumn = (headers, candidates) => {
+  const lower = headers.map((h) => h.toLowerCase().trim());
+  for (const c of candidates) {
+    const i = lower.indexOf(c.toLowerCase());
+    if (i !== -1) return headers[i];
+  }
+  return null;
+};
+
+export const handleGroupFromCsv = async (req, res) => {
+  try {
+    // Accepts JSON body: { user_id, group_name, description, contacts: [...], csv_url }
+    // contacts[] and csv_url come from the preview step — no file needed here
+    const {
+      user_id,
+      group_name,
+      description = "",
+      contacts,
+      csv_url = null,
+    } = req.body;
+
+    if (!user_id)
+      return res
+        .status(400)
+        .json({ success: false, error: "user_id is required" });
+    if (!group_name?.trim())
+      return res
+        .status(400)
+        .json({ success: false, error: "group_name is required" });
+    if (!contacts?.length)
+      return res
+        .status(400)
+        .json({ success: false, error: "No contacts provided" });
+
+    // ── Create group ─────────────────────────────────────────────────────────
+    const { data: group, error: groupErr } = await supabase
+      .from("groups")
+      .insert({
+        user_id,
+        group_name: group_name.trim(),
+        description: description?.trim() || null,
+        uploaded_csv: csv_url, // ← store the Supabase storage URL
+        status: "active",
+      })
+      .select()
+      .single();
+
+    if (groupErr)
+      return res.status(500).json({ success: false, error: groupErr.message });
+
+    // ── Bulk insert contacts ──────────────────────────────────────────────────
+    // Attach group_id to every contact (preview didn't know the group_id yet)
+    const contactsWithGroup = contacts.map((c) => ({
+      ...c,
+      group_id: group.group_id,
+      user_id,
+    }));
+
+    const BATCH = 500;
+    let insertedCount = 0;
+
+    for (let i = 0; i < contactsWithGroup.length; i += BATCH) {
+      const batch = contactsWithGroup.slice(i, i + BATCH);
+      const { data: inserted, error: insertErr } = await supabase
+        .from("group_contacts")
+        .insert(batch)
+        .select("contact_id");
+
+      if (insertErr) {
+        console.error(
+          `[AgentGroup] Batch insert error at offset ${i}:`,
+          insertErr.message,
+        );
+      } else {
+        insertedCount += inserted?.length ?? 0;
+      }
+    }
+
+    const skipped = contacts.length - insertedCount;
+
+    return res.status(201).json({
+      success: true,
+      group_id: group.group_id,
+      group_name: group.group_name,
+      contacts_inserted: insertedCount,
+      skipped,
+      message: `Group "${group.group_name}" created with ${insertedCount} contact${insertedCount !== 1 ? "s" : ""}${skipped > 0 ? ` (${skipped} skipped)` : ""}.`,
+    });
+  } catch (err) {
+    console.error("❌ handleGroupFromCsv:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 };
