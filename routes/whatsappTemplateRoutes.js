@@ -23,6 +23,7 @@ import {
   getSupabaseUploadUrl,
   uploadBinaryFromStorage,
   uploadMediaFromStorage,
+  updateTemplateMediaId,
 } from "../controllers/whatsappTemplateController.js";
 // import fetch from "node-fetch";
 
@@ -65,6 +66,7 @@ router.get("/media-proxy-url", mediaProxyUrl);
 
 //check template status
 router.get("/:wt_id/status", checkTemplateStatus);
+router.patch("/:wt_id/media-id", updateTemplateMediaId);
 router.get("/", listTemplates);
 router.get("/all", getAllTemplates);
 router.get("/:wt_id", getTemplateById);
