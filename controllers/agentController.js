@@ -416,7 +416,8 @@ Before calling create_template, show this preview block:
 
 Call create_template only after the user confirms.
 After success, reply in one or two plain sentences: the template name, its status (usually PENDING), and that Meta typically approves within a few minutes to a few hours.
-If the user asks for a media template (image/video/document header), tell them that media templates are not supported via chat yet and they can create one from the Templates page.
+If the user wants a media template (image/video/document header) but no media_attachment is present in this session, tell them to use the attachment button (+ icon) in the chat to upload their file first, then you can create the template with it.
+If a media_attachment IS present in this session context, use header_format and header_handle from it automatically — include "Header: [format] file attached" in the preview, and pass those values to create_template.
 
 OTHER RULES:
 - If a time is given without a date (e.g. "6pm"), assume today. If that time has already passed, assume tomorrow. Always show the full date in the summary.
@@ -428,7 +429,7 @@ const MAX_TOOL_ITERATIONS = 8;
 
 export const handleSamvaadikChat = async (req, res) => {
   try {
-    const { user_id, messages } = req.body;
+    const { user_id, messages, media_attachment } = req.body;
 
     // ── Validation ──────────────────────────────────────────────────────────
     if (!user_id) {
@@ -460,6 +461,30 @@ export const handleSamvaadikChat = async (req, res) => {
       }
     }
 
+    // ── Build system prompt (inject media attachment context if present) ─────
+    let systemPrompt = SAMVAADIK_SYSTEM_PROMPT;
+    if (media_attachment?.header_handle) {
+      systemPrompt +=
+        `\n\nMEDIA ATTACHMENT FOR THIS SESSION:\n` +
+        `The user has already uploaded a ${media_attachment.header_format || "IMAGE"} file` +
+        (media_attachment.file_name
+          ? ` named "${media_attachment.file_name}"`
+          : "") +
+        ` to use as a template header. ` +
+        `Meta header handle: ${media_attachment.header_handle}. ` +
+        (media_attachment.media_id
+          ? `Meta media_id: ${media_attachment.media_id}. `
+          : "") +
+        `When creating a template with this media, pass ` +
+        `header_format="${media_attachment.header_format || "IMAGE"}", ` +
+        `header_handle="${media_attachment.header_handle}"` +
+        (media_attachment.media_id
+          ? `, and media_id="${media_attachment.media_id}"`
+          : "") +
+        ` to the create_template tool. ` +
+        `Do NOT ask the user to upload a file — the upload is already complete.`;
+    }
+
     // ── Agentic loop ────────────────────────────────────────────────────────
     let currentMessages = [...messages];
     let iteration = 0;
@@ -470,7 +495,7 @@ export const handleSamvaadikChat = async (req, res) => {
       const response = await anthropic.messages.create({
         model: "claude-haiku-4-5-20251001", // Fast + cheap for tool-use loop
         max_tokens: 1024,
-        system: SAMVAADIK_SYSTEM_PROMPT,
+        system: systemPrompt,
         tools: CAMPAIGN_TOOLS,
         messages: currentMessages,
       });

@@ -24,6 +24,7 @@ import {
   uploadBinaryFromStorage,
   uploadMediaFromStorage,
   updateTemplateMediaId,
+  prepareMediaHeader,
 } from "../controllers/whatsappTemplateController.js";
 // import fetch from "node-fetch";
 
@@ -41,6 +42,9 @@ router.post("/upload-media", upload.single("file"), uploadMedia);
 router.post("/media/upload-url", getSupabaseUploadUrl);
 router.post("/media/upload-binary-from-storage", uploadBinaryFromStorage);
 router.post("/media/upload-media-from-storage", uploadMediaFromStorage);
+
+// AI chat: prepare a media header — accepts file directly, runs full upload pipeline
+router.post("/prepare-media-header", upload.single("file"), prepareMediaHeader);
 
 // sending template;
 router.post("/send/:templateId", sendTemplate);
