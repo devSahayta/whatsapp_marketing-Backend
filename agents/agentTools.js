@@ -29,7 +29,7 @@ export const CAMPAIGN_TOOLS = [
   {
     name: "list_templates",
     description:
-      "Fetch all approved WhatsApp message templates. Returns each template's body text, variable count, and variable names so Claude knows if the template needs variable values before creating a campaign.",
+      "Fetch all approved WhatsApp message templates. Returns each template's body text, variable count, variable names, header_format (TEXT/IMAGE/VIDEO/DOCUMENT), and media_id. For media templates (IMAGE/VIDEO/DOCUMENT), Claude must check if media_id is present and not expired before creating a campaign.",
     input_schema: {
       type: "object",
       properties: {
@@ -101,7 +101,8 @@ export const CAMPAIGN_TOOLS = [
               },
               text: {
                 type: "string",
-                description: "Button label shown to the user. Max 25 characters.",
+                description:
+                  "Button label shown to the user. Max 25 characters.",
               },
               url: {
                 type: "string",
@@ -129,7 +130,7 @@ export const CAMPAIGN_TOOLS = [
   {
     name: "create_campaign",
     description:
-      "Create and schedule a WhatsApp campaign. IMPORTANT: Only call this AFTER (1) collecting all required template variable values from the user if the template has variables, (2) showing the full summary, and (3) the user has explicitly confirmed. Never call without confirmation.",
+      "Create and schedule a WhatsApp campaign. IMPORTANT: Only call this AFTER (1) collecting all required template variable values from the user if the template has variables, (2) confirming media is available if it is a media template, (3) showing the full summary, and (4) the user has explicitly confirmed. Never call without confirmation.",
     input_schema: {
       type: "object",
       properties: {
@@ -160,6 +161,11 @@ export const CAMPAIGN_TOOLS = [
           type: "object",
           description:
             'Variable values for the template. If template has variables like {{1}}, {{2}}, {{3}}, this must be {"1": "value1", "2": "value2", "3": "value3"}. If template has no variables, pass {}.',
+        },
+        media_id: {
+          type: "string",
+          description:
+            "The media_id for media templates (IMAGE/VIDEO/DOCUMENT). Copy exactly from list_templates result. Only include if the template has a media header. Omit for text templates.",
         },
       },
       required: [
@@ -228,10 +234,8 @@ function extractTemplateVariables(components, variablesCol) {
   ].sort((a, b) => Number(a) - Number(b));
 
   // Try to get human-readable labels from the `variables` column
-  // This column is jsonb and may contain example values or labels
   let labels = {};
   if (variablesCol && typeof variablesCol === "object") {
-    // Handle array format: [{ "1": "CustomerName" }, ...]
     if (Array.isArray(variablesCol)) {
       variablesCol.forEach((item) => {
         Object.assign(labels, item);
@@ -243,9 +247,55 @@ function extractTemplateVariables(components, variablesCol) {
 
   return {
     count: variableNumbers.length,
-    variable_numbers: variableNumbers, // e.g. ["1","2","3"]
-    labels, // e.g. {"1":"Customer Name","2":"Order ID"}
+    variable_numbers: variableNumbers,
+    labels,
     body_text: bodyText,
+  };
+}
+
+// ─────────────────────────────────────────────
+// HELPER: check if a media_id is still valid
+// Meta media expires after 25 days.
+// We check the whatsapp_media_uploads table by media_id
+// and return { valid: bool, uploaded_at, days_old }
+// ─────────────────────────────────────────────
+
+async function checkMediaValidity(accountId, mediaId) {
+  if (!mediaId) return { valid: false, reason: "no_media_id" };
+
+  const { data, error } = await supabase
+    .from("whatsapp_media_uploads")
+    .select("media_id, uploaded_at, file_name, type")
+    .eq("account_id", accountId)
+    .eq("media_id", mediaId)
+    .order("uploaded_at", { ascending: false })
+    .limit(1)
+    .single();
+
+  if (error || !data) return { valid: false, reason: "not_found" };
+
+  const uploadedAt = new Date(data.uploaded_at);
+  const now = new Date();
+  const daysOld = Math.floor((now - uploadedAt) / (1000 * 60 * 60 * 24));
+
+  // Meta expires media after 25 days
+  if (daysOld >= 25) {
+    return {
+      valid: false,
+      reason: "expired",
+      days_old: daysOld,
+      file_name: data.file_name,
+      type: data.type,
+    };
+  }
+
+  return {
+    valid: true,
+    media_id: data.media_id,
+    days_old: daysOld,
+    days_remaining: 25 - daysOld,
+    file_name: data.file_name,
+    type: data.type,
   };
 }
 
@@ -296,8 +346,8 @@ async function listGroups(userId, search) {
 
 // ─────────────────────────────────────────────
 // list_templates
-// Now returns: variables_count + variable_numbers + labels
-// so Claude knows whether to collect values
+// Returns: variables_count + variable_numbers + labels
+// + header_format + media_id + media_validity
 // ─────────────────────────────────────────────
 
 async function listTemplates(userId, search) {
@@ -310,7 +360,7 @@ async function listTemplates(userId, search) {
     const { data, error } = await supabase
       .from("whatsapp_templates")
       .select(
-        "wt_id, name, category, language, status, components, variables, header_format",
+        "wt_id, name, category, language, status, components, variables, header_format, media_id, header_handle",
       )
       .eq("account_id", accountId)
       .eq("status", "APPROVED")
@@ -334,24 +384,39 @@ async function listTemplates(userId, search) {
       };
     }
 
-    return {
-      templates: templates.map((t) => {
+    // For media templates, check validity in parallel
+    const templateResults = await Promise.all(
+      templates.map(async (t) => {
         const varInfo = extractTemplateVariables(t.components, t.variables);
+        const isMediaTemplate = ["IMAGE", "VIDEO", "DOCUMENT"].includes(
+          t.header_format,
+        );
+
+        let mediaStatus = null;
+        if (isMediaTemplate) {
+          mediaStatus = await checkMediaValidity(accountId, t.media_id);
+        }
+
         return {
           wt_id: t.wt_id,
           name: t.name,
           category: t.category,
           language: t.language,
-          header_format: t.header_format || "TEXT", // TEXT, IMAGE, VIDEO, DOCUMENT
+          header_format: t.header_format || "TEXT",
+          is_media_template: isMediaTemplate,
+          // For media templates: the stored media_id (may be null or expired)
+          media_id: t.media_id || null,
+          // Validity info so Claude knows whether to proceed or redirect
+          media_status: mediaStatus,
           body_text: varInfo.body_text,
           variables_count: varInfo.count,
-          // e.g. ["1","2","3"] — Claude uses this to know which values to ask for
           variable_numbers: varInfo.variable_numbers,
-          // e.g. {"1":"Customer Name"} — hints for what to ask the user
           variable_labels: varInfo.labels,
         };
       }),
-    };
+    );
+
+    return { templates: templateResults };
   } catch (err) {
     return { error: err.message };
   }
@@ -370,6 +435,7 @@ async function createCampaign(userId, input) {
       scheduled_at,
       total_recipients,
       template_variables = {},
+      media_id = null,
     } = input;
 
     const accountId = await getAccountId(userId);
@@ -390,10 +456,11 @@ async function createCampaign(userId, input) {
     }
 
     // Validate template belongs to this account and is approved
-    // IMPORTANT: match on wt_id (UUID) only, never on name
     const { data: template, error: templateErr } = await supabase
       .from("whatsapp_templates")
-      .select("wt_id, name, status, components, variables")
+      .select(
+        "wt_id, name, status, components, variables, header_format, media_id",
+      )
       .eq("wt_id", template_id)
       .eq("account_id", accountId)
       .single();
@@ -406,6 +473,44 @@ async function createCampaign(userId, input) {
       return {
         error: `Template "${template.name}" is not approved (status: ${template.status}).`,
       };
+    }
+
+    // ── Media template validation ─────────────────────────────────────────
+    const isMediaTemplate = ["IMAGE", "VIDEO", "DOCUMENT"].includes(
+      template.header_format,
+    );
+
+    if (isMediaTemplate) {
+      // Use the media_id passed in (from the user's confirmed selection)
+      // or fall back to what's stored on the template
+      const effectiveMediaId = media_id || template.media_id;
+
+      if (!effectiveMediaId) {
+        return {
+          error: `MEDIA_REQUIRED: Template "${template.name}" is a ${template.header_format} template and requires a media file. Please go to the Templates page to upload media for this template, then come back to create the campaign.`,
+          requires_media_upload: true,
+          template_name: template.name,
+          header_format: template.header_format,
+        };
+      }
+
+      // Validate the media hasn't expired
+      const mediaValidity = await checkMediaValidity(
+        accountId,
+        effectiveMediaId,
+      );
+      if (!mediaValidity.valid) {
+        return {
+          error: `MEDIA_EXPIRED: The ${template.header_format} media for template "${template.name}" has ${mediaValidity.reason === "expired" ? `expired (uploaded ${mediaValidity.days_old} days ago — Meta expires media after 25 days)` : "not been found"}. Please go to the Templates page to upload fresh media, then come back to create the campaign.`,
+          requires_media_upload: true,
+          template_name: template.name,
+          header_format: template.header_format,
+          media_reason: mediaValidity.reason,
+        };
+      }
+
+      // All good — store the resolved media_id back for campaign use
+      input.media_id = effectiveMediaId;
     }
 
     // Validate that all required variables have been provided
@@ -429,7 +534,18 @@ async function createCampaign(userId, input) {
     const dbContactCount = Number(group.group_contacts?.[0]?.count ?? 0);
     const finalRecipients = dbContactCount || total_recipients || 0;
 
-    // Insert campaign with template_variables populated
+    // ── Parse and validate scheduled_at ──────────────────────────────────────
+    // Claude should always send ISO 8601, but guard against natural-language
+    // strings like "Today at 2:50 PM" which produce Invalid Date.
+    const parsedDate = new Date(scheduled_at);
+    if (isNaN(parsedDate.getTime())) {
+      return {
+        error: `Invalid scheduled time: "${scheduled_at}". Please provide an ISO 8601 datetime string (e.g. "2026-05-16T14:50:00.000Z"). Do not pass natural-language strings like "Today at 2:50 PM".`,
+      };
+    }
+    const scheduledAtIso = parsedDate.toISOString();
+
+    // Insert campaign
     const { data: campaign, error: insertErr } = await supabase
       .from("campaigns")
       .insert({
@@ -438,11 +554,13 @@ async function createCampaign(userId, input) {
         campaign_name,
         group_id,
         wt_id: template_id,
-        scheduled_at: new Date(scheduled_at).toISOString(),
+        scheduled_at: scheduledAtIso,
         status: "scheduled",
         total_recipients: finalRecipients,
         timezone: "UTC",
-        template_variables: template_variables, // ← now populated correctly
+        template_variables,
+        // Store the resolved media_id on the campaign so the sender can use it
+        media_id: isMediaTemplate ? input.media_id || null : null,
       })
       .select()
       .single();
@@ -509,6 +627,7 @@ async function createCampaign(userId, input) {
       scheduled_at: campaign.scheduled_at,
       total_recipients: contacts.length,
       template_variables,
+      media_id: isMediaTemplate ? input.media_id : null,
     };
   } catch (err) {
     return { error: err.message };
@@ -610,7 +729,11 @@ async function createTemplateTool(userId, input) {
           return { type: "QUICK_REPLY", text: btn.text };
         }
         if (btn.type === "PHONE_NUMBER") {
-          return { type: "PHONE_NUMBER", text: btn.text, phone_number: btn.phone_number };
+          return {
+            type: "PHONE_NUMBER",
+            text: btn.text,
+            phone_number: btn.phone_number,
+          };
         }
         if (btn.type === "URL") {
           const urlBtn = { type: "URL", text: btn.text, url: btn.url };

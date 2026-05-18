@@ -3,7 +3,9 @@
 import { supabase } from "../config/supabase.js";
 import Anthropic from "@anthropic-ai/sdk";
 import { ANTHROPIC_API_KEY } from "../config/anthropic.js";
-import { CAMPAIGN_TOOLS, executeTool } from "../agents/agentTools.js"; // ← NEW IMPORT
+import { CAMPAIGN_TOOLS, executeTool } from "../agents/agentTools.js";
+import { Readable } from "stream";
+import { parse as parseCsv } from "@fast-csv/parse";
 
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
@@ -13,7 +15,7 @@ const VALID_MODELS = [
   "claude-opus-4-6",
 ];
 
-// ─── MODEL INFO (sent to frontend for warnings) ───────────────────────────────
+// ─── MODEL INFO ───────────────────────────────────────────────────────────────
 export const getModelInfo = async (req, res) => {
   return res.json({
     success: true,
@@ -67,26 +69,26 @@ export const createAgent = async (req, res) => {
       exit_keywords,
     } = req.body;
 
-    // Validation
     if (!user_id || !account_id || !name) {
-      return res.status(400).json({
-        success: false,
-        error: "user_id, account_id and name are required",
-      });
+      return res
+        .status(400)
+        .json({
+          success: false,
+          error: "user_id, account_id and name are required",
+        });
     }
-
     if (!name.trim()) {
-      return res.status(400).json({
-        success: false,
-        error: "Agent name cannot be empty",
-      });
+      return res
+        .status(400)
+        .json({ success: false, error: "Agent name cannot be empty" });
     }
-
     if (model && !VALID_MODELS.includes(model)) {
-      return res.status(400).json({
-        success: false,
-        error: `Invalid model. Must be one of: ${VALID_MODELS.join(", ")}`,
-      });
+      return res
+        .status(400)
+        .json({
+          success: false,
+          error: `Invalid model. Must be one of: ${VALID_MODELS.join(", ")}`,
+        });
     }
 
     const { data, error } = await supabase
@@ -108,7 +110,6 @@ export const createAgent = async (req, res) => {
       .single();
 
     if (error) throw error;
-
     return res.status(201).json({ success: true, agent: data });
   } catch (err) {
     console.error("❌ createAgent:", err);
@@ -120,12 +121,10 @@ export const createAgent = async (req, res) => {
 export const getAgents = async (req, res) => {
   try {
     const { user_id, account_id } = req.query;
-
     if (!user_id) {
-      return res.status(400).json({
-        success: false,
-        error: "user_id is required",
-      });
+      return res
+        .status(400)
+        .json({ success: false, error: "user_id is required" });
     }
 
     let query = supabase
@@ -134,13 +133,10 @@ export const getAgents = async (req, res) => {
       .eq("user_id", user_id)
       .order("created_at", { ascending: false });
 
-    if (account_id) {
-      query = query.eq("account_id", account_id);
-    }
+    if (account_id) query = query.eq("account_id", account_id);
 
     const { data, error } = await query;
     if (error) throw error;
-
     return res.json({ success: true, agents: data });
   } catch (err) {
     console.error("❌ getAgents:", err);
@@ -152,7 +148,6 @@ export const getAgents = async (req, res) => {
 export const getAgentById = async (req, res) => {
   try {
     const { agent_id } = req.params;
-
     const { data, error } = await supabase
       .from("chatbot_agents")
       .select("*")
@@ -160,10 +155,8 @@ export const getAgentById = async (req, res) => {
       .single();
 
     if (error) throw error;
-    if (!data) {
+    if (!data)
       return res.status(404).json({ success: false, error: "Agent not found" });
-    }
-
     return res.json({ success: true, agent: data });
   } catch (err) {
     console.error("❌ getAgentById:", err);
@@ -188,13 +181,14 @@ export const updateAgent = async (req, res) => {
     } = req.body;
 
     if (model && !VALID_MODELS.includes(model)) {
-      return res.status(400).json({
-        success: false,
-        error: `Invalid model. Must be one of: ${VALID_MODELS.join(", ")}`,
-      });
+      return res
+        .status(400)
+        .json({
+          success: false,
+          error: `Invalid model. Must be one of: ${VALID_MODELS.join(", ")}`,
+        });
     }
 
-    // Build patch — only update fields that were sent
     const patch = { updated_at: new Date().toISOString() };
     if (name !== undefined) patch.name = name.trim();
     if (description !== undefined)
@@ -215,7 +209,6 @@ export const updateAgent = async (req, res) => {
       .single();
 
     if (error) throw error;
-
     return res.json({ success: true, agent: data });
   } catch (err) {
     console.error("❌ updateAgent:", err);
@@ -228,7 +221,6 @@ export const deleteAgent = async (req, res) => {
   try {
     const { agent_id } = req.params;
 
-    // Check if this agent is used in any active flows before deleting
     const { data: usedInNodes } = await supabase
       .from("chatbot_nodes")
       .select("node_id, flow_id")
@@ -247,9 +239,7 @@ export const deleteAgent = async (req, res) => {
       .from("chatbot_agents")
       .delete()
       .eq("agent_id", agent_id);
-
     if (error) throw error;
-
     return res.json({ success: true });
   } catch (err) {
     console.error("❌ deleteAgent:", err);
@@ -257,20 +247,18 @@ export const deleteAgent = async (req, res) => {
   }
 };
 
-// ─── TEST AGENT (single turn chat for testing in UI) ─────────────────────────
+// ─── TEST AGENT ───────────────────────────────────────────────────────────────
 export const testAgent = async (req, res) => {
   try {
     const { agent_id } = req.params;
     const { message, history = [] } = req.body;
 
     if (!message?.trim()) {
-      return res.status(400).json({
-        success: false,
-        error: "message is required",
-      });
+      return res
+        .status(400)
+        .json({ success: false, error: "message is required" });
     }
 
-    // Fetch agent config
     const { data: agent, error: agentErr } = await supabase
       .from("chatbot_agents")
       .select("*")
@@ -281,8 +269,6 @@ export const testAgent = async (req, res) => {
       return res.status(404).json({ success: false, error: "Agent not found" });
     }
 
-    // Build messages array for Claude
-    // history = [ { role: "user"|"assistant", content: "..." }, ... ]
     const messages = [...history, { role: "user", content: message.trim() }];
 
     const response = await anthropic.messages.create({
@@ -298,48 +284,31 @@ export const testAgent = async (req, res) => {
     return res.json({
       success: true,
       reply,
-      // Send back updated history so frontend can keep track
       updated_history: [...messages, { role: "assistant", content: reply }],
-      usage: response.usage, // input/output tokens for transparency
+      usage: response.usage,
     });
   } catch (err) {
     console.error("❌ testAgent:", err);
-
-    // Handle Anthropic-specific errors cleanly
-    if (err.status === 401) {
-      return res.status(500).json({
-        success: false,
-        error:
-          "Invalid Anthropic API key. Check your ANTHROPIC_API_KEY env variable.",
-      });
-    }
-    if (err.status === 429) {
-      return res.status(429).json({
-        success: false,
-        error: "Rate limit hit. Try again in a moment.",
-      });
-    }
-
+    if (err.status === 401)
+      return res
+        .status(500)
+        .json({ success: false, error: "Invalid Anthropic API key." });
+    if (err.status === 429)
+      return res
+        .status(429)
+        .json({
+          success: false,
+          error: "Rate limit hit. Try again in a moment.",
+        });
     return res.status(500).json({ success: false, error: err.message });
   }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ─── SAMVAADIK AI ASSISTANT  (agentic campaign loop) ─────────────────────────
-// ─────────────────────────────────────────────────────────────────────────────
-//
-//  Route:  POST /api/agents/samvaadik/chat
-//  Body:   { user_id: string, messages: [{ role, content }] }
-//
-//  Flow:
-//    1. Receives full conversation history from frontend
-//    2. Calls Claude with CAMPAIGN_TOOLS defined in agentTools.js
-//    3. If Claude calls a tool → executes it against Supabase → feeds result back
-//    4. Loops until Claude produces a final text response
-//    5. Returns { role: "assistant", content: "..." } to frontend
-//
+// ─── SAMVAADIK AI ASSISTANT ───────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── Static base prompt ────────────────────────────────────────────────────────
 const SAMVAADIK_SYSTEM_PROMPT = `You are Samvaadik AI, an assistant built into the Samvaadik WhatsApp marketing platform. You help users create and schedule campaigns through conversation.
 
 Communicate like a knowledgeable colleague: clear, direct, no filler, no excessive punctuation. Do not use emojis. Write in plain sentences.
@@ -361,55 +330,80 @@ GROUP CREATION FLOW:
 - Once the user uploads a file, the system handles it automatically outside the tool loop. You will receive a confirmation message. Just relay that confirmation to the user naturally.
 - Never create an empty group. Never call any tool for group creation.
 
-CONVERSATION FLOW:
+CAMPAIGN CREATION FLOW:
 
-Step 1 - Resolve group and template
+Step 1 - Collect the four required inputs
+Before calling any tool you need four things. Ask for any that are missing:
+  a) Campaign name
+  b) Contact group name
+  c) Template name
+  d) Scheduled date and time (user will give IST time — see DATETIME RULE below)
+
+Step 2 - Resolve group and template
 Call list_groups and list_templates once each to find the exact group and template the user mentioned.
 
-Step 2 - Collect variable values if needed
-Check variables_count from the template result.
-- If 0: skip to step 3.
-- If greater than 0: ask the user for each variable value before proceeding. Example for 3 variables:
-  "This template has 3 fields that need values:
-   - {{1}} Customer name (e.g. Rahul)
-   - {{2}} Order number (e.g. ORD-1234)
-   - {{3}} Amount (e.g. 500)
-   What should I use for each?"
-  Wait for the reply. Do not continue until all values are provided.
+Step 3 - Check media template
+Look at header_format from list_templates:
+- TEXT or null: plain text template, skip to Step 4.
+- IMAGE / VIDEO / DOCUMENT: check media_status returned.
+  Case A - media_status.valid is true: media is ready, note the filename and days remaining, continue to Step 4.
+  Case B - media_status.valid is false (reason: no_media_id or not_found): output exactly:
+    "REDIRECT_TO_TEMPLATES: The template '<name>' is a <TYPE> template but has no media uploaded yet. Please go to the Templates page, find this template, click Preview, and upload a <image/video/document> using the Upload Media button. Once done, come back here and we will continue."
+  Case C - media_status.valid is false (reason: expired): output exactly:
+    "REDIRECT_TO_TEMPLATES: The <TYPE> media for template '<name>' expired <N> days ago. Meta expires uploaded media after 25 days. Please go to the Templates page, find this template, click Preview, and upload fresh media. Once done, come back here and we will continue."
+  For Case B and C: do NOT call create_campaign.
 
-Step 3 - Show summary and ask for confirmation
+Step 4 - Collect variable values if needed
+Check variables_count from the template result.
+- If 0: skip to Step 5.
+- If greater than 0: ask the user for each variable value before proceeding. Do not continue until all values are provided.
+
+Step 5 - Show summary and ask for confirmation
 Output this block with no extra text or emoji on the separator lines:
   ───────────────────────
   Campaign Summary
   Name: <campaign_name>
   Group: <group_name> (<count> contacts)
   Template: <template_name>
-  Scheduled: <full day, date at time>
+  Header: <TEXT / IMAGE / VIDEO / DOCUMENT>
+  Media: <file name and days remaining, or "None">
+  Scheduled: <show in IST — e.g. "Today, 16 May 2026 at 5:07 PM IST">
   Variables: <list values or "None">
   ───────────────────────
   Ready to create this campaign?
 
-Step 4 - Create on confirmation only
+Step 6 - Create on confirmation only
 Call create_campaign only after the user says yes, go ahead, confirm, or similar.
 Pass template_variables exactly as collected. If no variables, pass {}.
+For media templates, pass the media_id from the list_templates result.
+
+SCHEDULED_AT DATETIME RULE (critical):
+- All times the user gives are in IST (Asia/Kolkata, UTC+5:30).
+- You MUST convert IST to UTC before passing scheduled_at to create_campaign.
+- Subtract 5 hours and 30 minutes from the IST time to get UTC.
+- Always pass a valid ISO 8601 string in UTC — e.g. "2026-05-16T11:37:00.000Z".
+- NEVER pass natural-language strings like "Today at 5:07 PM" — the database will reject them.
+- The create_campaign result includes scheduled_at_ist which is the IST display string. Use that in your confirmation message.
+- In the Campaign Summary, show the scheduled time in IST.
+
+AFTER REDIRECT - RESUMING:
+If the user comes back and says they uploaded media, call list_templates again to re-check. If media_status.valid is now true, continue from Step 4.
 
 TEMPLATE CREATION FLOW:
-
 When the user asks to create a template, gather these details one at a time if missing:
-1. Template name (you will auto-convert it to lowercase_with_underscores — tell the user what it becomes)
-2. Category: MARKETING (promotions/offers), UTILITY (order updates, alerts), or AUTHENTICATION (OTP)
-3. Language — default to English (en_US) unless the user specifies otherwise
-4. Message body text — can include {{1}}, {{2}}, etc. for dynamic values
-5. Header text (optional — a short title shown above the message)
-6. Footer text (optional — e.g. "Reply STOP to unsubscribe")
-7. Example values for any variables — required by Meta if body uses {{1}}, {{2}}, etc.
-8. Buttons (optional) — ask "Do you want to add any buttons?" and explain the three types:
-   - Quick Reply: a tap-to-reply button (e.g. "Yes", "No thanks"). Max 3.
-   - URL: opens a webpage (e.g. "Track Order" → https://example.com/track/{{1}}). Max 2. If the URL has {{1}}, ask for a full example URL.
-   - Phone: calls a number (e.g. "Call Us" → +911234567890). Max 1.
-   Collect button type, label, and any required extra info (URL or phone number). Max 3 buttons total.
+1. Template name (auto-convert to lowercase_with_underscores)
+2. Category: MARKETING, UTILITY, or AUTHENTICATION
+3. Language — default en_US
+4. Message body text (can include {{1}}, {{2}} for variables)
+5. Header text (optional)
+6. Footer text (optional)
+7. Example values for any variables (required by Meta if body uses {{N}})
+8. Buttons (optional) — Quick Reply, URL, or Phone Number. Max 3 total.
 
-Before calling create_template, show this preview block:
+If user asks for a media template (IMAGE/VIDEO/DOCUMENT header), tell them:
+"Media templates cannot be created through chat yet. You can create one from the Templates page. Text-based templates are fully supported here."
+
+Before calling create_template, show this preview:
   ───────────────────────
   Template Preview
   Name: <normalized_name>
@@ -418,57 +412,81 @@ Before calling create_template, show this preview block:
   Header: <header text or "None">
   Body: <body text>
   Footer: <footer text or "None">
-  Buttons: <list each button as "Label (Type)" or "None">
+  Buttons: <list each or "None">
   ───────────────────────
   Ready to submit this template to Meta for approval?
 
-Call create_template only after the user confirms.
-After success, reply in one or two plain sentences: the template name, its status (usually PENDING), and that Meta typically approves within a few minutes to a few hours.
-If the user asks for a media template (image/video/document header), tell them that media templates are not supported via chat yet and they can create one from the Templates page.
+Call create_template only after confirmation.
+After success, reply in one or two plain sentences with the template name, status, and that Meta typically approves within minutes to hours.
 
 OTHER RULES:
-- If a time is given without a date (e.g. "6pm"), assume today. If that time has already passed, assume tomorrow. Always show the full date in the summary.
-- After create_campaign succeeds, reply in one plain sentence stating the campaign name, group, and scheduled time. No emojis. Then stop.
-- If a tool returns an error, explain it plainly. Never retry with fabricated IDs.
+- After create_campaign succeeds, use scheduled_at_ist from the result in your confirmation. Reply in one plain sentence: campaign name, group, and IST time. No emojis. Then stop.
+- If a tool returns an error containing "Invalid scheduled time", tell the user there was a datetime error and ask them to state the schedule time again clearly in IST (e.g. "tomorrow at 3pm IST").
+- If a tool returns any other error, explain it plainly. Never retry with fabricated IDs.
 - Never show raw UUIDs. Always refer to things by name.`;
+
+// ── Dynamic prompt builder — injects current IST time on every request ────────
+function buildSystemPrompt() {
+  const nowUtc = new Date();
+
+  // Current IST time using Intl.DateTimeFormat — no manual offset math
+  const istString = new Intl.DateTimeFormat("en-IN", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(nowUtc);
+
+  const timeContext = `\nCURRENT TIME (use for all date/time calculations):
+- Current IST time (Asia/Kolkata): ${istString}
+- Current UTC time: ${nowUtc.toISOString()}
+- The user is in India. All times they mention are in IST (Asia/Kolkata, UTC+5:30) unless stated otherwise.
+- To convert IST to UTC: subtract 5 hours and 30 minutes.
+- Example: "5:07 PM IST" → 11:37 AM UTC → "2026-05-16T11:37:00.000Z"\n`;
+
+  // Inject time context right after the first paragraph
+  return SAMVAADIK_SYSTEM_PROMPT.replace(
+    "ID RULES (critical):",
+    timeContext + "\nID RULES (critical):",
+  );
+}
 
 const MAX_TOOL_ITERATIONS = 8;
 
+// ── handleSamvaadikChat ───────────────────────────────────────────────────────
 export const handleSamvaadikChat = async (req, res) => {
   try {
     const { user_id, messages } = req.body;
 
-    // ── Validation ──────────────────────────────────────────────────────────
     if (!user_id) {
       return res
         .status(400)
         .json({ success: false, error: "user_id is required" });
     }
-
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
       return res
         .status(400)
         .json({ success: false, error: "messages array is required" });
     }
-
-    // Validate message shape — each must have role + content
     for (const msg of messages) {
       if (!msg.role || !msg.content) {
-        return res.status(400).json({
-          success: false,
-          error:
-            "Each message must have role ('user' or 'assistant') and content.",
-        });
+        return res
+          .status(400)
+          .json({
+            success: false,
+            error: "Each message must have role and content.",
+          });
       }
       if (!["user", "assistant"].includes(msg.role)) {
-        return res.status(400).json({
-          success: false,
-          error: `Invalid role "${msg.role}". Must be "user" or "assistant".`,
-        });
+        return res
+          .status(400)
+          .json({ success: false, error: `Invalid role "${msg.role}".` });
       }
     }
 
-    // ── Agentic loop ────────────────────────────────────────────────────────
     let currentMessages = [...messages];
     let iteration = 0;
 
@@ -476,49 +494,41 @@ export const handleSamvaadikChat = async (req, res) => {
       iteration++;
 
       const response = await anthropic.messages.create({
-        model: "claude-haiku-4-5-20251001", // Fast + cheap for tool-use loop
+        model: "claude-haiku-4-5-20251001",
         max_tokens: 1024,
-        system: SAMVAADIK_SYSTEM_PROMPT,
+        system: buildSystemPrompt(), // dynamic — injects current IST time each request
         tools: CAMPAIGN_TOOLS,
         messages: currentMessages,
       });
 
       const { stop_reason, content, usage } = response;
 
-      // ── Claude finished → return text reply ──
       if (stop_reason === "end_turn") {
         const textBlock = content.find((b) => b.type === "text");
         return res.json({
           success: true,
           role: "assistant",
           content: textBlock?.text || "",
-          usage, // expose token usage for debugging
-          iterations: iteration, // how many tool loops ran
+          usage,
+          iterations: iteration,
         });
       }
 
-      // ── Claude wants to call tool(s) ──
       if (stop_reason === "tool_use") {
-        // Add Claude's response (with tool_use blocks) to history
         currentMessages.push({ role: "assistant", content });
 
-        // Execute all tool calls in this turn
         const toolResults = [];
-
         for (const block of content) {
           if (block.type === "tool_use") {
             console.log(
               `[SamvaadikAI] Tool call: ${block.name}`,
               JSON.stringify(block.input),
             );
-
             const result = await executeTool(block.name, block.input, user_id);
-
             console.log(
               `[SamvaadikAI] Tool result: ${block.name}`,
               JSON.stringify(result),
             );
-
             toolResults.push({
               type: "tool_result",
               tool_use_id: block.id,
@@ -527,12 +537,10 @@ export const handleSamvaadikChat = async (req, res) => {
           }
         }
 
-        // Feed all results back to Claude and loop
         currentMessages.push({ role: "user", content: toolResults });
         continue;
       }
 
-      // ── Unexpected stop reason ──
       console.warn("[SamvaadikAI] Unexpected stop_reason:", stop_reason);
       return res.json({
         success: true,
@@ -542,7 +550,6 @@ export const handleSamvaadikChat = async (req, res) => {
       });
     }
 
-    // ── Safety: exceeded max iterations ──
     return res.json({
       success: true,
       role: "assistant",
@@ -552,37 +559,44 @@ export const handleSamvaadikChat = async (req, res) => {
     });
   } catch (err) {
     console.error("❌ handleSamvaadikChat:", err);
-
-    if (err.status === 401) {
-      return res.status(500).json({
-        success: false,
-        error:
-          "Invalid Anthropic API key. Check your ANTHROPIC_API_KEY env variable.",
-      });
-    }
-    if (err.status === 429) {
-      return res.status(429).json({
-        success: false,
-        error: "Rate limit hit. Try again in a moment.",
-      });
-    }
-
+    if (err.status === 401)
+      return res
+        .status(500)
+        .json({ success: false, error: "Invalid Anthropic API key." });
+    if (err.status === 429)
+      return res
+        .status(429)
+        .json({
+          success: false,
+          error: "Rate limit hit. Try again in a moment.",
+        });
     return res.status(500).json({ success: false, error: err.message });
   }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ─── GROUP PREVIEW (parse CSV, return summary, NO DB writes) ─────────────────
-// ─────────────────────────────────────────────────────────────────────────────
-//
-//  Route:  POST /api/agents/samvaadik/preview-group
-//  Body:   multipart/form-data: user_id, group_name, file
-//  Returns: { group_name, contact_count, columns, sample, contacts }
-//           contacts[] is returned so frontend can send it back on confirm
-//           without re-uploading the file.
-//
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── HELPERS for group CSV parsing ────────────────────────────────────────────
 
+const findColumn = (headers, candidates) => {
+  const lower = headers.map((h) => h.toLowerCase().trim());
+  for (const c of candidates) {
+    const i = lower.indexOf(c.toLowerCase());
+    if (i !== -1) return headers[i];
+  }
+  return null;
+};
+
+const slugify = (s) =>
+  String(s || "")
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9-_]/g, "")
+    .slice(0, 60);
+
+// ─── GROUP PREVIEW ────────────────────────────────────────────────────────────
+// POST /api/agents/samvaadik/preview-group
+// multipart/form-data: user_id, group_name, file
+// Parses CSV, uploads to Supabase storage, returns preview + contacts[].
+// NO DB writes to groups or group_contacts.
 export const handleGroupPreview = async (req, res) => {
   try {
     const { user_id, group_name } = req.body;
@@ -614,12 +628,14 @@ export const handleGroupPreview = async (req, res) => {
           .on("error", reject)
           .on("end", resolve);
       });
-    } catch (parseErr) {
-      return res.status(400).json({
-        success: false,
-        error:
-          "Could not parse the file. Make sure it is a valid CSV with headers.",
-      });
+    } catch {
+      return res
+        .status(400)
+        .json({
+          success: false,
+          error:
+            "Could not parse the file. Make sure it is a valid CSV with headers.",
+        });
     }
 
     if (!rows.length) {
@@ -646,7 +662,7 @@ export const handleGroupPreview = async (req, res) => {
       });
     }
 
-    // Build contacts array
+    // Build contacts
     const contacts = rows
       .map((r) => ({
         user_id,
@@ -665,19 +681,10 @@ export const handleGroupPreview = async (req, res) => {
         });
     }
 
-    // ── Upload CSV to Supabase storage ───────────────────────────────────────
-    // Upload now while we have the file buffer. Store URL and pass it to
-    // the create step so it gets saved in groups.uploaded_csv.
+    // Upload CSV to Supabase storage (non-fatal)
     let csvUrl = null;
     try {
-      const slug = (s) =>
-        String(s || "")
-          .toLowerCase()
-          .replace(/\s+/g, "-")
-          .replace(/[^a-z0-9-_]/g, "")
-          .slice(0, 60);
-      const storageKey = `${user_id}/${Date.now()}_${slug(group_name)}.csv`;
-
+      const storageKey = `${user_id}/${Date.now()}_${slugify(group_name)}.csv`;
       const { error: uploadErr } = await supabase.storage
         .from("group-csvs")
         .upload(storageKey, file.buffer, { contentType: "text/csv" });
@@ -692,7 +699,6 @@ export const handleGroupPreview = async (req, res) => {
           "[AgentGroup] CSV storage upload failed:",
           uploadErr.message,
         );
-        // Non-fatal — group creation proceeds without the stored CSV
       }
     } catch (storageErr) {
       console.warn("[AgentGroup] CSV storage error:", storageErr.message);
@@ -710,7 +716,7 @@ export const handleGroupPreview = async (req, res) => {
       },
       sample: contacts.slice(0, 3),
       contacts, // full list — frontend holds and sends back on confirm
-      csv_url: csvUrl, // storage URL — frontend sends back on confirm
+      csv_url: csvUrl, // Supabase storage URL — stored in groups.uploaded_csv
     });
   } catch (err) {
     console.error("❌ handleGroupPreview:", err);
@@ -718,42 +724,12 @@ export const handleGroupPreview = async (req, res) => {
   }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ─── GROUP CREATION FROM CSV/EXCEL ───────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────────────────────
-//
-//  Route:  POST /api/agents/samvaadik/create-group
-//  Accepts: multipart/form-data
-//  Fields:
-//    - user_id (string)
-//    - group_name (string)
-//    - description (string, optional)
-//    - file (CSV or Excel — field name: "file")
-//
-//  Flow:
-//    1. Creates the group row in Supabase
-//    2. Parses the CSV/Excel file in memory
-//    3. Bulk-inserts contacts into group_contacts
-//    4. Returns summary for the frontend to display as an AI message
-//
-// ─────────────────────────────────────────────────────────────────────────────
-
-import { Readable } from "stream";
-import { parse as parseCsv } from "@fast-csv/parse";
-
-const findColumn = (headers, candidates) => {
-  const lower = headers.map((h) => h.toLowerCase().trim());
-  for (const c of candidates) {
-    const i = lower.indexOf(c.toLowerCase());
-    if (i !== -1) return headers[i];
-  }
-  return null;
-};
-
+// ─── GROUP CREATION FROM CSV ──────────────────────────────────────────────────
+// POST /api/agents/samvaadik/create-group
+// JSON body: { user_id, group_name, description, contacts[], csv_url }
+// contacts[] and csv_url come from the preview step — no file upload here.
 export const handleGroupFromCsv = async (req, res) => {
   try {
-    // Accepts JSON body: { user_id, group_name, description, contacts: [...], csv_url }
-    // contacts[] and csv_url come from the preview step — no file needed here
     const {
       user_id,
       group_name,
@@ -775,14 +751,14 @@ export const handleGroupFromCsv = async (req, res) => {
         .status(400)
         .json({ success: false, error: "No contacts provided" });
 
-    // ── Create group ─────────────────────────────────────────────────────────
+    // Create group row
     const { data: group, error: groupErr } = await supabase
       .from("groups")
       .insert({
         user_id,
         group_name: group_name.trim(),
         description: description?.trim() || null,
-        uploaded_csv: csv_url, // ← store the Supabase storage URL
+        uploaded_csv: csv_url, // Supabase storage URL from preview step
         status: "active",
       })
       .select()
@@ -791,8 +767,7 @@ export const handleGroupFromCsv = async (req, res) => {
     if (groupErr)
       return res.status(500).json({ success: false, error: groupErr.message });
 
-    // ── Bulk insert contacts ──────────────────────────────────────────────────
-    // Attach group_id to every contact (preview didn't know the group_id yet)
+    // Bulk insert contacts — attach group_id (preview didn't know it yet)
     const contactsWithGroup = contacts.map((c) => ({
       ...c,
       group_id: group.group_id,
