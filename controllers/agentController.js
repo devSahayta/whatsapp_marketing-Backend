@@ -70,12 +70,10 @@ export const createAgent = async (req, res) => {
     } = req.body;
 
     if (!user_id || !account_id || !name) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          error: "user_id, account_id and name are required",
-        });
+      return res.status(400).json({
+        success: false,
+        error: "user_id, account_id and name are required",
+      });
     }
     if (!name.trim()) {
       return res
@@ -83,12 +81,10 @@ export const createAgent = async (req, res) => {
         .json({ success: false, error: "Agent name cannot be empty" });
     }
     if (model && !VALID_MODELS.includes(model)) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          error: `Invalid model. Must be one of: ${VALID_MODELS.join(", ")}`,
-        });
+      return res.status(400).json({
+        success: false,
+        error: `Invalid model. Must be one of: ${VALID_MODELS.join(", ")}`,
+      });
     }
 
     const { data, error } = await supabase
@@ -181,12 +177,10 @@ export const updateAgent = async (req, res) => {
     } = req.body;
 
     if (model && !VALID_MODELS.includes(model)) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          error: `Invalid model. Must be one of: ${VALID_MODELS.join(", ")}`,
-        });
+      return res.status(400).json({
+        success: false,
+        error: `Invalid model. Must be one of: ${VALID_MODELS.join(", ")}`,
+      });
     }
 
     const patch = { updated_at: new Date().toISOString() };
@@ -294,12 +288,10 @@ export const testAgent = async (req, res) => {
         .status(500)
         .json({ success: false, error: "Invalid Anthropic API key." });
     if (err.status === 429)
-      return res
-        .status(429)
-        .json({
-          success: false,
-          error: "Rate limit hit. Try again in a moment.",
-        });
+      return res.status(429).json({
+        success: false,
+        error: "Rate limit hit. Try again in a moment.",
+      });
     return res.status(500).json({ success: false, error: err.message });
   }
 };
@@ -473,12 +465,10 @@ export const handleSamvaadikChat = async (req, res) => {
     }
     for (const msg of messages) {
       if (!msg.role || !msg.content) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            error: "Each message must have role and content.",
-          });
+        return res.status(400).json({
+          success: false,
+          error: "Each message must have role and content.",
+        });
       }
       if (!["user", "assistant"].includes(msg.role)) {
         return res
@@ -564,12 +554,10 @@ export const handleSamvaadikChat = async (req, res) => {
         .status(500)
         .json({ success: false, error: "Invalid Anthropic API key." });
     if (err.status === 429)
-      return res
-        .status(429)
-        .json({
-          success: false,
-          error: "Rate limit hit. Try again in a moment.",
-        });
+      return res.status(429).json({
+        success: false,
+        error: "Rate limit hit. Try again in a moment.",
+      });
     return res.status(500).json({ success: false, error: err.message });
   }
 };
@@ -629,13 +617,11 @@ export const handleGroupPreview = async (req, res) => {
           .on("end", resolve);
       });
     } catch {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          error:
-            "Could not parse the file. Make sure it is a valid CSV with headers.",
-        });
+      return res.status(400).json({
+        success: false,
+        error:
+          "Could not parse the file. Make sure it is a valid CSV with headers.",
+      });
     }
 
     if (!rows.length) {
@@ -673,12 +659,10 @@ export const handleGroupPreview = async (req, res) => {
       .filter((c) => c.phone_number);
 
     if (!contacts.length) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          error: "No valid phone numbers found in the file.",
-        });
+      return res.status(400).json({
+        success: false,
+        error: "No valid phone numbers found in the file.",
+      });
     }
 
     // Upload CSV to Supabase storage (non-fatal)

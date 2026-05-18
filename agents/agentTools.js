@@ -70,10 +70,26 @@ export const CAMPAIGN_TOOLS = [
           description:
             "Main message body. Use {{1}}, {{2}}, etc. for dynamic variables. Example: 'Hi {{1}}, your order {{2}} is confirmed.'",
         },
+        header_format: {
+          type: "string",
+          enum: ["TEXT", "IMAGE", "VIDEO", "DOCUMENT"],
+          description:
+            "Header type. Use TEXT for a plain text header (provide header_text). Use IMAGE, VIDEO, or DOCUMENT only when the user has already uploaded a media file — its handle is provided in the conversation context.",
+        },
         header_text: {
           type: "string",
           description:
-            "Optional text header shown above the body. Plain text only, no variables.",
+            "Text header content. Only used when header_format is TEXT. Plain text, no variables.",
+        },
+        header_handle: {
+          type: "string",
+          description:
+            "The Meta media handle (starts with 'h:') for IMAGE/VIDEO/DOCUMENT headers. Use the exact value from the media_attachment context in the conversation. Never guess or construct this value.",
+        },
+        media_id: {
+          type: "string",
+          description:
+            "The Meta media_id returned alongside header_handle in the media_attachment context. Pass it here so it is saved in the template record.",
         },
         footer_text: {
           type: "string",
@@ -645,7 +661,10 @@ async function createTemplateTool(userId, input) {
       category,
       language = "en_US",
       body_text,
+      header_format,
       header_text,
+      header_handle,
+      media_id,
       footer_text,
       body_examples = [],
       buttons = [],
@@ -704,12 +723,16 @@ async function createTemplateTool(userId, input) {
     // Build Meta components array
     const components = [];
 
-    if (header_text?.trim()) {
+    if (header_format && ["IMAGE", "VIDEO", "DOCUMENT"].includes(header_format) && header_handle) {
+      // Media header — use the h: handle from the upload session
       components.push({
         type: "HEADER",
-        format: "TEXT",
-        text: header_text.trim(),
+        format: header_format,
+        example: { header_handle: [header_handle] },
       });
+    } else if (header_text?.trim()) {
+      // Text header
+      components.push({ type: "HEADER", format: "TEXT", text: header_text.trim() });
     }
 
     const variableMatches = body_text.match(/\{\{\d+\}\}/g) || [];
@@ -802,13 +825,17 @@ async function createTemplateTool(userId, input) {
       category,
       parameter_format: "positional",
       components,
-      header_format: header_text?.trim() ? "TEXT" : null,
-      header_handle: null,
+      header_format: ["IMAGE", "VIDEO", "DOCUMENT"].includes(header_format)
+        ? header_format
+        : header_text?.trim()
+        ? "TEXT"
+        : null,
+      header_handle: header_handle || null,
       variables: body_examples,
       buttons: buttons.length > 0 ? buttons : [],
       preview,
       status: preview?.status || metaResp.status || "PENDING",
-      media_id: null,
+      media_id: media_id || null,
     };
 
     const { error: insertErr } = await supabase

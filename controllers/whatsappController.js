@@ -59,6 +59,113 @@ async function forwardToApiWebhooks(account_id, payload) {
 const BUCKET_NAME = process.env.SUPABASE_BUCKET || "message_media";
 const TEMPLATE_URL = process.env.TEMPLATE_BASE_URL;
 
+async function handleTemplateStatusUpdate(wabaId, value) {
+  const templateId = value?.message_template_id?.toString();
+  const templateName = value?.message_template_name;
+  const language = value?.message_template_language;
+  const status = value?.event;
+  const category = value?.message_template_category;
+  const reason = value?.reason;
+
+  if (!wabaId || !templateId || !templateName || !status) {
+    console.warn("Template status webhook missing required fields", {
+      wabaId,
+      templateId,
+      templateName,
+      status,
+    });
+    return;
+  }
+
+  const { data: account, error: accountError } = await supabase
+    .from("whatsapp_accounts")
+    .select("wa_id")
+    .eq("waba_id", wabaId)
+    .limit(1)
+    .maybeSingle();
+
+  if (accountError || !account?.wa_id) {
+    console.error("No WhatsApp account mapped for template status update", {
+      wabaId,
+      error: accountError,
+    });
+    return;
+  }
+
+  let templateQuery = supabase
+    .from("whatsapp_templates")
+    .select("wt_id, preview")
+    .eq("template_id", templateId)
+    .eq("name", templateName);
+
+  if (language) templateQuery = templateQuery.eq("language", language);
+
+  const { data: templateRow, error: templateError } =
+    await templateQuery.maybeSingle();
+
+  if (templateError) {
+    console.error("Failed to find template for status update:", {
+      account_id: account.wa_id,
+      error: templateError,
+    });
+    return;
+  }
+
+  if (!templateRow?.wt_id) {
+    console.warn("Template not found for status update", {
+      account_id: account.wa_id,
+      templateId,
+      templateName,
+      language,
+    });
+    return;
+  }
+
+  const preview =
+    templateRow.preview && typeof templateRow.preview === "object"
+      ? {
+          ...templateRow.preview,
+          id: templateRow.preview.id || templateId,
+          name: templateRow.preview.name || templateName,
+          language: templateRow.preview.language || language,
+          status,
+          category: category || templateRow.preview.category,
+        }
+      : {
+          id: templateId,
+          name: templateName,
+          language,
+          status,
+          category,
+        };
+
+  const updateData = {
+    template_id: templateId,
+    status,
+    reason,
+    preview,
+  };
+
+  if (category) updateData.category = category;
+
+  const { data: updatedTemplate, error: updateError } = await supabase
+    .from("whatsapp_templates")
+    .update(updateData)
+    .eq("wt_id", templateRow.wt_id)
+    .select("wt_id, name, status, category")
+    .maybeSingle();
+
+  if (updateError) {
+    console.error("Failed to update template status:", {
+      account_id: account.wa_id,
+      error: updateError,
+    });
+    return;
+  }
+
+  console.log("Template status updated:", updatedTemplate);
+}
+
 async function fetchTemplateFromSystem(templateName) {
   const userId = "kp_c7f2725ff7a74158bb7eae3060d6f1de"; // static for now
   const url = `${TEMPLATE_URL}?user_id=${userId}&templateName=${templateName}`;
@@ -92,10 +199,20 @@ export const verifyWebhook = (req, res) => {
 export const handleIncomingMessage = async (req, res) => {
   console.log("🔹 FULL WHATSAPP PAYLOAD:", JSON.stringify(req.body, null, 2));
 
-  const value = req.body.entry?.[0]?.changes?.[0]?.value;
+  const change = req.body.entry?.[0]?.changes?.[0];
+  const value = change?.value;
 
   const wabaId = req.body.entry?.[0]?.id;
   const phoneNumberId = value?.metadata?.phone_number_id;
+
+  if (change?.field === "message_template_status_update") {
+    try {
+      await handleTemplateStatusUpdate(wabaId, value);
+    } catch (err) {
+      console.error("Template status webhook handler error:", err);
+    }
+    return res.sendStatus(200);
+  }
 
   if (!wabaId || !phoneNumberId) {
     console.error("❌ Missing WABA ID or phone_number_id");
