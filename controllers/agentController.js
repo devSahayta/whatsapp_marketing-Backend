@@ -383,17 +383,22 @@ If the user comes back and says they uploaded media, call list_templates again t
 
 TEMPLATE CREATION FLOW:
 When the user asks to create a template, gather these details one at a time if missing:
-1. Template name (auto-convert to lowercase_with_underscores)
-2. Category: MARKETING, UTILITY, or AUTHENTICATION
-3. Language — default en_US
-4. Message body text (can include {{1}}, {{2}} for variables)
-5. Header text (optional)
-6. Footer text (optional)
-7. Example values for any variables (required by Meta if body uses {{N}})
-8. Buttons (optional) — Quick Reply, URL, or Phone Number. Max 3 total.
+1. Template name (you will auto-convert it to lowercase_with_underscores — tell the user what it becomes)
+2. Category: MARKETING (promotions/offers), UTILITY (order updates, alerts), or AUTHENTICATION (OTP)
+3. Language — default to English (en_US) unless the user specifies otherwise
+4. Message body text — can include {{1}}, {{2}}, etc. for dynamic values
+5. Header text (optional — a short title shown above the message)
+6. Footer text (optional — e.g. "Reply STOP to unsubscribe")
+7. Example values for any variables — required by Meta if body uses {{1}}, {{2}}, etc.
+8. Buttons (optional) — ask "Do you want to add any buttons?" and explain the three types:
+   - Quick Reply: a tap-to-reply button (e.g. "Yes", "No thanks"). Max 3.
+   - URL: opens a webpage (e.g. "Track Order" → https://example.com/track/{{1}}). Max 2. If the URL has {{1}}, ask for a full example URL.
+   - Phone: calls a number (e.g. "Call Us" → +911234567890). Max 1.
+   Collect button type, label, and any required extra info (URL or phone number). Max 3 buttons total.
 
-If user asks for a media template (IMAGE/VIDEO/DOCUMENT header), tell them:
-"Media templates cannot be created through chat yet. You can create one from the Templates page. Text-based templates are fully supported here."
+
+If the user wants a media template (IMAGE/VIDEO/DOCUMENT header) and no media file has been attached in this session, tell them to upload their file using the + attachment button in the chat first, then you can create the template with it.
+If a MEDIA ATTACHMENT context appears in this prompt, use the header_format, header_handle, and media_id values from it automatically — show "Header: [format] file attached" in the preview and pass those values to create_template.
 
 Before calling create_template, show this preview:
   ───────────────────────
@@ -451,7 +456,7 @@ const MAX_TOOL_ITERATIONS = 8;
 // ── handleSamvaadikChat ───────────────────────────────────────────────────────
 export const handleSamvaadikChat = async (req, res) => {
   try {
-    const { user_id, messages } = req.body;
+    const { user_id, messages, media_attachment } = req.body;
 
     if (!user_id) {
       return res
@@ -477,6 +482,29 @@ export const handleSamvaadikChat = async (req, res) => {
       }
     }
 
+    // Build system prompt — inject media attachment context if file was uploaded
+    let systemPrompt = buildSystemPrompt();
+    if (media_attachment?.header_handle) {
+      systemPrompt +=
+        `\n\nMEDIA ATTACHMENT FOR THIS SESSION:\n` +
+        `The user has already uploaded a ${media_attachment.header_format || "IMAGE"} file` +
+        (media_attachment.file_name
+          ? ` named "${media_attachment.file_name}"`
+          : "") +
+        ` to use as a template header. ` +
+        `Meta header handle: ${media_attachment.header_handle}. ` +
+        (media_attachment.media_id
+          ? `Meta media_id: ${media_attachment.media_id}. `
+          : "") +
+        `When creating a template with this media, pass ` +
+        `header_format="${media_attachment.header_format || "IMAGE"}", ` +
+        `header_handle="${media_attachment.header_handle}"` +
+        (media_attachment.media_id
+          ? `, and media_id="${media_attachment.media_id}"`
+          : "") +
+        ` to the create_template tool. Do NOT ask the user to upload a file — the upload is already complete.`;
+    }
+
     let currentMessages = [...messages];
     let iteration = 0;
 
@@ -486,7 +514,7 @@ export const handleSamvaadikChat = async (req, res) => {
       const response = await anthropic.messages.create({
         model: "claude-haiku-4-5-20251001",
         max_tokens: 1024,
-        system: buildSystemPrompt(), // dynamic — injects current IST time each request
+        system: systemPrompt,
         tools: CAMPAIGN_TOOLS,
         messages: currentMessages,
       });
