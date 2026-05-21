@@ -114,7 +114,7 @@ export const importContactsFromSheet = async (req, res) => {
 
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId,
-      range: "Sheet1!A1:C1000",
+      range: "A1:C1000",
     });
 
     const rows = response.data.values;
@@ -371,7 +371,7 @@ export const syncContactsFromSheet = async (req, res) => {
 
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId,
-      range: "Sheet1!A1:C1000",
+      range: "A1:C1000",
     });
 
     const rows = response.data.values;
