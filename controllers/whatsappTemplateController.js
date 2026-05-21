@@ -242,16 +242,20 @@ export async function createTemplate(req, res) {
 }
 
 // Prepare a media header for a template via AI chat.
-// Accepts file via multipart upload. All Meta upload steps run in one request.
-// Flow: upload to Supabase → createUploadSession → uploadBinaryToSession (h: handle)
+// File is uploaded directly from browser to Supabase (bypasses Vercel 4.5MB limit).
+// This endpoint receives only storage_path (JSON) — no file binary.
+// Flow: download from Supabase → createUploadSession → uploadBinaryToSession (h: handle)
 //       → uploadMediaForMessage (media_id) → save to DB → cleanup Supabase
 export async function prepareMediaHeader(req, res) {
   const BUCKET = "template-media"; // bucket in Supabase storage for uploaded media
-
   try {
-    const { user_id } = req.body;
-    if (!user_id) return res.status(400).json({ error: "user_id required" });
-    if (!req.file) return res.status(400).json({ error: "file required" });
+    const { user_id, storage_path, file_name, file_type } = req.body;
+
+    if (!user_id || !storage_path || !file_name || !file_type) {
+      return res.status(400).json({
+        error: "user_id, storage_path, file_name, and file_type are required",
+      });
+    }
 
     const account = await getWhatsappAccount(user_id);
     if (!account)
@@ -261,37 +265,49 @@ export async function prepareMediaHeader(req, res) {
         .status(400)
         .json({ error: "Missing system_user_access_token" });
 
-    const {
-      buffer,
-      mimetype: mimeType,
-      originalname: fileName,
-      size,
-    } = req.file;
+    // Detect mime type and header format
+    const ext = storage_path.split(".").pop().toLowerCase();
+    const mimeMap = {
+      jpg: "image/jpeg",
+      jpeg: "image/jpeg",
+      png: "image/png",
+      webp: "image/webp",
+      mp4: "video/mp4",
+      "3gp": "video/3gpp",
+      mov: "video/quicktime",
+      pdf: "application/pdf",
+      doc: "application/msword",
+      docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    };
+    const mimeType = mimeMap[ext] || file_type || "application/octet-stream";
 
-    // Detect header format from mime type
     let header_format = "IMAGE";
     if (mimeType.startsWith("video/")) header_format = "VIDEO";
     else if (!mimeType.startsWith("image/")) header_format = "DOCUMENT";
 
-    // Step 1: Upload to Supabase storage
-    const ext = fileName.split(".").pop().toLowerCase();
-    const storagePath = `uploads/${user_id}/${Date.now()}.${ext}`;
-
-    const { error: storageErr } = await supabase.storage
+    // Step 1: Download file from Supabase (outgoing request — no Vercel size limit)
+    const { data, error: downloadErr } = await supabase.storage
       .from(BUCKET)
-      .upload(storagePath, buffer, { contentType: mimeType });
-    if (storageErr)
-      throw new Error("Supabase upload failed: " + storageErr.message);
+      .download(storage_path);
+
+    if (downloadErr || !data) {
+      throw new Error(
+        "Failed to download from Supabase: " + downloadErr?.message,
+      );
+    }
+
+    const arrayBuffer = await data.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
 
     // Step 2: Create Meta upload session
     const sessionData = await wsService.createUploadSession(
       account.app_id,
       account.system_user_access_token,
-      { file_name: fileName, file_type: mimeType },
+      { file_name, file_type: mimeType },
     );
     const session_id = sessionData.id;
     if (!session_id) {
-      await supabase.storage.from(BUCKET).remove([storagePath]);
+      await supabase.storage.from(BUCKET).remove([storage_path]);
       throw new Error("Failed to create Meta upload session");
     }
 
@@ -304,7 +320,7 @@ export async function prepareMediaHeader(req, res) {
     );
     const header_handle = binaryResp.h;
     if (!header_handle) {
-      await supabase.storage.from(BUCKET).remove([storagePath]);
+      await supabase.storage.from(BUCKET).remove([storage_path]);
       return res.status(500).json({
         error: "Meta did not return a header handle",
         debug: binaryResp,
@@ -316,7 +332,7 @@ export async function prepareMediaHeader(req, res) {
     const form = new FormData();
     form.set("messaging_product", "whatsapp");
     form.set("type", mimeType);
-    form.set("file", blob, fileName);
+    form.set("file", blob, file_name);
 
     const metaMediaResp = await wsService.uploadMediaForMessage(
       account.phone_number_id,
@@ -329,14 +345,14 @@ export async function prepareMediaHeader(req, res) {
     await supabase.from("whatsapp_media_uploads").insert({
       account_id: account.wa_id,
       media_id,
-      file_name: fileName,
+      file_name,
       type: mimeType,
       mime_type: mimeType,
-      size_bytes: size || buffer.byteLength,
+      size_bytes: buffer.byteLength,
     });
 
     // Step 6: Clean up Supabase storage
-    await supabase.storage.from(BUCKET).remove([storagePath]);
+    await supabase.storage.from(BUCKET).remove([storage_path]);
 
     return res.json({ success: true, header_handle, header_format, media_id });
   } catch (err) {
@@ -1356,28 +1372,31 @@ export async function listMedia(req, res) {
 
 export async function deleteMedia(req, res) {
   try {
-    const { wmu_id } = req.params;
-    if (!wmu_id) return res.status(400).json({ error: "wmu_id required" });
+    const { media_id } = req.params;
+    if (!media_id) return res.status(400).json({ error: "media_id required" });
+
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: "user_id required" });
+
+    // Get WhatsApp account
+    const account = await getWhatsappAccount(req.query.user_id);
+    if (!account)
+      return res.status(404).json({ error: "WhatsApp account not found" });
+
+    // Check for system_user_access_token
+    if (!account || !account.system_user_access_token)
+      return res.status(400).json({ error: "Account missing token" });
 
     // Get media row
     const { data: media, error: mediaErr } = await supabase
       .from("whatsapp_media_uploads")
       .select("*")
-      .eq("wmu_id", wmu_id)
+      .eq("media_id", media_id)
+      .eq("account_id", account.wa_id)
       .single();
 
     if (mediaErr || !media)
       return res.status(404).json({ error: "Media record not found" });
-
-    // Get WhatsApp account
-    const { data: account } = await supabase
-      .from("whatsapp_accounts")
-      .select("*")
-      .eq("wa_id", media.account_id)
-      .single();
-
-    if (!account || !account.system_user_access_token)
-      return res.status(400).json({ error: "Account missing token" });
 
     // ---- DELETE FROM META ----
     const metaResult = await wsService.deleteMediaFromMeta(
@@ -1390,11 +1409,14 @@ export async function deleteMedia(req, res) {
     }
 
     // ---- DELETE FROM DATABASE ----
-    await supabase.from("whatsapp_media_uploads").delete().eq("wmu_id", wmu_id);
+    await supabase
+      .from("whatsapp_media_uploads")
+      .delete()
+      .eq("wmu_id", media.wmu_id);
 
     return res.json({
       success: true,
-      deleted: wmu_id,
+      deleted: media.media_id,
       meta: metaResult,
     });
   } catch (err) {

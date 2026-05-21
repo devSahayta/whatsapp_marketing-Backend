@@ -43,8 +43,8 @@ router.post("/media/upload-url", getSupabaseUploadUrl);
 router.post("/media/upload-binary-from-storage", uploadBinaryFromStorage);
 router.post("/media/upload-media-from-storage", uploadMediaFromStorage);
 
-// AI chat: prepare a media header — accepts file directly, runs full upload pipeline
-router.post("/prepare-media-header", upload.single("file"), prepareMediaHeader);
+// AI chat: prepare a media header — JSON body with storage_path (file already in Supabase)
+router.post("/prepare-media-header", prepareMediaHeader);
 
 // sending template;
 router.post("/send/:templateId", sendTemplate);
@@ -53,7 +53,7 @@ router.post("/send/:templateId", sendTemplate);
 router.post("/send-bulk/:templateId", sendTemplateBulk);
 
 router.get("/media/list", listMedia);
-router.delete("/media/:wmu_id", deleteMedia);
+router.delete("/media/:media_id", deleteMedia);
 
 //list all template from meta
 router.get("/meta/list", listMetaTemplates);
