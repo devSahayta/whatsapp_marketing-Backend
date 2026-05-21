@@ -312,7 +312,10 @@ ID RULES (critical):
 - If unsure, call the tool again rather than guessing.
 
 DUPLICATE PREVENTION:
-- Once create_campaign returns a campaign_id, the campaign exists. Stop. Never call create_campaign again.
+- Once create_campaign returns a campaign_id for the CURRENT confirmation, that campaign is created. Do not call create_campaign again for that same confirmation.
+- If the user starts a NEW campaign request later in the conversation, treat it as a completely fresh flow from Step 1. You MUST call list_groups and list_templates again.
+- One conversation can contain multiple separate campaign creation flows.
+- CRITICAL: If the user says "yes" or confirms and you have NOT yet called create_campaign in this response, you MUST call it. Do NOT generate a confirmation text without first calling the tool. A campaign does not exist until create_campaign is called and returns a campaign_id.
 
 GROUP CREATION FLOW:
 There are two ways to create a group. Ask the user which they prefer if not clear from context.
@@ -404,22 +407,17 @@ If the user comes back and says they uploaded media, call list_templates again t
 
 TEMPLATE CREATION FLOW:
 When the user asks to create a template, gather these details one at a time if missing:
-1. Template name (you will auto-convert it to lowercase_with_underscores — tell the user what it becomes)
-2. Category: MARKETING (promotions/offers), UTILITY (order updates, alerts), or AUTHENTICATION (OTP)
-3. Language — default to English (en_US) unless the user specifies otherwise
-4. Message body text — can include {{1}}, {{2}}, etc. for dynamic values
-5. Header text (optional — a short title shown above the message)
-6. Footer text (optional — e.g. "Reply STOP to unsubscribe")
-7. Example values for any variables — required by Meta if body uses {{1}}, {{2}}, etc.
-8. Buttons (optional) — ask "Do you want to add any buttons?" and explain the three types:
-   - Quick Reply: a tap-to-reply button (e.g. "Yes", "No thanks"). Max 3.
-   - URL: opens a webpage (e.g. "Track Order" → https://example.com/track/{{1}}). Max 2. If the URL has {{1}}, ask for a full example URL.
-   - Phone: calls a number (e.g. "Call Us" → +911234567890). Max 1.
-   Collect button type, label, and any required extra info (URL or phone number). Max 3 buttons total.
+1. Template name (auto-convert to lowercase_with_underscores)
+2. Category: MARKETING, UTILITY, or AUTHENTICATION
+3. Language — default en_US
+4. Message body text (can include {{1}}, {{2}} for variables)
+5. Header text (optional)
+6. Footer text (optional)
+7. Example values for any variables (required by Meta if body uses {{N}})
+8. Buttons (optional) — Quick Reply, URL, or Phone Number. Max 3 total.
 
-
-If the user wants a media template (IMAGE/VIDEO/DOCUMENT header) and no media file has been attached in this session, tell them to upload their file using the + attachment button in the chat first, then you can create the template with it.
-If a MEDIA ATTACHMENT context appears in this prompt, use the header_format, header_handle, and media_id values from it automatically — show "Header: [format] file attached" in the preview and pass those values to create_template.
+If user asks for a media template (IMAGE/VIDEO/DOCUMENT header), tell them:
+"Media templates cannot be created through chat yet. You can create one from the Templates page. Text-based templates are fully supported here."
 
 Before calling create_template, show this preview:
   ───────────────────────
@@ -436,6 +434,42 @@ Before calling create_template, show this preview:
 
 Call create_template only after confirmation.
 After success, reply in one or two plain sentences with the template name, status, and that Meta typically approves within minutes to hours.
+
+AGENT CREATION FLOW:
+Collect details one at a time in this exact order. Ask only for what is missing.
+
+Step 1 - Agent name
+Ask: "What should the agent be called?" (e.g. "Order Support Bot")
+
+Step 2 - Description (optional)
+Ask: "Give it a short description — what does it do? (or say skip)"
+If the user says skip or nothing meaningful, use null.
+
+Step 3 - System prompt
+Ask: "What should the agent do and how should it behave? Describe its role, what topics it can help with, and any limits."
+Based on what the user tells you, write a clear and complete system prompt yourself.
+Show it to the user: "Here is the system prompt I wrote: [prompt]. Does this look right, or would you like to change anything?"
+If they want changes, update and show again. Continue until they approve.
+
+Once you have name, description, and an approved system prompt, go directly to the preview.
+Do NOT ask for model, max_turns, fallback_action, or exit keywords — use defaults silently:
+- model: claude-haiku-4-5-20251001
+- max_turns: 10
+- fallback_action: handoff_to_agent
+- exit_keywords: []
+
+Show this preview:
+  ───────────────────────
+  Agent Preview
+  Name: <name>
+  Description: <description or "None">
+  System prompt: <system_prompt>
+  ───────────────────────
+  Ready to create this agent?
+
+Call create_agent only after the user confirms.
+Pass model="claude-haiku-4-5-20251001", max_turns=10, fallback_action="handoff_to_agent", exit_keywords=[].
+After success, reply in one sentence: the agent name and that it is now available on the Agents page.
 
 OTHER RULES:
 - After create_campaign succeeds, use scheduled_at_ist from the result in your confirmation. Reply in one plain sentence: campaign name, group, and IST time. No emojis. Then stop.
@@ -503,7 +537,7 @@ export const handleSamvaadikChat = async (req, res) => {
       }
     }
 
-    // Build system prompt — inject media attachment context if file was uploaded
+    // Build system prompt with current IST time + optional media attachment context
     let systemPrompt = buildSystemPrompt();
     if (media_attachment?.header_handle) {
       systemPrompt +=
@@ -526,17 +560,63 @@ export const handleSamvaadikChat = async (req, res) => {
         ` to the create_template tool. Do NOT ask the user to upload a file — the upload is already complete.`;
     }
 
-    let currentMessages = [...messages];
+    // Trim to last 20 messages to prevent context bloat across multiple campaigns
+    const trimmedMessages =
+      messages.length > 20 ? messages.slice(-20) : messages;
+    let currentMessages = [...trimmedMessages];
     let iteration = 0;
+
+    // ── Detect if user just confirmed a campaign or agent summary ─────────────
+    // If yes, force Claude to call a tool on the first iteration using tool_choice:any.
+    // This is enforced at the API level — Claude physically cannot return text
+    // without calling a tool when tool_choice is "any".
+    const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
+    const isConfirmation =
+      lastUserMsg &&
+      /^(yes|yeah|yep|confirm|go ahead|sure|ok|okay|proceed|do it|create it|create( the)? (campaign|agent)|correct|crct|looks good|that('s| is) (fine|good|correct)|yep do it)$/i.test(
+        lastUserMsg.content.trim(),
+      );
+
+    // Check if the last assistant message contains a pending campaign or agent summary
+    const lastAssistantMsg = [...messages]
+      .reverse()
+      .find((m) => m.role === "assistant");
+    const hasSummaryPending =
+      lastAssistantMsg &&
+      lastAssistantMsg.content.includes("\u2500\u2500\u2500") &&
+      // Campaign summary pending
+      ((lastAssistantMsg.content.includes("Campaign Summary") &&
+        (lastAssistantMsg.content.includes("Ready to create") ||
+          lastAssistantMsg.content.includes(
+            "Ready to create this campaign",
+          ))) ||
+        // Agent preview pending
+        (lastAssistantMsg.content.includes("Agent Preview") &&
+          lastAssistantMsg.content.includes("Ready to create this agent")));
+
+    // Force tool use only when user confirmed AND a summary was just shown
+    const forceToolUse = isConfirmation && hasSummaryPending;
+
+    if (forceToolUse) {
+      console.log(
+        "[SamvaadikAI] Confirmation after summary detected — forcing tool call (tool_choice:any)",
+      );
+    }
 
     while (iteration < MAX_TOOL_ITERATIONS) {
       iteration++;
 
+      // First iteration after confirmation: force a tool call so Claude cannot
+      // hallucinate a confirmation text. After that, let Claude respond freely.
+      const toolChoice =
+        forceToolUse && iteration === 1 ? { type: "any" } : { type: "auto" };
+
       const response = await anthropic.messages.create({
         model: "claude-haiku-4-5-20251001",
-        max_tokens: 1024,
+        max_tokens: 4096,
         system: systemPrompt,
         tools: CAMPAIGN_TOOLS,
+        tool_choice: toolChoice,
         messages: currentMessages,
       });
 

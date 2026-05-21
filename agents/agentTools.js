@@ -145,6 +145,64 @@ export const CAMPAIGN_TOOLS = [
     },
   },
   {
+    name: "create_agent",
+    description:
+      "Create a new AI chatbot agent for the user. Only call this AFTER collecting all required details, showing the full Agent Preview, and receiving explicit confirmation from the user.",
+    input_schema: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description:
+            "Name of the agent. Clear and descriptive, e.g. 'Order Support Bot'.",
+        },
+        description: {
+          type: "string",
+          description: "Optional short description of what this agent does.",
+        },
+        system_prompt: {
+          type: "string",
+          description:
+            "The full system prompt that defines the agent's role, tone, and behaviour.",
+        },
+        model: {
+          type: "string",
+          enum: [
+            "claude-haiku-4-5-20251001",
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+          ],
+          description:
+            "The AI model to use. claude-haiku-4-5-20251001 is fastest and cheapest (recommended). claude-sonnet-4-6 is smarter. claude-opus-4-6 is most powerful.",
+        },
+        max_turns: {
+          type: "number",
+          description:
+            "Maximum number of back-and-forth messages before the fallback triggers. Must be between 1 and 50. Default is 10.",
+        },
+        fallback_action: {
+          type: "string",
+          enum: ["handoff_to_agent", "end_flow"],
+          description:
+            "What happens when max_turns is reached. handoff_to_agent transfers to a human. end_flow ends the conversation.",
+        },
+        exit_keywords: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Optional list of keywords (uppercase) that let users exit the agent at any time. e.g. ['STOP', 'MENU', 'EXIT'].",
+        },
+      },
+      required: [
+        "name",
+        "system_prompt",
+        "model",
+        "max_turns",
+        "fallback_action",
+      ],
+    },
+  },
+  {
     name: "create_campaign",
     description:
       "Create and schedule a WhatsApp campaign. IMPORTANT: Only call this AFTER (1) collecting all required template variable values from the user if the template has variables, (2) confirming media is available if it is a media template, (3) showing the full summary, and (4) the user has explicitly confirmed. Never call without confirmation.",
@@ -249,6 +307,8 @@ export async function executeTool(toolName, toolInput, userId) {
       return await listGoogleSheets(userId);
     case "create_group_from_sheet":
       return await createGroupFromSheet(userId, toolInput);
+    case "create_agent":
+      return await createAgentTool(userId, toolInput);
     default:
       return { error: `Unknown tool: ${toolName}` };
   }
@@ -1123,6 +1183,71 @@ async function createTemplateTool(userId, input) {
         insert.status === "APPROVED"
           ? "Template created and approved by Meta."
           : "Template submitted to Meta for approval. It usually takes a few minutes to a few hours.",
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// ─────────────────────────────────────────────
+// create_agent
+// ─────────────────────────────────────────────
+
+async function createAgentTool(userId, input) {
+  try {
+    const {
+      name,
+      description = "",
+      system_prompt,
+      model = "claude-haiku-4-5-20251001",
+      max_turns = 10,
+      fallback_action = "handoff_to_agent",
+      exit_keywords = [],
+    } = input;
+
+    if (!name?.trim()) return { error: "Agent name is required." };
+    if (!system_prompt?.trim()) return { error: "System prompt is required." };
+
+    // Get the user's active WhatsApp account_id
+    const accountId = await getAccountId(userId);
+    if (!accountId) {
+      return { error: "No active WhatsApp account found." };
+    }
+
+    // Normalize exit keywords to uppercase
+    const normalizedKeywords = exit_keywords
+      .map((k) => String(k).trim().toUpperCase())
+      .filter(Boolean);
+
+    const { data: agent, error: insertErr } = await supabase
+      .from("chatbot_agents")
+      .insert({
+        user_id: userId,
+        account_id: accountId,
+        name: name.trim(),
+        description: description?.trim() || null,
+        system_prompt: system_prompt.trim(),
+        model,
+        temperature: 0.7,
+        max_turns: Math.min(Math.max(parseInt(max_turns) || 10, 1), 50),
+        fallback_action,
+        exit_keywords: normalizedKeywords,
+        status: "active",
+      })
+      .select()
+      .single();
+
+    if (insertErr) return { error: insertErr.message };
+
+    return {
+      success: true,
+      agent_id: agent.agent_id,
+      name: agent.name,
+      model: agent.model,
+      max_turns: agent.max_turns,
+      fallback_action: agent.fallback_action,
+      exit_keywords: agent.exit_keywords,
+      message: `Agent "${agent.name}" created successfully. You can find it on the Agents page and assign it to flows.`,
     };
   } catch (err) {
     return { error: err.message };
