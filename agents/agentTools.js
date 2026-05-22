@@ -4,6 +4,7 @@
 import { v4 as uuidv4 } from "uuid";
 import { supabase } from "../config/supabase.js";
 import * as wsService from "../services/whatsappTemplateService.js";
+import { getSheetsClient, getDriveClient } from "../services/google.service.js";
 
 // ─────────────────────────────────────────────
 // TOOL DEFINITIONS  (sent to Anthropic API)
@@ -344,6 +345,40 @@ export const CAMPAIGN_TOOLS = [
       ],
     },
   },
+  {
+    name: "list_google_sheets",
+    description:
+      "List the user's Google Sheets spreadsheets so they can pick one to import contacts from. Returns each sheet's id and name. If Google is not connected, returns an error asking the user to connect first.",
+    input_schema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: "create_group_from_sheet",
+    description:
+      "Create a new contact group by importing contacts from a Google Sheets spreadsheet. The sheet must have columns: name (col A), phoneno (col B), email optional (col C). Only call this AFTER showing a summary and receiving explicit confirmation from the user.",
+    input_schema: {
+      type: "object",
+      properties: {
+        group_name: {
+          type: "string",
+          description: "Name for the new contact group.",
+        },
+        description: {
+          type: "string",
+          description: "Optional description for the group.",
+        },
+        spreadsheet_id: {
+          type: "string",
+          description:
+            "The Google Sheets spreadsheet ID — copied exactly from the list_google_sheets result. Never guess or construct this value.",
+        },
+      },
+      required: ["group_name", "spreadsheet_id"],
+    },
+  },
 ];
 
 // ─────────────────────────────────────────────
@@ -370,6 +405,10 @@ export async function executeTool(toolName, toolInput, userId) {
       return await renameFlow(userId, toolInput);
     case "delete_flow":
       return await deleteFlowTool(userId, toolInput);
+    case "list_google_sheets":
+      return await listGoogleSheets(userId);
+    case "create_group_from_sheet":
+      return await createGroupFromSheet(userId, toolInput);
     case "create_agent":
       return await createAgentTool(userId, toolInput);
     default:
@@ -815,6 +854,227 @@ async function createCampaign(userId, input) {
 // ─────────────────────────────────────────────
 // create_template
 // ─────────────────────────────────────────────
+
+// ─────────────────────────────────────────────
+// list_google_sheets
+// ─────────────────────────────────────────────
+
+async function listGoogleSheets(userId) {
+  try {
+    const { data: googleAccount } = await supabase
+      .from("user_google_accounts")
+      .select("id")
+      .eq("user_id", userId)
+      .single();
+
+    if (!googleAccount) {
+      return {
+        error:
+          "GOOGLE_NOT_CONNECTED: Your Google account is not connected. Please go to the Integrations page and connect your Google account first, then come back here.",
+        requires_google_connection: true,
+      };
+    }
+
+    let drive;
+    try {
+      drive = await getDriveClient(userId);
+    } catch {
+      return {
+        error:
+          "GOOGLE_NOT_CONNECTED: Could not access your Google account. Please reconnect it from the Integrations page.",
+        requires_google_connection: true,
+      };
+    }
+
+    const response = await drive.files.list({
+      q: "mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
+      fields: "files(id, name)",
+      orderBy: "modifiedTime desc",
+    });
+
+    const sheets = response.data.files || [];
+
+    if (sheets.length === 0) {
+      return {
+        sheets: [],
+        message: "No Google Sheets found in your Drive.",
+      };
+    }
+
+    return { sheets };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// ─────────────────────────────────────────────
+// create_group_from_sheet
+// ─────────────────────────────────────────────
+
+async function createGroupFromSheet(userId, input) {
+  try {
+    const { group_name, description = "", spreadsheet_id } = input;
+
+    const { data: googleAccount } = await supabase
+      .from("user_google_accounts")
+      .select("id")
+      .eq("user_id", userId)
+      .single();
+
+    if (!googleAccount) {
+      return {
+        error:
+          "GOOGLE_NOT_CONNECTED: Your Google account is not connected. Please go to the Integrations page and connect it first.",
+        requires_google_connection: true,
+      };
+    }
+
+    let sheets;
+    try {
+      sheets = await getSheetsClient(userId);
+    } catch {
+      return {
+        error:
+          "GOOGLE_NOT_CONNECTED: Could not access your Google account. Please reconnect it from the Integrations page.",
+        requires_google_connection: true,
+      };
+    }
+
+    let rows;
+    try {
+      const response = await sheets.spreadsheets.values.get({
+        spreadsheetId: spreadsheet_id,
+        range: "A1:C1000",
+      });
+      rows = response.data.values;
+    } catch (err) {
+      console.log(
+        `[createGroupFromSheet] Error reading spreadsheet ${spreadsheet_id}:`,
+        err,
+      );
+      return {
+        error: `Could not read the spreadsheet. Make sure it exists and you have access to it. (${err.message})`,
+      };
+    }
+
+    if (!rows || rows.length < 2) {
+      return {
+        error:
+          "No data found in the sheet. Make sure Sheet1 has at least a header row and one data row.",
+      };
+    }
+
+    const headers = rows[0].map((h) => h?.toString().trim().toLowerCase());
+    if (headers[0] !== "name") {
+      return {
+        error_type: "INVALID_COLUMNS",
+        error: `Column A header must be 'name' but found '${rows[0][0]}'. Please rename it in your sheet and try again.`,
+      };
+    }
+    if (headers[1] !== "phoneno") {
+      return {
+        error_type: "INVALID_COLUMNS",
+        error: `Column B header must be 'phoneno' but found '${rows[0][1]}'. Please rename it in your sheet and try again.`,
+      };
+    }
+    if (headers.length >= 3 && headers[2] !== "email") {
+      return {
+        error_type: "INVALID_COLUMNS",
+        error: `Column C header must be 'email' but found '${rows[0][2]}'. Please rename it in your sheet and try again.`,
+      };
+    }
+
+    const invalidRows = [];
+    const seenPhones = new Set();
+    const validContacts = [];
+
+    rows.slice(1).forEach((row, index) => {
+      const rowNumber = index + 2;
+      const name = row[0]?.toString().trim();
+      const rawPhone = row[1]?.toString().trim();
+      const email = row[2]?.toString().trim() || null;
+
+      if (!name || !rawPhone) return;
+
+      const phoneDigits = rawPhone.replace(/^\+/, "");
+      if (!/^\d+$/.test(phoneDigits)) {
+        invalidRows.push({
+          row: rowNumber,
+          phone: rawPhone,
+          reason: "Invalid phone number",
+        });
+        return;
+      }
+
+      if (seenPhones.has(rawPhone)) return;
+      seenPhones.add(rawPhone);
+
+      validContacts.push({ full_name: name, phone_number: rawPhone, email });
+    });
+
+    if (validContacts.length === 0) {
+      return {
+        error: "No valid contacts found in the sheet.",
+        ...(invalidRows.length > 0 && { invalid_rows: invalidRows }),
+      };
+    }
+
+    // Create group
+    const { data: group, error: groupErr } = await supabase
+      .from("groups")
+      .insert({
+        user_id: userId,
+        group_name: group_name.trim(),
+        description: description?.trim() || null,
+        status: "active",
+        google_sheet_id: spreadsheet_id,
+      })
+      .select()
+      .single();
+
+    if (groupErr) return { error: groupErr.message };
+
+    // Bulk insert contacts in batches of 500
+    const BATCH = 500;
+    let insertedCount = 0;
+
+    for (let i = 0; i < validContacts.length; i += BATCH) {
+      const batch = validContacts.slice(i, i + BATCH).map((c) => ({
+        ...c,
+        group_id: group.group_id,
+        user_id: userId,
+      }));
+
+      const { data: inserted, error: insertErr } = await supabase
+        .from("group_contacts")
+        .insert(batch)
+        .select("contact_id");
+
+      if (insertErr) {
+        console.error(
+          `[createGroupFromSheet] Batch insert error at offset ${i}:`,
+          insertErr.message,
+        );
+      } else {
+        insertedCount += inserted?.length ?? 0;
+      }
+    }
+
+    const skipped = validContacts.length - insertedCount;
+
+    return {
+      success: true,
+      group_id: group.group_id,
+      group_name: group.group_name,
+      contacts_inserted: insertedCount,
+      skipped,
+      invalid_row_count: invalidRows.length,
+      message: `Group "${group.group_name}" created with ${insertedCount} contact${insertedCount !== 1 ? "s" : ""}${skipped > 0 ? ` (${skipped} skipped)` : ""}.`,
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
 
 async function createTemplateTool(userId, input) {
   try {

@@ -18,10 +18,10 @@ export const getSheetsClient = async (userId) => {
   oauth2Client.setCredentials({
     access_token: data.access_token,
     refresh_token: data.refresh_token,
-    expiry_date: data.expiry_date,
+    expiry_date: data.expiry_date ? Number(data.expiry_date) : undefined,
   });
 
-  // ✅ Auto-save refreshed tokens
+  // Auto-save refreshed tokens
   oauth2Client.on("tokens", async (newTokens) => {
     await supabase
       .from("user_google_accounts")
@@ -33,6 +33,10 @@ export const getSheetsClient = async (userId) => {
       })
       .eq("user_id", userId);
   });
+
+  // Force a proactive token refresh if expired — prevents the Sheets API
+  // from receiving a stale token and returning a misleading 404
+  await oauth2Client.getAccessToken();
 
   return google.sheets({ version: "v4", auth: oauth2Client });
 };
@@ -53,7 +57,7 @@ export const getDriveClient = async (userId) => {
   oauth2Client.setCredentials({
     access_token: data.access_token,
     refresh_token: data.refresh_token,
-    expiry_date: data.expiry_date,
+    expiry_date: data.expiry_date ? Number(data.expiry_date) : undefined,
   });
 
   // Auto-save refreshed tokens
