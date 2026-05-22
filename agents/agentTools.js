@@ -144,6 +144,98 @@ export const CAMPAIGN_TOOLS = [
     },
   },
   {
+    name: "list_flows",
+    description:
+      "Fetch all chatbot flows for the user. Use this to find a flow by name, show status, or look up a flow_id before updating or deleting.",
+    input_schema: {
+      type: "object",
+      properties: {
+        search: {
+          type: "string",
+          description:
+            "Optional search string to filter flows by name (case-insensitive).",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "create_flow",
+    description:
+      "Create a new chatbot flow. Only needs a name and optional description. Call this directly after collecting the name — no summary card needed. Returns flow_id so the user can open the visual builder.",
+    input_schema: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description: "Name for the chatbot flow.",
+        },
+        description: {
+          type: "string",
+          description: "Optional short description of what this flow does.",
+        },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "update_flow_status",
+    description:
+      "Activate or deactivate a chatbot flow. Use list_flows first to get the flow_id.",
+    input_schema: {
+      type: "object",
+      properties: {
+        flow_id: {
+          type: "string",
+          description:
+            "The UUID of the flow to update. Copy exactly from list_flows result.",
+        },
+        status: {
+          type: "string",
+          enum: ["active", "inactive"],
+          description: "The new status to set.",
+        },
+      },
+      required: ["flow_id", "status"],
+    },
+  },
+  {
+    name: "rename_flow",
+    description:
+      "Rename an existing chatbot flow. Use list_flows first to get the flow_id.",
+    input_schema: {
+      type: "object",
+      properties: {
+        flow_id: {
+          type: "string",
+          description:
+            "The UUID of the flow to rename. Copy exactly from list_flows result.",
+        },
+        name: {
+          type: "string",
+          description: "The new name for the flow.",
+        },
+      },
+      required: ["flow_id", "name"],
+    },
+  },
+  {
+    name: "delete_flow",
+    description:
+      "Permanently delete a chatbot flow and all its nodes and edges. Only call this AFTER the user has explicitly confirmed deletion. This cannot be undone.",
+    input_schema: {
+      type: "object",
+      properties: {
+        flow_id: {
+          type: "string",
+          description:
+            "The UUID of the flow to delete. Copy exactly from list_flows result.",
+        },
+      },
+      required: ["flow_id"],
+    },
+  },
+  {
     name: "create_agent",
     description:
       "Create a new AI chatbot agent for the user. Only call this AFTER collecting all required details, showing the full Agent Preview, and receiving explicit confirmation from the user.",
@@ -268,6 +360,16 @@ export async function executeTool(toolName, toolInput, userId) {
       return await createCampaign(userId, toolInput);
     case "create_template":
       return await createTemplateTool(userId, toolInput);
+    case "list_flows":
+      return await listFlows(userId, toolInput.search);
+    case "create_flow":
+      return await createFlowTool(userId, toolInput);
+    case "update_flow_status":
+      return await updateFlowStatus(userId, toolInput);
+    case "rename_flow":
+      return await renameFlow(userId, toolInput);
+    case "delete_flow":
+      return await deleteFlowTool(userId, toolInput);
     case "create_agent":
       return await createAgentTool(userId, toolInput);
     default:
@@ -923,6 +1025,217 @@ async function createTemplateTool(userId, input) {
         insert.status === "APPROVED"
           ? "Template created and approved by Meta."
           : "Template submitted to Meta for approval. It usually takes a few minutes to a few hours.",
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// ─────────────────────────────────────────────
+// list_flows
+// ─────────────────────────────────────────────
+
+async function listFlows(userId, search) {
+  try {
+    const { data, error } = await supabase
+      .from("chatbot_flows")
+      .select("flow_id, name, description, status, created_at, updated_at")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false });
+
+    if (error) return { error: error.message };
+
+    let flows = data || [];
+
+    if (search) {
+      const q = search.toLowerCase();
+      flows = flows.filter((f) => f.name?.toLowerCase().includes(q));
+    }
+
+    if (flows.length === 0) {
+      return {
+        flows: [],
+        message: search
+          ? `No flows found matching "${search}".`
+          : "No chatbot flows found. Create one to get started.",
+      };
+    }
+
+    return {
+      flows: flows.map((f) => ({
+        flow_id: f.flow_id,
+        name: f.name,
+        description: f.description || "",
+        status: f.status || "inactive",
+        created_at: f.created_at,
+        updated_at: f.updated_at,
+      })),
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// ─────────────────────────────────────────────
+// create_flow
+// ─────────────────────────────────────────────
+
+async function createFlowTool(userId, input) {
+  try {
+    const { name, description = "" } = input;
+
+    if (!name?.trim()) return { error: "Flow name is required." };
+
+    // Get account_id for this user
+    const accountId = await getAccountId(userId);
+    if (!accountId) {
+      return { error: "No active WhatsApp account found." };
+    }
+
+    const { data: flow, error } = await supabase
+      .from("chatbot_flows")
+      .insert({
+        user_id: userId,
+        account_id: accountId,
+        name: name.trim(),
+        description: description?.trim() || null,
+        status: "inactive",
+      })
+      .select()
+      .single();
+
+    if (error) return { error: error.message };
+
+    return {
+      success: true,
+      flow_id: flow.flow_id,
+      name: flow.name,
+      status: flow.status,
+      message: `Flow "${flow.name}" created successfully.`,
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// ─────────────────────────────────────────────
+// update_flow_status
+// ─────────────────────────────────────────────
+
+async function updateFlowStatus(userId, input) {
+  try {
+    const { flow_id, status } = input;
+
+    if (!flow_id) return { error: "flow_id is required." };
+    if (!["active", "inactive"].includes(status)) {
+      return { error: "Status must be 'active' or 'inactive'." };
+    }
+
+    // Verify the flow belongs to this user
+    const { data: existing } = await supabase
+      .from("chatbot_flows")
+      .select("flow_id, name, status")
+      .eq("flow_id", flow_id)
+      .eq("user_id", userId)
+      .single();
+
+    if (!existing) return { error: "Flow not found or access denied." };
+
+    const { data: flow, error } = await supabase
+      .from("chatbot_flows")
+      .update({ status, updated_at: new Date().toISOString() })
+      .eq("flow_id", flow_id)
+      .select()
+      .single();
+
+    if (error) return { error: error.message };
+
+    return {
+      success: true,
+      flow_id: flow.flow_id,
+      name: flow.name,
+      status: flow.status,
+      message: `Flow "${flow.name}" is now ${flow.status}.`,
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// ─────────────────────────────────────────────
+// rename_flow
+// ─────────────────────────────────────────────
+
+async function renameFlow(userId, input) {
+  try {
+    const { flow_id, name } = input;
+
+    if (!flow_id) return { error: "flow_id is required." };
+    if (!name?.trim()) return { error: "New name is required." };
+
+    // Verify ownership
+    const { data: existing } = await supabase
+      .from("chatbot_flows")
+      .select("flow_id, name")
+      .eq("flow_id", flow_id)
+      .eq("user_id", userId)
+      .single();
+
+    if (!existing) return { error: "Flow not found or access denied." };
+
+    const { data: flow, error } = await supabase
+      .from("chatbot_flows")
+      .update({ name: name.trim(), updated_at: new Date().toISOString() })
+      .eq("flow_id", flow_id)
+      .select()
+      .single();
+
+    if (error) return { error: error.message };
+
+    return {
+      success: true,
+      flow_id: flow.flow_id,
+      name: flow.name,
+      message: `Flow renamed to "${flow.name}".`,
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// ─────────────────────────────────────────────
+// delete_flow
+// ─────────────────────────────────────────────
+
+async function deleteFlowTool(userId, input) {
+  try {
+    const { flow_id } = input;
+
+    if (!flow_id) return { error: "flow_id is required." };
+
+    // Verify ownership and get name before deleting
+    const { data: existing } = await supabase
+      .from("chatbot_flows")
+      .select("flow_id, name")
+      .eq("flow_id", flow_id)
+      .eq("user_id", userId)
+      .single();
+
+    if (!existing) return { error: "Flow not found or access denied." };
+
+    const flowName = existing.name;
+
+    // Delete — nodes and edges cascade automatically via FK
+    const { error } = await supabase
+      .from("chatbot_flows")
+      .delete()
+      .eq("flow_id", flow_id);
+
+    if (error) return { error: error.message };
+
+    return {
+      success: true,
+      message: `Flow "${flowName}" has been deleted.`,
     };
   } catch (err) {
     return { error: err.message };
