@@ -213,7 +213,6 @@ export async function getChatsForUser({
   offset = 0,
   filter = "all",
 }) {
-  // Base select
   let query = supabase
     .from("chats")
     .select(
@@ -225,15 +224,16 @@ export async function getChatsForUser({
     .order("created_at", { ascending: false })
     .range(offset, offset + limit - 1);
 
-  // Apply filter
   if (filter === "incoming") {
     query = query.eq("last_sender_type", "user");
   } else if (filter === "outgoing") {
-    query = query.in("last_sender_type", ["admin", "bot"]);
+    // ← FIXED: include NULLs (old/campaign chats that never had last_sender_type set)
+    query = query.or(
+      "last_sender_type.in.(admin,bot),last_sender_type.is.null",
+    );
   } else if (filter === "bot") {
     query = query.in("mode", ["BOT", "AI"]);
   }
-  // "all" → no additional filter
 
   const { data, error, count } = await query;
   if (error) throw error;
