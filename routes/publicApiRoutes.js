@@ -77,4 +77,30 @@ router.post(
   uploadMedia,
 );
 
+// PATCH /v1/me/webhook — update webhook URL on the authenticated key
+router.patch("/me/webhook", apiKeyAuth, async (req, res) => {
+  try {
+    const { webhook_url } = req.body;
+    if (!webhook_url) {
+      return res.status(400).json({ error: "webhook_url is required" });
+    }
+
+    const { error } = await supabase
+      .from("api_keys")
+      .update({ webhook_url })
+      .eq("key_id", req.apiKey.key_id);
+
+    if (error) throw error;
+
+    return res.status(200).json({
+      success: true,
+      message: "Webhook URL updated",
+      webhook_url,
+    });
+  } catch (err) {
+    console.error("update webhook error:", err);
+    return res.status(500).json({ error: "Failed to update webhook URL" });
+  }
+});
+
 export default router;
