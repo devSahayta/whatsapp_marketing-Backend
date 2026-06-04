@@ -24,6 +24,8 @@ import {
   uploadMedia,
 } from "../controllers/publicApiController.js";
 
+import { supabase } from "../config/supabase.js";
+
 const router = express.Router();
 
 // multer — store uploads in memory (passed as buffer to Meta API)
@@ -77,8 +79,8 @@ router.post(
   uploadMedia,
 );
 
-// PATCH /v1/me/webhook — update webhook URL on the authenticated key
-router.patch("/me/webhook", apiKeyAuth, async (req, res) => {
+// PATCH /v1/me/webhook
+router.patch("/me/webhook", async (req, res) => {
   try {
     const { webhook_url } = req.body;
     if (!webhook_url) {
