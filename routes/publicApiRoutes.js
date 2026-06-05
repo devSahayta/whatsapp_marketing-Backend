@@ -45,6 +45,60 @@ router.get("/account", scopeGuard("get_account"), getAccount);
 // GET /v1/templates
 router.get("/templates", scopeGuard("get_templates"), getTemplates);
 
+router.get(
+  "/templates/:wt_id",
+  scopeGuard("get_templates"),
+  async (req, res) => {
+    try {
+      const { wt_id } = req.params;
+      const { wa_id } = req.account;
+
+      const { data, error } = await supabase
+        .from("whatsapp_templates")
+        .select(
+          "wt_id, name, language, category, header_format, variables, buttons, components, preview, status, created_at",
+        )
+        .eq("wt_id", wt_id)
+        .eq("account_id", wa_id)
+        .maybeSingle();
+
+      if (error) throw error;
+      if (!data)
+        return res
+          .status(404)
+          .json({ success: false, error: "Template not found" });
+
+      // Parse components + preview if stored as strings
+      const parsed = {
+        ...data,
+        components:
+          typeof data.components === "string"
+            ? JSON.parse(data.components)
+            : data.components,
+        preview:
+          typeof data.preview === "string"
+            ? JSON.parse(data.preview)
+            : data.preview,
+        variables:
+          typeof data.variables === "string"
+            ? JSON.parse(data.variables)
+            : data.variables,
+        buttons:
+          typeof data.buttons === "string"
+            ? JSON.parse(data.buttons)
+            : data.buttons,
+      };
+
+      return res.status(200).json({ success: true, data: parsed });
+    } catch (err) {
+      console.error("getTemplate error:", err);
+      return res
+        .status(500)
+        .json({ success: false, error: "Failed to fetch template" });
+    }
+  },
+);
+
 // ── Messages ──────────────────────────────────────────────────────────────────
 // POST /v1/messages/template
 router.post(
@@ -104,35 +158,5 @@ router.patch("/me/webhook", async (req, res) => {
     return res.status(500).json({ error: "Failed to update webhook URL" });
   }
 });
-
-// GET /v1/templates/:wt_id — fetch full template including components for preview
-router.get(
-  "/templates/:wt_id",
-  scopeGuard("get_templates"),
-  async (req, res) => {
-    try {
-      const { wt_id } = req.params;
-      const { wa_id } = req.account;
-
-      const { data, error } = await supabase
-        .from("whatsapp_templates")
-        .select(
-          "wt_id, name, language, category, header_format, header_handle, variables, buttons, components, status, media_id, created_at",
-        )
-        .eq("wt_id", wt_id)
-        .eq("account_id", wa_id)
-        .maybeSingle();
-
-      if (error) throw error;
-      if (!data) return res.status(404).json({ error: "Template not found" });
-
-      logUsage(req, 200);
-      return res.status(200).json({ success: true, data });
-    } catch (err) {
-      console.error("getTemplate error:", err);
-      return res.status(500).json({ error: "Failed to fetch template" });
-    }
-  },
-);
 
 export default router;
