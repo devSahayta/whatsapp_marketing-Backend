@@ -105,4 +105,34 @@ router.patch("/me/webhook", async (req, res) => {
   }
 });
 
+// GET /v1/templates/:wt_id — fetch full template including components for preview
+router.get(
+  "/templates/:wt_id",
+  scopeGuard("get_templates"),
+  async (req, res) => {
+    try {
+      const { wt_id } = req.params;
+      const { wa_id } = req.account;
+
+      const { data, error } = await supabase
+        .from("whatsapp_templates")
+        .select(
+          "wt_id, name, language, category, header_format, header_handle, variables, buttons, components, status, media_id, created_at",
+        )
+        .eq("wt_id", wt_id)
+        .eq("account_id", wa_id)
+        .maybeSingle();
+
+      if (error) throw error;
+      if (!data) return res.status(404).json({ error: "Template not found" });
+
+      logUsage(req, 200);
+      return res.status(200).json({ success: true, data });
+    } catch (err) {
+      console.error("getTemplate error:", err);
+      return res.status(500).json({ error: "Failed to fetch template" });
+    }
+  },
+);
+
 export default router;
