@@ -25,6 +25,7 @@ import {
 } from "../controllers/publicApiController.js";
 
 import { supabase } from "../config/supabase.js";
+import axios from "axios";
 
 const router = express.Router();
 
@@ -46,55 +47,64 @@ router.get("/account", scopeGuard("get_account"), getAccount);
 router.get("/templates", scopeGuard("get_templates"), getTemplates);
 
 router.get(
-  "/templates/:wt_id",
+  "/templates/:wt_id/media",
   scopeGuard("get_templates"),
   async (req, res) => {
     try {
       const { wt_id } = req.params;
-      const { wa_id } = req.account;
+      const { wa_id, system_user_access_token } = req.account;
 
-      const { data, error } = await supabase
+      const { data: template, error } = await supabase
         .from("whatsapp_templates")
-        .select(
-          "wt_id, name, language, category, header_format, variables, buttons, components, preview, status, created_at",
-        )
+        .select("media_id, header_format, preview")
         .eq("wt_id", wt_id)
         .eq("account_id", wa_id)
         .maybeSingle();
 
       if (error) throw error;
-      if (!data)
-        return res
-          .status(404)
-          .json({ success: false, error: "Template not found" });
+      if (!template)
+        return res.status(404).json({ error: "Template not found" });
 
-      // Parse components + preview if stored as strings
-      const parsed = {
-        ...data,
-        components:
-          typeof data.components === "string"
-            ? JSON.parse(data.components)
-            : data.components,
-        preview:
-          typeof data.preview === "string"
-            ? JSON.parse(data.preview)
-            : data.preview,
-        variables:
-          typeof data.variables === "string"
-            ? JSON.parse(data.variables)
-            : data.variables,
-        buttons:
-          typeof data.buttons === "string"
-            ? JSON.parse(data.buttons)
-            : data.buttons,
-      };
+      // Try media_id first — gives fresh non-expired URL from Meta
+      if (template.media_id) {
+        try {
+          const metaRes = await axios.get(
+            `https://graph.facebook.com/v21.0/${template.media_id}`,
+            {
+              headers: { Authorization: `Bearer ${system_user_access_token}` },
+            },
+          );
+          const freshUrl = metaRes.data?.url;
+          if (freshUrl)
+            return res.json({ success: true, url: freshUrl, source: "meta" });
+        } catch (metaErr) {
+          console.warn(
+            "Meta media fetch failed:",
+            metaErr.response?.data?.error?.message,
+          );
+        }
+      }
 
-      return res.status(200).json({ success: true, data: parsed });
-    } catch (err) {
-      console.error("getTemplate error:", err);
+      // Fallback to preview field URL
+      const preview =
+        typeof template.preview === "string"
+          ? JSON.parse(template.preview)
+          : template.preview;
+      const headerComp = preview?.components?.find((c) => c.type === "HEADER");
+      const previewUrl = headerComp?.example?.header_handle?.[0];
+
+      if (previewUrl)
+        return res.json({ success: true, url: previewUrl, source: "preview" });
+
       return res
-        .status(500)
-        .json({ success: false, error: "Failed to fetch template" });
+        .status(404)
+        .json({ error: "No media found for this template" });
+    } catch (err) {
+      console.error(
+        "getTemplateMedia error:",
+        err.response?.data || err.message,
+      );
+      return res.status(500).json({ error: "Failed to get media URL" });
     }
   },
 );
