@@ -97,7 +97,7 @@ router.get(
 );
 
 router.get(
-  "/templates/:wt_id/media",
+  "/templates/:wt_id/media-stream",
   scopeGuard("get_templates"),
   async (req, res) => {
     try {
@@ -115,7 +115,9 @@ router.get(
       if (!template)
         return res.status(404).json({ error: "Template not found" });
 
-      // Try media_id first — gives fresh non-expired URL from Meta
+      let mediaUrl = null;
+
+      // Step 1: Get fresh URL from Meta using media_id
       if (template.media_id) {
         try {
           const metaRes = await axios.get(
@@ -124,37 +126,69 @@ router.get(
               headers: { Authorization: `Bearer ${system_user_access_token}` },
             },
           );
-          const freshUrl = metaRes.data?.url;
-          if (freshUrl)
-            return res.json({ success: true, url: freshUrl, source: "meta" });
+          mediaUrl = metaRes.data?.url;
         } catch (metaErr) {
           console.warn(
-            "Meta media fetch failed:",
+            "Meta media_id fetch failed:",
             metaErr.response?.data?.error?.message,
           );
         }
       }
 
-      // Fallback to preview field URL
-      const preview =
-        typeof template.preview === "string"
-          ? JSON.parse(template.preview)
-          : template.preview;
-      const headerComp = preview?.components?.find((c) => c.type === "HEADER");
-      const previewUrl = headerComp?.example?.header_handle?.[0];
+      // Fallback: use URL from preview field
+      if (!mediaUrl) {
+        const preview =
+          typeof template.preview === "string"
+            ? JSON.parse(template.preview)
+            : template.preview;
+        const headerComp = preview?.components?.find(
+          (c) => c.type === "HEADER",
+        );
+        mediaUrl = headerComp?.example?.header_handle?.[0] || null;
+      }
 
-      if (previewUrl)
-        return res.json({ success: true, url: previewUrl, source: "preview" });
+      if (!mediaUrl) {
+        return res
+          .status(404)
+          .json({ error: "No media found for this template" });
+      }
 
-      return res
-        .status(404)
-        .json({ error: "No media found for this template" });
+      // Step 2: Fetch the actual image bytes WITH the access token
+      // Meta requires Authorization header even for the download URL
+      const imageRes = await axios.get(mediaUrl, {
+        responseType: "stream",
+        timeout: 15000,
+        headers: {
+          Authorization: `Bearer ${system_user_access_token}`,
+          "User-Agent": "WhatsApp/2.23.20.0 A",
+        },
+      });
+
+      // Step 3: Stream bytes to Sutrak (which forwards to frontend)
+      const contentType = imageRes.headers["content-type"] || "image/jpeg";
+      res.setHeader("Content-Type", contentType);
+      res.setHeader("Cache-Control", "public, max-age=3600");
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      imageRes.data.pipe(res);
     } catch (err) {
+      const status = err.response?.status;
       console.error(
-        "getTemplateMedia error:",
+        "media-stream error:",
+        status,
         err.response?.data || err.message,
       );
-      return res.status(500).json({ error: "Failed to get media URL" });
+      // Return SVG placeholder so <img> doesn't break
+      return res
+        .status(200)
+        .setHeader("Content-Type", "image/svg+xml")
+        .setHeader("Access-Control-Allow-Origin", "*")
+        .send(
+          '<svg xmlns="http://www.w3.org/2000/svg" width="300" height="160" viewBox="0 0 300 160">' +
+            '<rect width="300" height="160" fill="#1a1a22" rx="8"/>' +
+            '<text x="50%" y="45%" text-anchor="middle" fill="#3f3f46" font-size="22" dy=".3em">📷</text>' +
+            '<text x="50%" y="65%" text-anchor="middle" fill="#3f3f46" font-size="11" font-family="system-ui">Preview unavailable</text>' +
+            "</svg>",
+        );
     }
   },
 );
