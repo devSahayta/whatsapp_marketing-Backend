@@ -47,6 +47,56 @@ router.get("/account", scopeGuard("get_account"), getAccount);
 router.get("/templates", scopeGuard("get_templates"), getTemplates);
 
 router.get(
+  "/templates/:wt_id",
+  scopeGuard("get_templates"),
+  async (req, res) => {
+    try {
+      const { wt_id } = req.params;
+      const { wa_id } = req.account;
+
+      const { data, error } = await supabase
+        .from("whatsapp_templates")
+        .select(
+          "wt_id, name, language, category, header_format, variables, buttons, components, preview, status, media_id, created_at",
+        )
+        .eq("wt_id", wt_id)
+        .eq("account_id", wa_id)
+        .maybeSingle();
+
+      if (error) throw error;
+      if (!data)
+        return res
+          .status(404)
+          .json({ success: false, error: "Template not found" });
+
+      const safeParse = (v) => {
+        try {
+          return typeof v === "string" ? JSON.parse(v) : v;
+        } catch {
+          return v;
+        }
+      };
+
+      return res.status(200).json({
+        success: true,
+        data: {
+          ...data,
+          components: safeParse(data.components),
+          preview: safeParse(data.preview),
+          variables: safeParse(data.variables),
+          buttons: safeParse(data.buttons),
+        },
+      });
+    } catch (err) {
+      console.error("getTemplate error:", err);
+      return res
+        .status(500)
+        .json({ success: false, error: "Failed to fetch template" });
+    }
+  },
+);
+
+router.get(
   "/templates/:wt_id/media",
   scopeGuard("get_templates"),
   async (req, res) => {
