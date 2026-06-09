@@ -184,7 +184,9 @@ export const sendTemplateMessage = async (req, res) => {
     const apiError = err.response?.data || err.message;
     console.error("sendTemplateMessage error:", apiError);
     logUsage(req, 500, JSON.stringify(apiError));
-    return res.status(500).json({ error: "Failed to send template message", details: apiError });
+    return res
+      .status(500)
+      .json({ error: "Failed to send template message", details: apiError });
   }
 };
 
@@ -263,7 +265,8 @@ async function check24hWindow(phone, user_id) {
 
   // 3. 24-hour window from last user message
   const diffHours =
-    (Date.now() - new Date(lastUserMsg.created_at).getTime()) / (1000 * 60 * 60);
+    (Date.now() - new Date(lastUserMsg.created_at).getTime()) /
+    (1000 * 60 * 60);
 
   if (diffHours > 24) {
     return { allowed: false, reason: "WINDOW_EXPIRED" };
@@ -283,28 +286,34 @@ export const sendTextMessage = async (req, res) => {
     }
 
     // ── 24-hour window check ─────────────────────────────────────────────────
-    const windowCheck = await check24hWindow(phone, req.apiKey.user_id);
+    // x-skip-window-check: "true" bypasses this for trusted internal callers
+    // (e.g. Sutrak smart fields bot replying to a guest mid-session)
+    const skipWindowCheck = req.headers["x-skip-window-check"] === "true";
 
-    if (!windowCheck.allowed) {
-      const reasons = {
-        NO_USER_REPLY:
-          "The contact has never replied to you. Only template messages are allowed to initiate a conversation.",
-        WINDOW_EXPIRED:
-          "The 24-hour messaging window has expired. Send a template message to re-open the conversation.",
-        TEMPLATE_ONLY_WAITING_FOR_USER:
-          "A template was sent but the contact hasn't replied yet. Wait for their reply before sending free-form text.",
-      };
+    if (!skipWindowCheck) {
+      const windowCheck = await check24hWindow(phone, req.apiKey.user_id);
 
-      const errorMessage =
-        reasons[windowCheck.reason] ??
-        "Cannot send text message outside the 24-hour window. Use /v1/messages/template instead.";
+      if (!windowCheck.allowed) {
+        const reasons = {
+          NO_USER_REPLY:
+            "The contact has never replied to you. Only template messages are allowed to initiate a conversation.",
+          WINDOW_EXPIRED:
+            "The 24-hour messaging window has expired. Send a template message to re-open the conversation.",
+          TEMPLATE_ONLY_WAITING_FOR_USER:
+            "A template was sent but the contact hasn't replied yet. Wait for their reply before sending free-form text.",
+        };
 
-      logUsage(req, 403, windowCheck.reason);
-      return res.status(403).json({
-        error: errorMessage,
-        code: windowCheck.reason,
-        hint: "Use POST /v1/messages/template to reach this contact.",
-      });
+        const errorMessage =
+          reasons[windowCheck.reason] ??
+          "Cannot send text message outside the 24-hour window. Use /v1/messages/template instead.";
+
+        logUsage(req, 403, windowCheck.reason);
+        return res.status(403).json({
+          error: errorMessage,
+          code: windowCheck.reason,
+          hint: "Use POST /v1/messages/template to reach this contact.",
+        });
+      }
     }
     // ────────────────────────────────────────────────────────────────────────
 
@@ -362,7 +371,9 @@ export const uploadMedia = async (req, res) => {
 
     if (!req.file) {
       logUsage(req, 400, "No file provided");
-      return res.status(400).json({ error: "No file uploaded. Use multipart/form-data with field 'file'." });
+      return res.status(400).json({
+        error: "No file uploaded. Use multipart/form-data with field 'file'.",
+      });
     }
 
     const form = new FormData();
@@ -554,9 +565,15 @@ export const scheduleTemplateMessage = async (req, res) => {
         error: result.error,
         code: result.code,
         ...(result.hint && { hint: result.hint }),
-        ...(result.required_count !== undefined && { required_variable_count: result.required_count }),
-        ...(result.missing_indices && { missing_variables: result.missing_indices.map((i) => `{{${i}}}`) }),
-        ...(result.required_media_type && { required_media_type: result.required_media_type }),
+        ...(result.required_count !== undefined && {
+          required_variable_count: result.required_count,
+        }),
+        ...(result.missing_indices && {
+          missing_variables: result.missing_indices.map((i) => `{{${i}}}`),
+        }),
+        ...(result.required_media_type && {
+          required_media_type: result.required_media_type,
+        }),
       });
     }
 
