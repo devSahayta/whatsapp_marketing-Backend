@@ -2,10 +2,15 @@
 // Public API endpoints — authenticated via API key (apiKeyAuth middleware).
 // Consumed by external apps (Doctor CRM, etc.) to use Samvaadik as a WhatsApp service.
 
+import { v4 as uuidv4 } from "uuid";
 import axios from "axios";
 import FormData from "form-data";
 import { supabase } from "../config/supabase.js";
 import { createScheduledMessage } from "../services/scheduledMessageService.js";
+import * as wsService from "../services/whatsappTemplateService.js";
+
+const { FormData: NativeFormData, Blob } = global;
+const PUBLIC_API_BUCKET = "template-media";
 
 const GRAPH_API_VERSION = "v21.0";
 const GRAPH_BASE = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
@@ -589,5 +594,582 @@ export const scheduleTemplateMessage = async (req, res) => {
     return res
       .status(500)
       .json({ error: "Failed to schedule message", details: err.message });
+  }
+};
+
+/* ─── POST /v1/media/upload-from-url ────────────────────────────────────── */
+/*
+  Primary approach for media uploads — avoids Vercel 4.5 MB request limit.
+  The file binary is fetched server-side from the developer's URL, so nothing
+  large ever hits the Vercel request body.
+
+  Body (JSON):
+  {
+    "url":       "https://your-cdn.com/banner.jpg",   // publicly accessible URL
+    "file_name": "banner.jpg",
+    "file_type": "image/jpeg"                         // MIME type
+  }
+
+  Returns: { media_id, header_handle, header_format }
+  - media_id      → use in sendTemplateMessage / createTemplate
+  - header_handle → use in createTemplate (media header)
+  - header_format → IMAGE | VIDEO | DOCUMENT
+*/
+export const uploadMediaFromUrl = async (req, res) => {
+  try {
+    const { phone_number_id, system_user_access_token, wa_id, app_id } =
+      req.account;
+    const { url: fileUrl, file_name, file_type } = req.body;
+
+    if (!fileUrl || !file_name || !file_type) {
+      logUsage(req, 400, "Missing url, file_name, or file_type");
+      return res
+        .status(400)
+        .json({ error: "url, file_name, and file_type are required" });
+    }
+
+    if (!app_id) {
+      return res.status(400).json({
+        error:
+          "WhatsApp account is not fully configured (missing app_id). Contact Samvaadik support.",
+      });
+    }
+
+    const mimeType = file_type;
+    let header_format = "IMAGE";
+    if (mimeType.startsWith("video/")) header_format = "VIDEO";
+    else if (!mimeType.startsWith("image/")) header_format = "DOCUMENT";
+
+    // Step 1: Fetch file from external URL — no Vercel body limit on outgoing requests
+    let buffer;
+    try {
+      const fileRes = await axios.get(fileUrl, {
+        responseType: "arraybuffer",
+        timeout: 30000,
+        maxContentLength: 50 * 1024 * 1024,
+      });
+      buffer = Buffer.from(fileRes.data);
+    } catch (fetchErr) {
+      logUsage(req, 400, "Failed to fetch file from URL");
+      return res.status(400).json({
+        error: "Could not fetch file from the provided URL.",
+        details: fetchErr.message,
+      });
+    }
+
+    // Step 2: Create Meta upload session → needed for header_handle
+    const sessionData = await wsService.createUploadSession(
+      app_id,
+      system_user_access_token,
+      { file_name, file_type: mimeType },
+    );
+    const session_id = sessionData.id;
+    if (!session_id) throw new Error("Failed to create Meta upload session");
+
+    // Step 3: Upload buffer to session → header_handle (used when creating template)
+    const binaryResp = await wsService.uploadBinaryToSession(
+      session_id,
+      buffer,
+      mimeType,
+      system_user_access_token,
+    );
+    const header_handle = binaryResp.h;
+    if (!header_handle)
+      throw new Error("Meta did not return a header handle");
+
+    // Step 4: Upload to media API → media_id (used when sending template messages)
+    const blob = new Blob([buffer], { type: mimeType });
+    const form = new NativeFormData();
+    form.set("messaging_product", "whatsapp");
+    form.set("type", mimeType);
+    form.set("file", blob, file_name);
+    const metaMediaResp = await wsService.uploadMediaForMessage(
+      phone_number_id,
+      system_user_access_token,
+      form,
+    );
+    const media_id = metaMediaResp.id;
+
+    // Step 5: Persist to DB
+    await supabase.from("whatsapp_media_uploads").insert({
+      account_id: wa_id,
+      media_id,
+      file_name,
+      type: mimeType,
+      mime_type: mimeType,
+      size_bytes: buffer.byteLength,
+    });
+
+    logUsage(req, 200);
+    return res.status(200).json({
+      success: true,
+      media_id,
+      header_handle,
+      header_format,
+      message:
+        "Media uploaded successfully. Use media_id and header_handle when calling POST /v1/templates.",
+    });
+  } catch (err) {
+    const apiError = err.response?.data || err.message;
+    console.error("uploadMediaFromUrl error:", apiError);
+    logUsage(req, 500, JSON.stringify(apiError));
+    return res
+      .status(500)
+      .json({ error: "Failed to upload media from URL", details: apiError });
+  }
+};
+
+/* ─── POST /v1/media/prepare-upload ─────────────────────────────────────── */
+/*
+  Step 1 of the Supabase-signed-URL flow (alternative when you don't have a
+  hosted URL for your file).
+
+  Body (JSON): { "file_name": "banner.jpg", "file_type": "image/jpeg" }
+
+  Returns: { signed_url, storage_path, expires_in_seconds: 300 }
+
+  After this call:
+    PUT <signed_url>   ← upload your file binary here (direct to Supabase, NOT via Samvaadik)
+    Content-Type: <file_type>
+
+  Then call POST /v1/media/process-upload with storage_path.
+*/
+export const getMediaUploadUrl = async (req, res) => {
+  try {
+    const { file_name, file_type } = req.body;
+
+    if (!file_name || !file_type) {
+      logUsage(req, 400, "Missing file_name or file_type");
+      return res
+        .status(400)
+        .json({ error: "file_name and file_type are required" });
+    }
+
+    const ext = file_name.split(".").pop().toLowerCase();
+    const storagePath = `public-api/${req.apiKey.key_id}/${Date.now()}.${ext}`;
+
+    const { data, error } = await supabase.storage
+      .from(PUBLIC_API_BUCKET)
+      .createSignedUploadUrl(storagePath);
+
+    if (error) throw error;
+
+    logUsage(req, 200);
+    return res.status(200).json({
+      success: true,
+      signed_url: data.signedUrl,
+      storage_path: storagePath,
+      expires_in_seconds: 300,
+      next_step:
+        "PUT your file binary to signed_url, then call POST /v1/media/process-upload with storage_path.",
+    });
+  } catch (err) {
+    console.error("getMediaUploadUrl error:", err);
+    logUsage(req, 500, err.message);
+    return res
+      .status(500)
+      .json({ error: "Failed to generate upload URL", details: err.message });
+  }
+};
+
+/* ─── POST /v1/media/process-upload ─────────────────────────────────────── */
+/*
+  Step 2 of the Supabase-signed-URL flow.
+  Call this after you have PUT your file to the signed_url from prepare-upload.
+
+  Body (JSON):
+  {
+    "storage_path": "<value from prepare-upload response>",
+    "file_name":    "banner.jpg",
+    "file_type":    "image/jpeg"
+  }
+
+  Returns: { media_id, header_handle, header_format }
+*/
+export const processUploadedMedia = async (req, res) => {
+  try {
+    const { phone_number_id, system_user_access_token, wa_id, app_id } =
+      req.account;
+    const { storage_path, file_name, file_type } = req.body;
+
+    if (!storage_path || !file_name || !file_type) {
+      logUsage(req, 400, "Missing storage_path, file_name, or file_type");
+      return res
+        .status(400)
+        .json({ error: "storage_path, file_name, and file_type are required" });
+    }
+
+    if (!app_id) {
+      return res.status(400).json({
+        error:
+          "WhatsApp account is not fully configured (missing app_id). Contact Samvaadik support.",
+      });
+    }
+
+    // Reject paths that don't belong to this API key — prevents accessing other keys' uploads
+    const expectedPrefix = `public-api/${req.apiKey.key_id}/`;
+    if (!storage_path.startsWith(expectedPrefix)) {
+      logUsage(req, 403, "storage_path does not belong to this API key");
+      return res.status(403).json({ error: "Invalid storage_path." });
+    }
+
+    const ext = storage_path.split(".").pop().toLowerCase();
+    const mimeMap = {
+      jpg: "image/jpeg",
+      jpeg: "image/jpeg",
+      png: "image/png",
+      webp: "image/webp",
+      mp4: "video/mp4",
+      "3gp": "video/3gpp",
+      mov: "video/quicktime",
+      pdf: "application/pdf",
+      doc: "application/msword",
+      docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    };
+    const mimeType = mimeMap[ext] || file_type || "application/octet-stream";
+
+    let header_format = "IMAGE";
+    if (mimeType.startsWith("video/")) header_format = "VIDEO";
+    else if (!mimeType.startsWith("image/")) header_format = "DOCUMENT";
+
+    // Download from Supabase (outgoing request — no Vercel size limit)
+    const { data: fileBlob, error: downloadErr } = await supabase.storage
+      .from(PUBLIC_API_BUCKET)
+      .download(storage_path);
+
+    if (downloadErr || !fileBlob) {
+      throw new Error(
+        "Failed to download file from storage: " + downloadErr?.message,
+      );
+    }
+
+    const arrayBuffer = await fileBlob.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    // Create Meta upload session
+    const sessionData = await wsService.createUploadSession(
+      app_id,
+      system_user_access_token,
+      { file_name, file_type: mimeType },
+    );
+    const session_id = sessionData.id;
+    if (!session_id) throw new Error("Failed to create Meta upload session");
+
+    // Upload binary → header_handle
+    const binaryResp = await wsService.uploadBinaryToSession(
+      session_id,
+      buffer,
+      mimeType,
+      system_user_access_token,
+    );
+    const header_handle = binaryResp.h;
+    if (!header_handle)
+      throw new Error("Meta did not return a header handle");
+
+    // Upload to media API → media_id
+    const blob = new Blob([buffer], { type: mimeType });
+    const form = new NativeFormData();
+    form.set("messaging_product", "whatsapp");
+    form.set("type", mimeType);
+    form.set("file", blob, file_name);
+    const metaMediaResp = await wsService.uploadMediaForMessage(
+      phone_number_id,
+      system_user_access_token,
+      form,
+    );
+    const media_id = metaMediaResp.id;
+
+    // Persist to DB
+    await supabase.from("whatsapp_media_uploads").insert({
+      account_id: wa_id,
+      media_id,
+      file_name,
+      type: mimeType,
+      mime_type: mimeType,
+      size_bytes: buffer.byteLength,
+    });
+
+    // Cleanup Supabase storage — file has been forwarded to Meta
+    await supabase.storage.from(PUBLIC_API_BUCKET).remove([storage_path]);
+
+    logUsage(req, 200);
+    return res.status(200).json({
+      success: true,
+      media_id,
+      header_handle,
+      header_format,
+      message:
+        "Media processed successfully. Use media_id and header_handle when calling POST /v1/templates.",
+    });
+  } catch (err) {
+    const apiError = err.response?.data || err.message;
+    console.error("processUploadedMedia error:", apiError);
+    logUsage(req, 500, JSON.stringify(apiError));
+
+    // Clean up Supabase storage even on failure — bucket is only 50 MB
+    if (req.body?.storage_path) {
+      supabase.storage
+        .from(PUBLIC_API_BUCKET)
+        .remove([req.body.storage_path])
+        .catch(() => {});
+    }
+
+    return res.status(500).json({
+      error: "Failed to process uploaded media",
+      details: apiError,
+    });
+  }
+};
+
+/* ─── POST /v1/templates ─────────────────────────────────────────────────── */
+/*
+  Create a WhatsApp message template and submit it to Meta for approval.
+
+  For TEXT-only templates:
+  {
+    "name":          "order_confirmation",
+    "category":      "UTILITY",           // MARKETING | UTILITY | AUTHENTICATION
+    "language":      "en_US",
+    "body_text":     "Hi {{1}}, your order {{2}} is confirmed.",
+    "body_examples": ["John", "ORD-1234"],  // required when body has variables
+    "header_format": "TEXT",              // optional
+    "header_text":   "Order Update",      // required when header_format is TEXT
+    "footer_text":   "Reply STOP to opt out.",  // optional
+    "buttons": [                          // optional, max 3
+      { "type": "QUICK_REPLY", "text": "Track Order" },
+      { "type": "URL", "text": "View Details", "url": "https://example.com/order/{{1}}", "url_example": "https://example.com/order/ORD-1234" }
+    ]
+  }
+
+  For MEDIA templates (IMAGE / VIDEO / DOCUMENT):
+  — First call POST /v1/media/upload-from-url (or the prepare/process flow)
+    to get header_handle and media_id, then include them here:
+  {
+    "name":           "promo_banner",
+    "category":       "MARKETING",
+    "language":       "en_US",
+    "body_text":      "Check out our new offer!",
+    "header_format":  "IMAGE",
+    "header_handle":  "<h: handle from media upload>",
+    "media_id":       "<media_id from media upload>"
+  }
+*/
+export const createTemplate = async (req, res) => {
+  try {
+    const { wa_id, waba_id, system_user_access_token } = req.account;
+    const {
+      name,
+      category,
+      language = "en_US",
+      body_text,
+      body_examples = [],
+      header_format,
+      header_text,
+      header_handle,
+      media_id,
+      footer_text,
+      buttons = [],
+    } = req.body;
+
+    if (!name || !category || !body_text) {
+      logUsage(req, 400, "Missing name, category, or body_text");
+      return res
+        .status(400)
+        .json({ error: "name, category, and body_text are required" });
+    }
+
+    if (!["MARKETING", "UTILITY", "AUTHENTICATION"].includes(category)) {
+      return res.status(400).json({
+        error: "category must be one of: MARKETING, UTILITY, AUTHENTICATION",
+      });
+    }
+
+    // Normalize name — Meta requires lowercase, underscores only
+    const normalizedName = name
+      .toLowerCase()
+      .replace(/\s+/g, "_")
+      .replace(/[^a-z0-9_]/g, "");
+
+    if (!normalizedName) {
+      return res.status(400).json({
+        error:
+          "Template name is invalid. Use letters, numbers, and underscores only.",
+      });
+    }
+
+    // Duplicate check
+    const { data: existing } = await supabase
+      .from("whatsapp_templates")
+      .select("wt_id")
+      .eq("account_id", wa_id)
+      .eq("name", normalizedName)
+      .limit(1)
+      .maybeSingle();
+
+    if (existing) {
+      logUsage(req, 409, "Duplicate template name");
+      return res.status(409).json({
+        error: `A template named "${normalizedName}" already exists.`,
+      });
+    }
+
+    // Build Meta components array
+    const components = [];
+
+    if (
+      header_format &&
+      ["IMAGE", "VIDEO", "DOCUMENT"].includes(header_format) &&
+      header_handle
+    ) {
+      components.push({
+        type: "HEADER",
+        format: header_format,
+        example: { header_handle: [header_handle] },
+      });
+    } else if (header_text?.trim()) {
+      components.push({
+        type: "HEADER",
+        format: "TEXT",
+        text: header_text.trim(),
+      });
+    }
+
+    const variableMatches = body_text.match(/\{\{\d+\}\}/g) || [];
+    const bodyComponent = { type: "BODY", text: body_text };
+    if (variableMatches.length > 0 && body_examples.length > 0) {
+      bodyComponent.example = { body_text: [body_examples] };
+    }
+    components.push(bodyComponent);
+
+    if (footer_text?.trim()) {
+      components.push({ type: "FOOTER", text: footer_text.trim() });
+    }
+
+    if (buttons.length > 0) {
+      const builtButtons = buttons.map((btn) => {
+        if (btn.type === "QUICK_REPLY")
+          return { type: "QUICK_REPLY", text: btn.text };
+        if (btn.type === "PHONE_NUMBER")
+          return {
+            type: "PHONE_NUMBER",
+            text: btn.text,
+            phone_number: btn.phone_number,
+          };
+        if (btn.type === "URL") {
+          const urlBtn = { type: "URL", text: btn.text, url: btn.url };
+          if (btn.url?.includes("{{1}}") && btn.url_example)
+            urlBtn.example = [btn.url_example];
+          return urlBtn;
+        }
+        return btn;
+      });
+      components.push({ type: "BUTTONS", buttons: builtButtons });
+    }
+
+    // Submit to Meta (with retry)
+    let metaResp;
+    let attempts = 0;
+    while (attempts < 3) {
+      try {
+        attempts++;
+        metaResp = await wsService.createTemplateOnMeta(
+          waba_id,
+          system_user_access_token,
+          {
+            name: normalizedName,
+            language,
+            category,
+            parameter_format: "positional",
+            components,
+          },
+        );
+        break;
+      } catch (retryErr) {
+        if (attempts >= 3) {
+          const apiError =
+            retryErr.response?.data || { error: retryErr.message };
+          logUsage(
+            req,
+            retryErr.response?.status || 400,
+            JSON.stringify(apiError),
+          );
+          return res
+            .status(retryErr.response?.status || 400)
+            .json(apiError);
+        }
+        await new Promise((r) => setTimeout(r, 2000 * attempts));
+      }
+    }
+
+    // Fetch preview from Meta (best-effort)
+    let preview = {};
+    try {
+      const allTemplates = await wsService.listTemplatesFromMeta(
+        waba_id,
+        system_user_access_token,
+      );
+      preview =
+        (metaResp?.id
+          ? allTemplates.find((t) => t.id === metaResp.id)
+          : null) ||
+        allTemplates.find((t) => t.name === normalizedName) ||
+        {};
+    } catch {
+      // preview stays {} — not worth failing the request over
+    }
+
+    // Persist to DB
+    const wt_id = uuidv4();
+    const insert = {
+      wt_id,
+      account_id: wa_id,
+      template_id: metaResp.id || null,
+      name: normalizedName,
+      language,
+      category,
+      parameter_format: "positional",
+      components,
+      header_format: ["IMAGE", "VIDEO", "DOCUMENT"].includes(header_format)
+        ? header_format
+        : header_text?.trim()
+          ? "TEXT"
+          : null,
+      header_handle: header_handle || null,
+      variables: body_examples,
+      buttons: buttons.length > 0 ? buttons : [],
+      preview,
+      status: preview?.status || metaResp.status || "PENDING",
+      media_id: media_id || null,
+    };
+
+    const { error: insertErr } = await supabase
+      .from("whatsapp_templates")
+      .insert(insert);
+    if (insertErr) throw insertErr;
+
+    logUsage(req, 201);
+    return res.status(201).json({
+      success: true,
+      data: {
+        wt_id,
+        name: normalizedName,
+        category,
+        language,
+        status: insert.status,
+        header_format: insert.header_format,
+        media_id: insert.media_id,
+      },
+      message:
+        insert.status === "APPROVED"
+          ? "Template created and approved by Meta."
+          : "Template submitted to Meta for approval. It usually takes a few minutes to a few hours.",
+    });
+  } catch (err) {
+    const apiError = err.response?.data || err.message;
+    console.error("createTemplate error:", apiError);
+    logUsage(req, 500, JSON.stringify(apiError));
+    return res
+      .status(500)
+      .json({ error: "Failed to create template", details: apiError });
   }
 };
