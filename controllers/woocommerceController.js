@@ -683,16 +683,31 @@ export async function handleWebhook(req, res) {
       return;
     }
 
-    // 1. Look up the connection to get user_id
-    const { data: connection, error: connError } = await supabase
-      .from("user_woocommerce_connections")
-      .select("*")
-      .eq("id", connection_id)
-      .eq("is_active", true)
-      .single();
+    // With this — retries 3 times with 1s gap:
+    let connection = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const { data, error } = await supabase
+        .from("user_woocommerce_connections")
+        .select("*")
+        .eq("id", connection_id)
+        .eq("is_active", true)
+        .single();
 
-    if (connError || !connection) {
-      console.warn(`   ⚠️  Connection not found or inactive: ${connection_id}`);
+      if (data) {
+        connection = data;
+        break;
+      }
+
+      console.warn(
+        `   ⚠️  Connection lookup attempt ${attempt} failed, retrying...`,
+      );
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+
+    if (!connection) {
+      console.warn(
+        `   ⚠️  Connection not found after 3 attempts: ${connection_id}`,
+      );
       return;
     }
 
