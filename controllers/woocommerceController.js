@@ -42,7 +42,7 @@ function normalizePhone(phone, defaultCountryCode = "91") {
   // Starts with 00 (international prefix)
   if (cleaned.startsWith("00")) {
     cleaned = cleaned.slice(2);
-    return "+" + cleaned;
+    return cleaned.replace(/\D/g, ""); // ✅ no +
   }
 
   // Starts with 0 (local trunk prefix, e.g. India 09876543210)
@@ -51,7 +51,7 @@ function normalizePhone(phone, defaultCountryCode = "91") {
   }
 
   // Add default country code
-  return "+" + defaultCountryCode + cleaned;
+  return defaultCountryCode + cleaned; // ✅ no +
 }
 
 /**
@@ -847,14 +847,29 @@ async function runAutomation(automation, order, phone, connection) {
     let mediaId = null;
     if (automation.include_product_image) {
       console.log(`   🖼️  Product image enabled for this automation`);
-      const imageUrl = await fetchProductImage(order, connection);
+
+      // ✅ Use image already in webhook payload — no extra API call, no timeout
+      const imageUrl = order.line_items?.[0]?.image?.src || null;
+
       if (imageUrl) {
+        console.log(`   ✅ Image URL from payload: ${imageUrl}`);
         mediaId = await uploadImageToMeta(imageUrl, account);
+      } else {
+        console.log(`   ⚠️  No image in order payload`);
       }
+
+      // ✅ Template needs image but we couldn't get one — skip instead of crashing
       if (!mediaId) {
-        console.log(
-          `   ⚠️  No media_id — sending text-only (graceful fallback)`,
+        console.warn(
+          `   ❌ Template requires image but none available — skipping`,
         );
+        await supabase.from("woocommerce_automation_logs").insert({
+          ...logEntry,
+          status: "skipped",
+          error_message:
+            "Template requires image header but product image unavailable",
+        });
+        return;
       }
     }
 
