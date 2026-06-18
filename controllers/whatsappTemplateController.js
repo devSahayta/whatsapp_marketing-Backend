@@ -357,6 +357,14 @@ export async function prepareMediaHeader(req, res) {
     return res.json({ success: true, header_handle, header_format, media_id });
   } catch (err) {
     console.error("PREPARE MEDIA HEADER ERROR:", err);
+
+    if (req.body?.storage_path) {
+      supabase.storage
+        .from(BUCKET)
+        .remove([req.body.storage_path])
+        .catch(() => {});
+    }
+
     return res.status(500).json({ error: err.response?.data || err.message });
   }
 }
@@ -494,6 +502,14 @@ export async function uploadBinaryFromStorage(req, res) {
     return res.json(resp);
   } catch (err) {
     console.error(err);
+
+    if (req.body?.storage_path) {
+      supabase.storage
+        .from(BUCKET)
+        .remove([req.body.storage_path])
+        .catch(() => {});
+    }
+
     return res.status(500).json({ error: err.message || err });
   }
 }
@@ -578,6 +594,14 @@ export async function uploadMediaFromStorage(req, res) {
     });
   } catch (err) {
     console.error("UPLOAD MEDIA FROM STORAGE ERROR:", err);
+
+    if (req.body?.storage_path) {
+      supabase.storage
+        .from(BUCKET)
+        .remove([req.body.storage_path])
+        .catch(() => {});
+    }
+
     return res.status(500).json({
       error: err.response?.data || err.message,
     });

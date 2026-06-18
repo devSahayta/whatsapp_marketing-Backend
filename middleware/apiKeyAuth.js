@@ -36,7 +36,7 @@ export const apiKeyAuth = async (req, res, next) => {
       scopes, webhook_url, is_active, expires_at,
       whatsapp_accounts (
         wa_id, phone_number_id, system_user_access_token,
-        business_phone_number, waba_id, status
+        business_phone_number, waba_id, app_id, status
       )
     `,
     )

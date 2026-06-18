@@ -3,13 +3,20 @@
 // Mount in app.js: app.use("/v1", publicApiRoutes)
 //
 // Available endpoints:
-//   GET  /v1/account
-//   GET  /v1/templates
-//   POST /v1/messages/template
-//   POST /v1/messages/text
-//   POST /v1/messages/interactive
-//   POST /v1/messages/schedule
-//   POST /v1/media/upload
+//   GET   /v1/account
+//   GET   /v1/templates
+//   GET   /v1/templates/:wt_id
+//   GET   /v1/templates/:wt_id/media-stream
+//   POST  /v1/templates                     — create a new template (scope: manage_templates)
+//   POST  /v1/messages/template
+//   POST  /v1/messages/text
+//   POST  /v1/messages/interactive
+//   POST  /v1/messages/schedule
+//   POST  /v1/media/upload                  — multipart upload (≤4.5 MB, Vercel limit)
+//   POST  /v1/media/upload-from-url         — upload via public URL (no size limit)
+//   POST  /v1/media/prepare-upload          — step 1: get Supabase signed URL
+//   POST  /v1/media/process-upload          — step 2: move from Supabase → Meta
+//   PATCH /v1/me/webhook
 
 import express from "express";
 import multer from "multer";
@@ -22,6 +29,10 @@ import {
   sendInteractiveMessage,
   scheduleTemplateMessage,
   uploadMedia,
+  uploadMediaFromUrl,
+  getMediaUploadUrl,
+  processUploadedMedia,
+  createTemplate,
 } from "../controllers/publicApiController.js";
 
 import { supabase } from "../config/supabase.js";
@@ -218,13 +229,38 @@ router.post(
   scheduleTemplateMessage,
 );
 
+// ── Templates (write) ─────────────────────────────────────────────────────────
+// POST /v1/templates
+router.post("/templates", scopeGuard("manage_templates"), createTemplate);
+
 // ── Media ─────────────────────────────────────────────────────────────────────
-// POST /v1/media/upload  (multipart/form-data, field: file)
+// POST /v1/media/upload  (multipart/form-data, ≤4.5 MB — Vercel hard limit)
 router.post(
   "/media/upload",
   scopeGuard("upload_media"),
   upload.single("file"),
   uploadMedia,
+);
+
+// POST /v1/media/upload-from-url  (preferred — no size limit, server fetches binary)
+router.post(
+  "/media/upload-from-url",
+  scopeGuard("upload_media"),
+  uploadMediaFromUrl,
+);
+
+// POST /v1/media/prepare-upload  (step 1 of signed-URL flow)
+router.post(
+  "/media/prepare-upload",
+  scopeGuard("upload_media"),
+  getMediaUploadUrl,
+);
+
+// POST /v1/media/process-upload  (step 2 of signed-URL flow)
+router.post(
+  "/media/process-upload",
+  scopeGuard("upload_media"),
+  processUploadedMedia,
 );
 
 // PATCH /v1/me/webhook
