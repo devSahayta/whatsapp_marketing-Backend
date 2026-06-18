@@ -921,7 +921,7 @@ async function runAutomation(automation, order, phone, connection) {
           Authorization: `Bearer ${account.system_user_access_token}`,
           "Content-Type": "application/json",
         },
-        timeout: 30000,
+        timeout: 60000,
       },
     );
 
@@ -1038,7 +1038,7 @@ async function getPlaceholderHeaderHandle(account) {
     console.log("📷 Downloading placeholder image...");
     const imageResponse = await axios.get(PLACEHOLDER_URL, {
       responseType: "arraybuffer",
-      timeout: 15000,
+      timeout: 30000,
     });
 
     const imageBuffer = Buffer.from(imageResponse.data);
