@@ -35,9 +35,8 @@ function normalizePhone(phone, defaultCountryCode = "91") {
 
   // Already has + prefix
   if (cleaned.startsWith("+")) {
-    return cleaned.replace(/\D/g, "").length >= 10
-      ? "+" + cleaned.replace(/\D/g, "")
-      : null;
+    const digits = cleaned.replace(/\D/g, "");
+    return digits.length >= 10 ? digits : null; // ✅ no +
   }
 
   // Starts with 00 (international prefix)
