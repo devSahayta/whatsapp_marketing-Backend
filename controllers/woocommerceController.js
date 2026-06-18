@@ -135,64 +135,11 @@ async function fetchProductImage(order, connection) {
 
 async function uploadImageToMeta(imageUrl, account) {
   try {
-    console.log(`   📤 Uploading product image to Meta...`);
-
-    // Step 1 — Download image as buffer
-    const imageResponse = await axios.get(imageUrl, {
-      responseType: "arraybuffer",
-      timeout: 15000,
-    });
-
-    const imageBuffer = Buffer.from(imageResponse.data);
-    const contentType = imageResponse.headers["content-type"] || "image/jpeg";
-
-    console.log(
-      `   📎 Image type: ${contentType}, size: ${imageBuffer.length} bytes`,
-    );
-
-    // Step 2 — Skip WebP, Meta doesn't support it
-    if (contentType.includes("webp")) {
-      console.log(
-        "   ⚠️  WebP not supported by Meta — falling back to text-only",
-      );
-      return null;
-    }
-
-    // Step 3 — Upload directly to phone_number_id/media endpoint
-    const form = new FormData();
-    form.append("messaging_product", "whatsapp");
-    form.append("type", contentType);
-    form.append("file", imageBuffer, {
-      filename: "product-image.jpg",
-      contentType,
-    });
-
-    const uploadResponse = await axios.post(
-      `https://graph.facebook.com/v21.0/${account.phone_number_id}/media`,
-      form,
-      {
-        headers: {
-          Authorization: `Bearer ${account.system_user_access_token}`,
-          ...form.getHeaders(),
-        },
-        timeout: 30000,
-      },
-    );
-
-    const mediaId = uploadResponse.data?.id;
-
-    if (!mediaId) {
-      console.log("   ⚠️  Meta returned no media_id");
-      return null;
-    }
-
-    console.log(`   ✅ Media uploaded to Meta, media_id: ${mediaId}`);
-    return mediaId;
+    console.log(`   📤 Using image URL directly (no upload needed)`);
+    // Return the URL itself — we'll use it as a link parameter
+    return { type: "url", url: imageUrl };
   } catch (err) {
-    console.warn(
-      "   ⚠️  uploadImageToMeta failed:",
-      err.response?.data || err.message,
-    );
+    console.warn("   ⚠️  uploadImageToMeta failed:", err.message);
     return null;
   }
 }
@@ -993,15 +940,17 @@ function buildWhatsAppPayload(
   };
 
   // ✅ Add image header if media_id provided
+  // ✅ Add image header
   if (mediaId) {
+    // mediaId can be { type: "url", url: "..." } or a string media_id
+    const imageParam =
+      mediaId.type === "url"
+        ? { type: "image", image: { link: mediaId.url } } // ✅ URL directly
+        : { type: "image", image: { id: mediaId } }; // uploaded media_id
+
     messageBody.template.components.push({
       type: "header",
-      parameters: [
-        {
-          type: "image",
-          image: { id: mediaId },
-        },
-      ],
+      parameters: [imageParam],
     });
     console.log(`   🖼️  Image header added to payload`);
   }
