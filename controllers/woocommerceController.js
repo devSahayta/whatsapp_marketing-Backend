@@ -848,26 +848,53 @@ async function runAutomation(automation, order, phone, connection) {
     if (automation.include_product_image) {
       console.log(`   🖼️  Product image enabled for this automation`);
 
-      // ✅ Use image already in webhook payload — no extra API call, no timeout
-      const imageUrl = order.line_items?.[0]?.image?.src || null;
+      // Try payload first, then fallback to WooCommerce API
+      let imageUrl = order.line_items?.[0]?.image?.src || null;
+      console.log(`   🖼️  Image from payload: ${imageUrl || "none"}`);
 
-      if (imageUrl) {
-        console.log(`   ✅ Image URL from payload: ${imageUrl}`);
-        mediaId = await uploadImageToMeta(imageUrl, account);
-      } else {
-        console.log(`   ⚠️  No image in order payload`);
+      // Fallback — fetch from WooCommerce API with 10s timeout
+      if (!imageUrl) {
+        try {
+          console.log(`   🔄 Fetching image from WooCommerce API...`);
+          imageUrl = await Promise.race([
+            fetchProductImage(order, connection),
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error("image fetch timeout")), 10000),
+            ),
+          ]);
+          console.log(`   ✅ Image from API: ${imageUrl}`);
+        } catch (e) {
+          console.warn(`   ⚠️  Image fetch failed: ${e.message}`);
+          imageUrl = null;
+        }
       }
 
-      // ✅ Template needs image but we couldn't get one — skip instead of crashing
+      // Upload to Meta
+      if (imageUrl) {
+        mediaId = await uploadImageToMeta(imageUrl, account);
+      }
+
+      // Still no image — use placeholder so message always goes through
       if (!mediaId) {
-        console.warn(
-          `   ❌ Template requires image but none available — skipping`,
-        );
+        try {
+          console.log(`   🔄 Using placeholder image as final fallback...`);
+          const account = automation.whatsapp_accounts;
+          const placeholderUrl =
+            "https://ygynmoezdffuencztefl.supabase.co/storage/v1/object/public/default_templateImage/randomImg.jpg";
+          mediaId = await uploadImageToMeta(placeholderUrl, account);
+          console.log(`   ✅ Placeholder image uploaded, media_id: ${mediaId}`);
+        } catch (e) {
+          console.warn(`   ⚠️  Placeholder upload also failed: ${e.message}`);
+        }
+      }
+
+      // Absolute last resort — skip and log
+      if (!mediaId) {
+        console.warn(`   ❌ All image attempts failed — skipping`);
         await supabase.from("woocommerce_automation_logs").insert({
           ...logEntry,
           status: "skipped",
-          error_message:
-            "Template requires image header but product image unavailable",
+          error_message: "All image upload attempts failed",
         });
         return;
       }
