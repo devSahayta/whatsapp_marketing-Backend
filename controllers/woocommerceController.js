@@ -58,11 +58,64 @@ function normalizePhone(phone, defaultCountryCode = "91") {
  * Extract template variable values from a WooCommerce order
  * template_variable_map example:
  * { "1": "order_number", "2": "total", "3": "billing_first_name" }
+ *
  */
+
+// ─── Get tracking URL from order meta ────────────────────────────────────────
+
+function getTrackingUrl(order, fallbackUrl = null) {
+  const meta = order.meta_data || [];
+
+  const trackUrl =
+    // Vedas Homes custom keys (track_url + awb)
+    meta.find((m) => m.key === "track_url")?.value ||
+    // ShipRocket standard plugin key
+    meta.find((m) => m.key === "_shipment_track_url")?.value ||
+    // Build from AWB if track_url not found
+    (meta.find((m) => m.key === "awb")?.value
+      ? `https://shiprocket.co/tracking/${meta.find((m) => m.key === "awb")?.value}`
+      : null) ||
+    // WooCommerce shipment tracking plugin
+    (meta.find((m) => m.key === "_wc_shipment_tracking_items")?.value
+      ? (() => {
+          try {
+            const items = JSON.parse(
+              meta.find((m) => m.key === "_wc_shipment_tracking_items")?.value,
+            );
+            return items?.[0]?.custom_tracking_link || null;
+          } catch {
+            return null;
+          }
+        })()
+      : null) ||
+    // Merchant-configured fallback URL
+    fallbackUrl ||
+    null;
+
+  return trackUrl;
+}
 function buildTemplateVariables(order, variableMap) {
   const variables = {};
 
-  // Fields available from WooCommerce order object
+  // ✅ Pre-compute meta lookups BEFORE building orderFields
+  const metaData = order.meta_data || [];
+
+  const awbValue =
+    metaData.find((m) => m.key === "awb")?.value ||
+    metaData.find((m) => m.key === "_shipment_awb_code")?.value ||
+    (() => {
+      const trackUrl =
+        metaData.find((m) => m.key === "track_url")?.value ||
+        metaData.find((m) => m.key === "_shipment_track_url")?.value;
+      return trackUrl ? trackUrl.split("/").pop() : "";
+    })() ||
+    "";
+
+  const trackingUrlValue = getTrackingUrl(order) || "";
+
+  console.log(`   🔍 AWB computed: "${awbValue}"`);
+  console.log(`   🔍 Tracking URL computed: "${trackingUrlValue}"`);
+
   const orderFields = {
     order_number: String(order.number || order.id),
     order_id: String(order.id),
@@ -87,9 +140,11 @@ function buildTemplateVariables(order, variableMap) {
         .join(", ") || "",
     order_date: new Date(order.date_created).toLocaleDateString("en-IN"),
     item_names: (order.line_items || []).map((i) => i.name).join(", "),
+    tracking_url: trackingUrlValue,
+    awb_number: awbValue,
+    tracking_number: awbValue,
   };
 
-  // Map variable positions to values
   for (const [position, fieldName] of Object.entries(variableMap)) {
     variables[position] = orderFields[fieldName] || "";
   }
@@ -378,8 +433,10 @@ export async function createAutomation(req, res) {
     account_id,
     trigger_event,
     delay_minutes = 0,
+    delay_stages = null, // ✅ new
     template_variable_map = {},
     include_product_image = false, // ✅ added
+    shipping_fallback_url = null,
   } = req.body;
 
   console.log("📥 createAutomation body:", JSON.stringify(req.body, null, 2));
@@ -413,6 +470,7 @@ export async function createAutomation(req, res) {
     "order.on-hold",
     "order.shipped",
     "cart.abandoned",
+    "order.delayed",
   ];
 
   if (!validEvents.includes(trigger_event)) {
@@ -439,9 +497,12 @@ export async function createAutomation(req, res) {
         account_id: resolvedAccountId,
         trigger_event,
         delay_minutes,
+        delay_stages:
+          trigger_event === "order.delayed" ? delay_stages || [2, 4, 6] : null, // ✅
         template_variable_map,
         is_active: true,
         include_product_image, // ✅ now uses destructured value
+        shipping_fallback_url,
       })
       .select()
       .single();
@@ -510,9 +571,11 @@ export async function updateAutomation(req, res) {
     "is_active",
     "wt_id",
     "delay_minutes",
+    "delay_stages",
     "template_variable_map",
     "trigger_event",
     "include_product_image",
+    "shipping_fallback_url",
   ];
   const safeUpdates = {};
 
@@ -618,6 +681,11 @@ export async function handleWebhook(req, res) {
   try {
     const topic = req.headers["x-wc-webhook-topic"]; // e.g. "order.created"
     const payload = req.body; // the full WooCommerce order object
+
+    // TEMPORARY
+    if (payload?.meta_data?.length > 0) {
+      console.log("📦 meta_data:", JSON.stringify(payload.meta_data, null, 2));
+    }
 
     console.log(`\n📦 WooCommerce Webhook Received`);
     console.log(`   Connection: ${connection_id}`);
@@ -847,12 +915,22 @@ async function runAutomation(automation, order, phone, connection) {
       }
     }
 
-    // Build payload — passes mediaId if available
+    // ✅ Get tracking URL from order meta
+    const trackingUrl = getTrackingUrl(
+      order,
+      automation.shipping_fallback_url || null,
+    );
+    if (trackingUrl) {
+      console.log(`   🔗 Tracking URL found: ${trackingUrl}`);
+    }
+
+    // Build payload — passes mediaId and trackingUrl
     const messageBody = buildWhatsAppPayload(
       template,
       phone,
       templateVariables,
       mediaId,
+      trackingUrl,
     );
 
     console.log(`   📤 Sending WhatsApp message...`);
@@ -918,6 +996,7 @@ function buildWhatsAppPayload(
   phoneNumber,
   variables,
   mediaId = null,
+  trackingUrl = null,
 ) {
   let templateComponents = template.components;
   if (typeof templateComponents === "string") {
@@ -927,6 +1006,11 @@ function buildWhatsAppPayload(
       templateComponents = [];
     }
   }
+
+  // Check if template has a URL button component
+  const hasUrlButton = templateComponents.some(
+    (c) => c.type === "BUTTONS" && c.buttons?.some((b) => b.type === "URL"),
+  );
 
   const messageBody = {
     messaging_product: "whatsapp",
@@ -939,31 +1023,46 @@ function buildWhatsAppPayload(
     },
   };
 
-  // ✅ Add image header if media_id provided
-  // ✅ Add image header
+  // Image header
   if (mediaId) {
-    // mediaId can be { type: "url", url: "..." } or a string media_id
-    const imageParam =
-      mediaId.type === "url"
-        ? { type: "image", image: { link: mediaId.url } } // ✅ URL directly
-        : { type: "image", image: { id: mediaId } }; // uploaded media_id
-
     messageBody.template.components.push({
       type: "header",
-      parameters: [imageParam],
+      parameters: [{ type: "image", image: { id: mediaId } }],
     });
-    console.log(`   🖼️  Image header added to payload`);
   }
 
-  // Add body variables
+  // Body variables — filter out empty values to avoid Meta 131008 error
   if (variables && Object.keys(variables).length > 0) {
+    const params = Object.values(variables).map((value) => ({
+      type: "text",
+      text: String(value) || " ", // ✅ never send empty string — use space as fallback
+    }));
+
     messageBody.template.components.push({
       type: "body",
-      parameters: Object.values(variables).map((value) => ({
-        type: "text",
-        text: String(value),
-      })),
+      parameters: params,
     });
+  }
+
+  // ✅ Extract just the AWB from the full tracking URL
+  // e.g. "https://shiprocket.co/tracking/1904072514104" → "1904072514104"
+  if (hasUrlButton && trackingUrl) {
+    // Try to extract just the last path segment (AWB number)
+    const urlParts = trackingUrl.split("/");
+    const awbOrSuffix = urlParts[urlParts.length - 1] || trackingUrl;
+
+    messageBody.template.components.push({
+      type: "button",
+      sub_type: "url",
+      index: "0",
+      parameters: [
+        {
+          type: "text",
+          text: awbOrSuffix, // ✅ just the dynamic suffix, e.g. "1904072514104"
+        },
+      ],
+    });
+    console.log(`   🔗 Tracking button added with AWB: ${awbOrSuffix}`);
   }
 
   return messageBody;
