@@ -1025,9 +1025,14 @@ function buildWhatsAppPayload(
 
   // Image header
   if (mediaId) {
+    const imageParam =
+      mediaId?.type === "url"
+        ? { type: "image", image: { link: mediaId.url } } // ✅ URL link
+        : { type: "image", image: { id: mediaId } }; // ✅ uploaded media ID
+
     messageBody.template.components.push({
       type: "header",
-      parameters: [{ type: "image", image: { id: mediaId } }],
+      parameters: [imageParam],
     });
   }
 
