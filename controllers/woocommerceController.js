@@ -94,12 +94,12 @@ function getTrackingUrl(order, fallbackUrl = null) {
 
   return trackUrl;
 }
-function buildTemplateVariables(order, variableMap) {
-  const variables = {};
+// ─── FIXED: buildTemplateVariables — connection is now a parameter ───────────
 
-  // ✅ Pre-compute meta lookups BEFORE building orderFields
+function buildTemplateVariables(order, variableMap, connection = null) {
   const metaData = order.meta_data || [];
 
+  // ── AWB number ──────────────────────────────────────────────────────────────
   const awbValue =
     metaData.find((m) => m.key === "awb")?.value ||
     metaData.find((m) => m.key === "_shipment_awb_code")?.value ||
@@ -111,15 +111,39 @@ function buildTemplateVariables(order, variableMap) {
     })() ||
     "";
 
+  // ── Tracking URL ───────────────────────────────────────────────────────────
   const trackingUrlValue = getTrackingUrl(order) || "";
 
-  console.log(`   🔍 AWB computed: "${awbValue}"`);
-  console.log(`   🔍 Tracking URL computed: "${trackingUrlValue}"`);
+  // ── Product URL — dynamic per order ─────────────────────────────────────────
+  // Priority: line_items[0].permalink → slug built from product name + store URL
+  // connection is now passed in, so store_url is always available
+  const productUrl = (() => {
+    // 1. Some WooCommerce setups include permalink in line items
+    if (order.line_items?.[0]?.permalink) {
+      return order.line_items[0].permalink;
+    }
 
+    // 2. Build from product name slug + store URL
+    const productName = order.line_items?.[0]?.name;
+    const storeUrl = connection?.store_url || "";
+
+    if (productName && storeUrl) {
+      const slug = productName
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-|-$/g, "");
+      return `${storeUrl}/product/${slug}/`;
+    }
+
+    return "";
+  })();
+
+  // ── Full order fields map — every possible variable ──────────────────────────
+  // Add new fields here; they become instantly available in the UI dropdown
   const orderFields = {
     order_number: String(order.number || order.id),
     order_id: String(order.id),
-    total: `${order.currency_symbol || ""}${order.total}`,
+    total: `${order.currency_symbol || "₹"}${order.total}`,
     subtotal: String(order.subtotal || ""),
     status: order.status,
     payment_method: order.payment_method_title || "",
@@ -140,13 +164,30 @@ function buildTemplateVariables(order, variableMap) {
         .join(", ") || "",
     order_date: new Date(order.date_created).toLocaleDateString("en-IN"),
     item_names: (order.line_items || []).map((i) => i.name).join(", "),
+    item_count: String((order.line_items || []).length),
     tracking_url: trackingUrlValue,
     awb_number: awbValue,
-    tracking_number: awbValue,
+    tracking_number: awbValue, // alias
+    product_url: productUrl, // ✅ now dynamic per order
+    cart_total: `${order.currency_symbol || "₹"}${order.total}`,
   };
 
+  // ── Debug log — prints the resolved value for every mapped variable ──────────
+  console.log(
+    `\n   📊 Variable resolution for order #${order.number || order.id}:`,
+  );
   for (const [position, fieldName] of Object.entries(variableMap)) {
-    variables[position] = orderFields[fieldName] || "";
+    const resolved = orderFields[fieldName];
+    const status = resolved ? "✅" : "⚠️ EMPTY";
+    console.log(
+      `      {{${position}}} → ${fieldName} = "${resolved || ""}" ${status}`,
+    );
+  }
+
+  // ── Build the final variables object ─────────────────────────────────────────
+  const variables = {};
+  for (const [position, fieldName] of Object.entries(variableMap)) {
+    variables[position] = orderFields[fieldName] ?? "";
   }
 
   return variables;
@@ -734,6 +775,7 @@ export async function handleWebhook(req, res) {
       const statusMap = {
         processing: "order.processing",
         completed: "order.completed",
+        "wc-completed": "order.completed",
         cancelled: "order.cancelled",
         refunded: "order.refunded",
         "on-hold": "order.on-hold",
@@ -745,6 +787,14 @@ export async function handleWebhook(req, res) {
     }
 
     console.log(`   Mapped trigger: ${triggerEvent}`);
+
+    // Add inside handleWebhook, after triggerEvent is resolved
+    console.log(`\n   🔍 Webhook debug:`);
+    console.log(`      Raw topic:     ${topic}`);
+    console.log(`      Order status:  ${payload.status}`);
+    console.log(`      Trigger event: ${triggerEvent}`);
+    console.log(`      Order ID:      ${payload?.id}`);
+    console.log(`      Phone:         ${payload?.billing?.phone}`);
 
     // ✅ If order was created, check if it was an abandoned cart and mark recovered
     if (
@@ -852,6 +902,7 @@ async function runAutomation(automation, order, phone, connection) {
     const templateVariables = buildTemplateVariables(
       order,
       automation.template_variable_map || {},
+      connection, // ✅ pass connection
     );
 
     console.log(`   🤖 Running automation: ${automation.trigger_event}`);
