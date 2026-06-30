@@ -63,19 +63,16 @@ function normalizePhone(phone, defaultCountryCode = "91") {
 
 // ─── Get tracking URL from order meta ────────────────────────────────────────
 
-function getTrackingUrl(order, fallbackUrl = null) {
+function getTrackingUrl(order, orderNotes = [], fallbackUrl = null) {
   const meta = order.meta_data || [];
 
-  const trackUrl =
-    // Vedas Homes custom keys (track_url + awb)
+  // ── Priority 1: Custom fields (most reliable) ─────────────────────────────
+  const metaTrackUrl =
     meta.find((m) => m.key === "track_url")?.value ||
-    // ShipRocket standard plugin key
     meta.find((m) => m.key === "_shipment_track_url")?.value ||
-    // Build from AWB if track_url not found
     (meta.find((m) => m.key === "awb")?.value
       ? `https://shiprocket.co/tracking/${meta.find((m) => m.key === "awb")?.value}`
       : null) ||
-    // WooCommerce shipment tracking plugin
     (meta.find((m) => m.key === "_wc_shipment_tracking_items")?.value
       ? (() => {
           try {
@@ -87,20 +84,71 @@ function getTrackingUrl(order, fallbackUrl = null) {
             return null;
           }
         })()
-      : null) ||
-    // Merchant-configured fallback URL
-    fallbackUrl ||
-    null;
+      : null);
 
-  return trackUrl;
+  if (metaTrackUrl) {
+    console.log(`   🔗 Tracking from custom fields: ${metaTrackUrl}`);
+    return metaTrackUrl;
+  }
+
+  // ── Priority 2: Parse from order notes ───────────────────────────────────
+  if (orderNotes.length > 0) {
+    const parsed = parseTrackingFromNotes(orderNotes);
+    if (parsed?.trackUrl) return parsed.trackUrl;
+  }
+
+  // ── Priority 3: Fallback URL ──────────────────────────────────────────────
+  if (fallbackUrl) {
+    console.log(`   🔗 Using fallback URL: ${fallbackUrl}`);
+    return fallbackUrl;
+  }
+
+  return null;
 }
+
+// ─── Parse tracking from order notes ─────────────────────────────────────────
+function parseTrackingFromNotes(notes) {
+  for (const note of notes) {
+    const text = note.note || "";
+
+    // Pattern 1 — Direct URL in note
+    // "Please click on the below url to track your Shipments: https://shiprocket.co/tracking/4867628871963"
+    const urlMatch = text.match(/https?:\/\/[^\s<"]+tracking[^\s<"]+/i);
+    if (urlMatch) {
+      console.log(`   📝 Found tracking URL in note: ${urlMatch[0]}`);
+      return {
+        trackUrl: urlMatch[0],
+        awb: urlMatch[0].split("/").pop(),
+      };
+    }
+
+    // Pattern 2 — "Tracking: XXXXXXX" pattern
+    // "dispatched by Delhivery Courier, Tracking: 1504874262483"
+    const trackingMatch = text.match(/[Tt]racking[:\s#]+([A-Z0-9]{8,20})/);
+    if (trackingMatch) {
+      const awb = trackingMatch[1];
+      const trackUrl = buildCourierUrl(text, awb);
+      console.log(
+        `   📝 Parsed tracking from note: AWB=${awb}, URL=${trackUrl}`,
+      );
+      return { trackUrl, awb };
+    }
+  }
+  return null;
+}
+
 // ─── FIXED: buildTemplateVariables — connection is now a parameter ───────────
 
-function buildTemplateVariables(order, variableMap, connection = null) {
+function buildTemplateVariables(
+  order,
+  variableMap,
+  connection = null,
+  orderNotes = [],
+) {
   const metaData = order.meta_data || [];
 
-  // ── AWB number ──────────────────────────────────────────────────────────────
-  const awbValue =
+  // ── AWB number — meta first, then parse from notes ─────────────────────────
+  const awbFromMeta =
     metaData.find((m) => m.key === "awb")?.value ||
     metaData.find((m) => m.key === "_shipment_awb_code")?.value ||
     (() => {
@@ -111,8 +159,15 @@ function buildTemplateVariables(order, variableMap, connection = null) {
     })() ||
     "";
 
-  // ── Tracking URL ───────────────────────────────────────────────────────────
-  const trackingUrlValue = getTrackingUrl(order) || "";
+  const awbFromNotes =
+    !awbFromMeta && orderNotes.length > 0
+      ? parseTrackingFromNotes(orderNotes)?.awb || ""
+      : "";
+
+  const awbValue = awbFromMeta || awbFromNotes;
+
+  // ── Tracking URL — meta first, then notes ───────────────────────────────────
+  const trackingUrlValue = getTrackingUrl(order, orderNotes) || "";
 
   // ── Product URL — dynamic per order ─────────────────────────────────────────
   // Priority: line_items[0].permalink → slug built from product name + store URL
@@ -1062,6 +1117,22 @@ async function findOrCreateWooChat(
   }
 }
 
+// ─── Fetch order notes from WooCommerce API ───────────────────────────────────
+async function getOrderNotes(order, connection) {
+  try {
+    const client = wcClient(
+      connection.store_url,
+      connection.consumer_key,
+      connection.consumer_secret,
+    );
+    const res = await client.get(`/orders/${order.id}/notes`);
+    return res.data || [];
+  } catch (err) {
+    console.warn("   ⚠️  Could not fetch order notes:", err.message);
+    return [];
+  }
+}
+
 /**
  * Execute one automation — send the WhatsApp message
  */
@@ -1085,10 +1156,38 @@ async function runAutomation(automation, order, phone, connection) {
       throw new Error("Template or WhatsApp account not found in automation");
     }
 
+    // ✅ Fetch order notes for shipped orders — needed for tracking fallback
+    let orderNotes = [];
+    if (automation.trigger_event === "order.shipped") {
+      console.log(`   📝 Fetching order notes for tracking info...`);
+      orderNotes = await getOrderNotes(order, connection);
+      console.log(`   📝 Found ${orderNotes.length} order notes`);
+    }
+
+    // ─── Detect courier and build tracking URL from AWB ──────────────────────────
+    function buildCourierUrl(noteText, awb) {
+      const text = noteText.toLowerCase();
+      if (text.includes("delhivery"))
+        return `https://www.delhivery.com/track/package/${awb}`;
+      if (text.includes("dtdc"))
+        return `https://www.dtdc.in/trace.asp?strCnno=${awb}`;
+      if (text.includes("xpressbees"))
+        return `https://www.xpressbees.com/shipment/tracking?awb=${awb}`;
+      if (text.includes("bluedart") || text.includes("blue dart"))
+        return `https://www.bluedart.com/tracking?trackFor=0&field1=${awb}`;
+      if (text.includes("ekart"))
+        return `https://ekartlogistics.com/shipment-details/${awb}`;
+      if (text.includes("shiprocket"))
+        return `https://shiprocket.co/tracking/${awb}`;
+      // Default — ShipRocket aggregator works for most Indian couriers
+      return `https://shiprocket.co/tracking/${awb}`;
+    }
+
     const templateVariables = buildTemplateVariables(
       order,
       automation.template_variable_map || {},
-      connection, // ✅ pass connection
+      connection,
+      orderNotes, // ✅ pass order notes for AWB parsing fallback
     );
 
     console.log(`   🤖 Running automation: ${automation.trigger_event}`);
@@ -1152,13 +1251,18 @@ async function runAutomation(automation, order, phone, connection) {
       }
     }
 
-    // ✅ Get tracking URL from order meta
+    // ✅ Get tracking URL — checks meta first, then order notes, then fallback
     const trackingUrl = getTrackingUrl(
       order,
+      orderNotes,
       automation.shipping_fallback_url || null,
     );
     if (trackingUrl) {
-      console.log(`   🔗 Tracking URL found: ${trackingUrl}`);
+      console.log(`   🔗 Tracking URL: ${trackingUrl}`);
+    } else if (automation.trigger_event === "order.shipped") {
+      console.warn(
+        `   ⚠️  No tracking URL found in meta or notes — button will use fallback only`,
+      );
     }
 
     // Build payload — passes mediaId and trackingUrl
