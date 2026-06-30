@@ -687,9 +687,23 @@ export async function getLogs(req, res) {
   const { connection_id, limit = 50, offset = 0 } = req.query;
 
   try {
+    // ✅ Join with whatsapp_messages to get real status (read/delivered/failed)
     let query = supabase
       .from("woocommerce_automation_logs")
-      .select("*")
+      .select(
+        `
+        *,
+        whatsapp_messages (
+          status,
+          wa_message_id,
+          delivered_at,
+          read_at,
+          failed_at,
+          error_code,
+          error_message
+        )
+      `,
+      )
       .eq("user_id", user_id)
       .order("triggered_at", { ascending: false })
       .range(Number(offset), Number(offset) + Number(limit) - 1);
@@ -700,12 +714,79 @@ export async function getLogs(req, res) {
 
     const { data, error } = await query;
     if (error) throw error;
-    return res.json({ success: true, logs: data });
+
+    // ✅ Merge real status from whatsapp_messages into each log
+    const enriched = (data || []).map((log) => {
+      const wm = log.whatsapp_messages;
+      return {
+        ...log,
+        real_status: wm?.status || log.status,
+        delivered_at: wm?.delivered_at || null,
+        read_at: wm?.read_at || null,
+        wa_error_code: wm?.error_code || null,
+        wa_error_message: wm?.error_message || log.error_message || null,
+      };
+    });
+
+    return res.json({ success: true, logs: enriched });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
 }
 
+export async function syncLogs(req, res) {
+  const { user_id } = req.user;
+  const { connection_id } = req.query;
+
+  try {
+    // Get all logs with wm_id that are still showing "sent"
+    let query = supabase
+      .from("woocommerce_automation_logs")
+      .select("id, wm_id, status")
+      .eq("user_id", user_id)
+      .eq("status", "sent")
+      .not("wm_id", "is", null);
+
+    if (connection_id) {
+      query = query.eq("connection_id", connection_id);
+    }
+
+    const { data: staleLogs } = await query;
+
+    if (!staleLogs || staleLogs.length === 0) {
+      return res.json({ success: true, updated: 0 });
+    }
+
+    // Get real status from whatsapp_messages
+    const wmIds = staleLogs.map((l) => l.wm_id);
+    const { data: messages } = await supabase
+      .from("whatsapp_messages")
+      .select("wm_id, status")
+      .in("wm_id", wmIds);
+
+    const statusMap = {};
+    (messages || []).forEach((m) => {
+      statusMap[m.wm_id] = m.status;
+    });
+
+    // Update logs where status has changed
+    let updated = 0;
+    for (const log of staleLogs) {
+      const realStatus = statusMap[log.wm_id];
+      if (realStatus && realStatus !== "sent") {
+        await supabase
+          .from("woocommerce_automation_logs")
+          .update({ status: realStatus })
+          .eq("id", log.id);
+        updated++;
+      }
+    }
+
+    return res.json({ success: true, updated });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+}
 // ─── WEBHOOK HANDLER ────────────────────────────────────────────
 
 /**
@@ -876,6 +957,111 @@ export async function handleWebhook(req, res) {
   }
 }
 
+// ─── Extract readable text from template components ───────────────────────────
+function extractTemplateText(template, variables = {}) {
+  try {
+    let components = template.components;
+    if (typeof components === "string") {
+      try {
+        components = JSON.parse(components);
+      } catch {
+        components = [];
+      }
+    }
+    if (!Array.isArray(components)) return `Template: ${template.name}`;
+
+    const parts = [];
+    const header = components.find((c) => c.type === "HEADER");
+    if (header?.format === "TEXT" && header?.text)
+      parts.push(`*${header.text}*`);
+    if (header?.format === "IMAGE") parts.push("🖼️ [Product Image]");
+
+    const body = components.find((c) => c.type === "BODY");
+    if (body?.text) {
+      let bodyText = body.text;
+      // Replace {{X}} with actual variable values
+      Object.entries(variables).forEach(([pos, value]) => {
+        bodyText = bodyText.replaceAll(`{{${pos}}}`, value || `{{${pos}}}`);
+      });
+      parts.push(bodyText);
+    }
+
+    const footer = components.find((c) => c.type === "FOOTER");
+    if (footer?.text) parts.push(`_${footer.text}_`);
+
+    const buttons = components.find((c) => c.type === "BUTTONS");
+    if (buttons?.buttons?.length > 0) {
+      buttons.buttons.forEach((b) => parts.push(`[${b.text}]`));
+    }
+
+    return parts.join("\n\n") || `Template: ${template.name}`;
+  } catch {
+    return `Template: ${template.name}`;
+  }
+}
+
+// ─── Find or create chat for WooCommerce messages ────────────────────────────
+async function findOrCreateWooChat(
+  phoneNumber,
+  contactName,
+  userId,
+  lastMessage,
+) {
+  try {
+    // Look for existing chat with this phone number for this user
+    const { data: existingChats } = await supabase
+      .from("chats")
+      .select("chat_id, person_name")
+      .eq("phone_number", phoneNumber)
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(1);
+
+    if (existingChats && existingChats.length > 0) {
+      const existing = existingChats[0];
+      // Update last message info
+      await supabase
+        .from("chats")
+        .update({
+          last_message: lastMessage,
+          last_message_at: new Date().toISOString(),
+          last_admin_message_at: new Date().toISOString(),
+          last_sender_type: "admin",
+          person_name: contactName || existing.person_name || "Customer",
+          updated_at: new Date().toISOString(),
+        })
+        .eq("chat_id", existing.chat_id);
+      return existing.chat_id;
+    }
+
+    // Create new chat
+    const { data: newChat, error } = await supabase
+      .from("chats")
+      .insert({
+        phone_number: phoneNumber,
+        person_name: contactName || "Customer",
+        last_message: lastMessage,
+        last_message_at: new Date().toISOString(),
+        last_sender_type: "admin",
+        last_admin_message_at: new Date().toISOString(),
+        mode: "AUTO",
+        user_id: userId,
+        status: "active",
+        unread_count: 0,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+    return newChat.chat_id;
+  } catch (err) {
+    console.error("   ⚠️  findOrCreateWooChat error:", err.message);
+    return null;
+  }
+}
+
 /**
  * Execute one automation — send the WhatsApp message
  */
@@ -1000,10 +1186,10 @@ async function runAutomation(automation, order, phone, connection) {
         timeout: 60000,
       },
     );
-
     const wa_message_id = waResponse.data.messages?.[0]?.id;
 
-    const { data: wmRecord } = await supabase
+    // ✅ Store in whatsapp_messages
+    const { data: wmRecord, error: wmError } = await supabase
       .from("whatsapp_messages")
       .insert({
         account_id: account.wa_id,
@@ -1017,6 +1203,87 @@ async function runAutomation(automation, order, phone, connection) {
       .select()
       .single();
 
+    if (wmError) {
+      console.error(
+        "   ⚠️  whatsapp_messages insert failed:",
+        JSON.stringify(wmError),
+      );
+    }
+
+    // ✅ Build readable message text with actual variable values
+    const templateText = extractTemplateText(template, templateVariables);
+
+    // ✅ Customer name from order
+    const contactName =
+      `${order.billing?.first_name || ""} ${order.billing?.last_name || ""}`.trim() ||
+      "Customer";
+
+    console.log(`   👤 Contact: ${contactName}, Phone: ${phone}`);
+
+    // ✅ Find or create chat
+    const chatId = await findOrCreateWooChat(
+      phone,
+      contactName,
+      connection.user_id,
+      templateText,
+    );
+
+    console.log(`   💬 Chat ID: ${chatId}`);
+
+    // ✅ Build media path — single declaration
+    const mediaPath =
+      automation.include_product_image && mediaId?.url ? mediaId.url : null;
+
+    // ✅ Build buttons from template — single declaration
+    let buttonsValue = null;
+    try {
+      let comps = template.components;
+      if (typeof comps === "string") comps = JSON.parse(comps);
+      const btnComp = Array.isArray(comps)
+        ? comps.find((c) => c.type === "BUTTONS")
+        : null;
+      if (btnComp?.buttons?.length > 0) {
+        buttonsValue = btnComp.buttons; // ✅ store as object not string
+      }
+    } catch {
+      /* ignore */
+    }
+
+    // ✅ Store message in messages table
+    if (chatId) {
+      const messageInsert = {
+        chat_id: chatId,
+        sender_type: "admin",
+        message: templateText,
+        message_type: "template",
+        media_path: mediaPath || null,
+        buttons: buttonsValue || null,
+        created_at: new Date().toISOString(),
+      };
+
+      console.log(`   📝 Inserting message for chat ${chatId}...`);
+
+      const { data: msgData, error: msgError } = await supabase
+        .from("messages")
+        .insert(messageInsert)
+        .select()
+        .single();
+
+      if (msgError) {
+        console.error(
+          "   ❌ Failed to store message:",
+          JSON.stringify(msgError),
+        );
+      } else {
+        console.log(
+          `   💬 Message stored — message_id: ${msgData?.message_id}`,
+        );
+      }
+    } else {
+      console.error("   ❌ chatId is null — skipping message insert");
+    }
+
+    // ✅ Store in automation logs
     await supabase.from("woocommerce_automation_logs").insert({
       ...logEntry,
       wm_id: wmRecord?.wm_id,

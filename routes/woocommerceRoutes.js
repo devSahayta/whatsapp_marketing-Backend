@@ -13,7 +13,10 @@ import {
   getPlaceholderHandle,
 } from "../controllers/woocommerceController.js";
 
-import { getAccountId } from "../controllers/woocommerceController.js";
+import {
+  getAccountId,
+  syncLogs,
+} from "../controllers/woocommerceController.js";
 
 import {
   getCartRecoveryStats,
@@ -38,6 +41,7 @@ router.delete("/automations/:id", deleteAutomation);
 
 // Logs
 router.get("/logs", getLogs);
+router.get("/logs/sync", syncLogs);
 
 router.post("/placeholder-handle", getPlaceholderHandle);
 
