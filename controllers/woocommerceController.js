@@ -137,6 +137,25 @@ function parseTrackingFromNotes(notes) {
   return null;
 }
 
+// ─── Detect courier and build tracking URL from AWB ──────────────────────────
+function buildCourierUrl(noteText, awb) {
+  const text = noteText.toLowerCase();
+  if (text.includes("delhivery"))
+    return `https://www.delhivery.com/track/package/${awb}`;
+  if (text.includes("dtdc"))
+    return `https://www.dtdc.in/trace.asp?strCnno=${awb}`;
+  if (text.includes("xpressbees"))
+    return `https://www.xpressbees.com/shipment/tracking?awb=${awb}`;
+  if (text.includes("bluedart") || text.includes("blue dart"))
+    return `https://www.bluedart.com/tracking?trackFor=0&field1=${awb}`;
+  if (text.includes("ekart"))
+    return `https://ekartlogistics.com/shipment-details/${awb}`;
+  if (text.includes("shiprocket"))
+    return `https://shiprocket.co/tracking/${awb}`;
+  // Default — ShipRocket aggregator works for most Indian couriers
+  return `https://shiprocket.co/tracking/${awb}`;
+}
+
 // ─── FIXED: buildTemplateVariables — connection is now a parameter ───────────
 
 function buildTemplateVariables(
@@ -1162,25 +1181,6 @@ async function runAutomation(automation, order, phone, connection) {
       console.log(`   📝 Fetching order notes for tracking info...`);
       orderNotes = await getOrderNotes(order, connection);
       console.log(`   📝 Found ${orderNotes.length} order notes`);
-    }
-
-    // ─── Detect courier and build tracking URL from AWB ──────────────────────────
-    function buildCourierUrl(noteText, awb) {
-      const text = noteText.toLowerCase();
-      if (text.includes("delhivery"))
-        return `https://www.delhivery.com/track/package/${awb}`;
-      if (text.includes("dtdc"))
-        return `https://www.dtdc.in/trace.asp?strCnno=${awb}`;
-      if (text.includes("xpressbees"))
-        return `https://www.xpressbees.com/shipment/tracking?awb=${awb}`;
-      if (text.includes("bluedart") || text.includes("blue dart"))
-        return `https://www.bluedart.com/tracking?trackFor=0&field1=${awb}`;
-      if (text.includes("ekart"))
-        return `https://ekartlogistics.com/shipment-details/${awb}`;
-      if (text.includes("shiprocket"))
-        return `https://shiprocket.co/tracking/${awb}`;
-      // Default — ShipRocket aggregator works for most Indian couriers
-      return `https://shiprocket.co/tracking/${awb}`;
     }
 
     const templateVariables = buildTemplateVariables(
