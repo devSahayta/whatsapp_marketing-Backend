@@ -267,6 +267,28 @@ export const handleIncomingMessage = async (req, res) => {
 
       console.log({ updatedMsg });
 
+      // 🔹 NEW: log this status event into whatsapp_status_events so the
+      // sync scheduler/cron can pick it up and propagate it to whichever
+      // tables need it (campaign_messages, scheduled_messages, etc.)
+      // instead of us having to hardcode every table update right here.
+      const { error: eventError } = await supabase
+        .from("whatsapp_status_events")
+        .insert({
+          wm_id: updatedMsg?.wm_id || null,
+          wa_message_id: waMessageId,
+          status,
+          event_at: timestamp,
+          error_code: updateData.error_code || null,
+          error_message: updateData.error_message || null,
+        });
+
+      if (eventError) {
+        console.error(
+          "❌ Failed to insert whatsapp_status_events:",
+          eventError,
+        );
+      }
+
       if (updatedMsg?.wm_id) {
         // 🔹 ALSO UPDATE CAMPAIGN MESSAGE
         const { data: campaignMsg, error: cmError } = await supabase
