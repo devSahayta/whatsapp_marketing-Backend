@@ -122,4 +122,12 @@ app.get("/", (req, res) => res.send("API is running..."));
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
+app.get("/api/health", (req, res) => {
+  res.json({
+    status: "ok",
+    time: new Date().toISOString(),
+    service: "samvaadik-backend",
+  });
+});
+
 // startCampaignScheduler();
