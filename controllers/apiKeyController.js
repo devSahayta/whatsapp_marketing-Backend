@@ -12,6 +12,7 @@ const VALID_SCOPES = [
   "get_templates",
   "upload_media",
   "get_account",
+  "get_scheduled_messages",
 ];
 
 /**

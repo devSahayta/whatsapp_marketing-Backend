@@ -597,6 +597,95 @@ export const scheduleTemplateMessage = async (req, res) => {
   }
 };
 
+/* ─── GET /v1/messages/schedule/:sm_id ──────────────────────────────────── */
+/*
+  Get the status of a single scheduled message.
+*/
+export const getScheduledMessageStatus = async (req, res) => {
+  try {
+    const { wa_id } = req.account;
+    const { sm_id } = req.params;
+
+    const { data, error } = await supabase
+      .from("scheduled_messages")
+      .select(
+        "sm_id, phone_number, contact_name, wt_id, scheduled_at, timezone, status, wa_message_id, wm_id, sent_at, failed_at, error_message, error_code, created_at, updated_at",
+      )
+      .eq("sm_id", sm_id)
+      .eq("account_id", wa_id)
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!data) {
+      logUsage(req, 404, "Scheduled message not found");
+      return res
+        .status(404)
+        .json({ success: false, error: "Scheduled message not found" });
+    }
+
+    logUsage(req, 200);
+    return res.status(200).json({ success: true, data });
+  } catch (err) {
+    console.error("getScheduledMessageStatus error:", err);
+    logUsage(req, 500, err.message);
+    return res
+      .status(500)
+      .json({ error: "Failed to fetch scheduled message status" });
+  }
+};
+
+/* ─── GET /v1/messages/schedule ─────────────────────────────────────────── */
+/*
+  List scheduled messages for this account, most recent first.
+
+  Query params (all optional):
+    status  — filter by status: scheduled | sent | failed | cancelled
+    phone   — filter by recipient phone number
+    limit   — max rows to return (default 50, max 200)
+    offset  — pagination offset (default 0)
+*/
+export const listScheduledMessages = async (req, res) => {
+  try {
+    const { wa_id } = req.account;
+    const { status, phone } = req.query;
+
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+
+    let query = supabase
+      .from("scheduled_messages")
+      .select(
+        "sm_id, phone_number, contact_name, wt_id, scheduled_at, timezone, status, wa_message_id, wm_id, sent_at, failed_at, error_message, error_code, created_at, updated_at",
+        { count: "exact" },
+      )
+      .eq("account_id", wa_id)
+      .order("created_at", { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (status) query = query.eq("status", status);
+    if (phone) query = query.eq("phone_number", phone);
+
+    const { data, error, count } = await query;
+
+    if (error) throw error;
+
+    logUsage(req, 200);
+    return res.status(200).json({
+      success: true,
+      total: count ?? data?.length ?? 0,
+      limit,
+      offset,
+      data: data ?? [],
+    });
+  } catch (err) {
+    console.error("listScheduledMessages error:", err);
+    logUsage(req, 500, err.message);
+    return res
+      .status(500)
+      .json({ error: "Failed to fetch scheduled messages" });
+  }
+};
+
 /* ─── POST /v1/media/upload-from-url ────────────────────────────────────── */
 /*
   Primary approach for media uploads — avoids Vercel 4.5 MB request limit.
