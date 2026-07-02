@@ -264,7 +264,7 @@ function buildTemplateVariables(
     variables[position] = orderFields[fieldName] ?? "";
   }
 
-  return variables;
+  return { variables, awbValue };
 }
 
 // ─── NEW: Fetch product image from WooCommerce ──────────────────────────────
@@ -1172,11 +1172,11 @@ async function runAutomation(automation, order, phone, connection) {
       console.log(`   📝 Found ${orderNotes.length} order notes`);
     }
 
-    const templateVariables = buildTemplateVariables(
+    const { variables: templateVariables, awbValue } = buildTemplateVariables(
       order,
       automation.template_variable_map || {},
       connection,
-      orderNotes, // ✅ pass order notes for AWB parsing fallback
+      orderNotes,
     );
 
     console.log(`   🤖 Running automation: ${automation.trigger_event}`);
@@ -1254,13 +1254,12 @@ async function runAutomation(automation, order, phone, connection) {
       );
     }
 
-    // Build payload — passes mediaId and trackingUrl
     const messageBody = buildWhatsAppPayload(
       template,
       phone,
       templateVariables,
       mediaId,
-      trackingUrl,
+      awbValue,
     );
 
     console.log(`   📤 Sending WhatsApp message...`);
@@ -1407,7 +1406,7 @@ function buildWhatsAppPayload(
   phoneNumber,
   variables,
   mediaId = null,
-  trackingUrl = null,
+  awbForButton = null, // ✅ now expects a clean AWB, not a full URL
 ) {
   let templateComponents = template.components;
   if (typeof templateComponents === "string") {
@@ -1418,10 +1417,11 @@ function buildWhatsAppPayload(
     }
   }
 
-  // Check if template has a URL button component
-  const hasUrlButton = templateComponents.some(
-    (c) => c.type === "BUTTONS" && c.buttons?.some((b) => b.type === "URL"),
-  );
+  // ✅ Only treat the button as needing a param if its URL actually has {{1}}
+  const urlButton = templateComponents
+    .find((c) => c.type === "BUTTONS")
+    ?.buttons?.find((b) => b.type === "URL");
+  const buttonNeedsParam = urlButton?.url?.includes("{{1}}");
 
   const messageBody = {
     messaging_product: "whatsapp",
@@ -1438,8 +1438,8 @@ function buildWhatsAppPayload(
   if (mediaId) {
     const imageParam =
       mediaId?.type === "url"
-        ? { type: "image", image: { link: mediaId.url } } // ✅ URL link
-        : { type: "image", image: { id: mediaId } }; // ✅ uploaded media ID
+        ? { type: "image", image: { link: mediaId.url } }
+        : { type: "image", image: { id: mediaId } };
 
     messageBody.template.components.push({
       type: "header",
@@ -1451,7 +1451,7 @@ function buildWhatsAppPayload(
   if (variables && Object.keys(variables).length > 0) {
     const params = Object.values(variables).map((value) => ({
       type: "text",
-      text: String(value) || " ", // ✅ never send empty string — use space as fallback
+      text: String(value) || " ",
     }));
 
     messageBody.template.components.push({
@@ -1460,25 +1460,19 @@ function buildWhatsAppPayload(
     });
   }
 
-  // ✅ Extract just the AWB from the full tracking URL
-  // e.g. "https://shiprocket.co/tracking/1904072514104" → "1904072514104"
-  if (hasUrlButton && trackingUrl) {
-    // Try to extract just the last path segment (AWB number)
-    const urlParts = trackingUrl.split("/");
-    const awbOrSuffix = urlParts[urlParts.length - 1] || trackingUrl;
-
+  // ✅ Only push a button parameter if the template's button actually needs one
+  if (buttonNeedsParam && awbForButton) {
     messageBody.template.components.push({
       type: "button",
       sub_type: "url",
       index: "0",
-      parameters: [
-        {
-          type: "text",
-          text: awbOrSuffix, // ✅ just the dynamic suffix, e.g. "1904072514104"
-        },
-      ],
+      parameters: [{ type: "text", text: awbForButton }],
     });
-    console.log(`   🔗 Tracking button added with AWB: ${awbOrSuffix}`);
+    console.log(`   🔗 Tracking button added with AWB: ${awbForButton}`);
+  } else if (urlButton && !buttonNeedsParam) {
+    console.log(
+      `   ℹ️  Static URL button — no parameter sent (template URL has no {{1}})`,
+    );
   }
 
   return messageBody;
