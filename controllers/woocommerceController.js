@@ -1097,10 +1097,7 @@ async function findOrCreateWooChat(
           status: "active",
           updated_at: new Date().toISOString(),
         },
-        {
-          onConflict: "user_id,phone_number", // must match your unique constraint
-          ignoreDuplicates: false, // we WANT it to update on conflict
-        },
+        { onConflict: "user_id,phone_number", ignoreDuplicates: false },
       )
       .select("chat_id")
       .single();
@@ -1150,6 +1147,21 @@ async function runAutomation(automation, order, phone, connection) {
 
     if (!template || !account) {
       throw new Error("Template or WhatsApp account not found in automation");
+    }
+
+    const { data: existingLog } = await supabase
+      .from("woocommerce_automation_logs")
+      .select("id")
+      .eq("automation_id", automation.id)
+      .eq("wc_order_id", String(order.id))
+      .in("status", ["sent", "pending"])
+      .maybeSingle();
+
+    if (existingLog) {
+      console.log(
+        `   ⏭️  Order ${order.id} already processed — skipping duplicate webhook`,
+      );
+      return;
     }
 
     // ✅ Fetch order notes for shipped orders — needed for tracking fallback
