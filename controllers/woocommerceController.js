@@ -1082,54 +1082,31 @@ async function findOrCreateWooChat(
   lastMessage,
 ) {
   try {
-    // Look for existing chat with this phone number for this user
-    const { data: existingChats } = await supabase
+    const { data: chat, error } = await supabase
       .from("chats")
-      .select("chat_id, person_name")
-      .eq("phone_number", phoneNumber)
-      .eq("user_id", userId)
-      .order("created_at", { ascending: false })
-      .limit(1);
-
-    if (existingChats && existingChats.length > 0) {
-      const existing = existingChats[0];
-      // Update last message info
-      await supabase
-        .from("chats")
-        .update({
+      .upsert(
+        {
+          phone_number: phoneNumber,
+          person_name: contactName || "Customer",
           last_message: lastMessage,
           last_message_at: new Date().toISOString(),
           last_admin_message_at: new Date().toISOString(),
           last_sender_type: "admin",
-          person_name: contactName || existing.person_name || "Customer",
+          mode: "AUTO",
+          user_id: userId,
+          status: "active",
           updated_at: new Date().toISOString(),
-        })
-        .eq("chat_id", existing.chat_id);
-      return existing.chat_id;
-    }
-
-    // Create new chat
-    const { data: newChat, error } = await supabase
-      .from("chats")
-      .insert({
-        phone_number: phoneNumber,
-        person_name: contactName || "Customer",
-        last_message: lastMessage,
-        last_message_at: new Date().toISOString(),
-        last_sender_type: "admin",
-        last_admin_message_at: new Date().toISOString(),
-        mode: "AUTO",
-        user_id: userId,
-        status: "active",
-        unread_count: 0,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
-      .select()
+        },
+        {
+          onConflict: "user_id,phone_number", // must match your unique constraint
+          ignoreDuplicates: false, // we WANT it to update on conflict
+        },
+      )
+      .select("chat_id")
       .single();
 
     if (error) throw error;
-    return newChat.chat_id;
+    return chat.chat_id;
   } catch (err) {
     console.error("   ⚠️  findOrCreateWooChat error:", err.message);
     return null;
