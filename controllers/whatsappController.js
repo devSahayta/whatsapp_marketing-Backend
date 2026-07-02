@@ -289,32 +289,32 @@ export const handleIncomingMessage = async (req, res) => {
         );
       }
 
-      if (updatedMsg?.wm_id) {
-        // 🔹 ALSO UPDATE CAMPAIGN MESSAGE
-        const { data: campaignMsg, error: cmError } = await supabase
-          .from("campaign_messages")
-          .update({
-            status: status,
-            delivered_at: updateData.delivered_at || undefined,
-            read_at: updateData.read_at || undefined,
-            sent_at: updateData.sent_at || undefined,
-            failed_at: updateData.failed_at || undefined,
-            error_code: updateData.error_code || undefined,
-            error_message: updateData.error_message || undefined,
-            updated_at: new Date().toISOString(),
-          })
-          .eq("wm_id", updatedMsg.wm_id);
+      // if (updatedMsg?.wm_id) {
+      //   // 🔹 ALSO UPDATE CAMPAIGN MESSAGE
+      //   const { data: campaignMsg, error: cmError } = await supabase
+      //     .from("campaign_messages")
+      //     .update({
+      //       status: status,
+      //       delivered_at: updateData.delivered_at || undefined,
+      //       read_at: updateData.read_at || undefined,
+      //       sent_at: updateData.sent_at || undefined,
+      //       failed_at: updateData.failed_at || undefined,
+      //       error_code: updateData.error_code || undefined,
+      //       error_message: updateData.error_message || undefined,
+      //       updated_at: new Date().toISOString(),
+      //     })
+      //     .eq("wm_id", updatedMsg.wm_id);
 
-        if (cmError) {
-          console.error("❌ Failed to update campaign message:", cmError);
-        }
+      //   if (cmError) {
+      //     console.error("❌ Failed to update campaign message:", cmError);
+      //   }
 
-        console.log(
-          campaignMsg
-            ? { campaignMsg }
-            : `No campaign message linked to this WhatsApp message`,
-        );
-      }
+      //   console.log(
+      //     campaignMsg
+      //       ? { campaignMsg }
+      //       : `No campaign message linked to this WhatsApp message`,
+      //   );
+      // }
     }
 
     return res.sendStatus(200);
