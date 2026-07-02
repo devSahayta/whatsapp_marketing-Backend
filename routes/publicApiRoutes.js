@@ -12,6 +12,8 @@
 //   POST  /v1/messages/text
 //   POST  /v1/messages/interactive
 //   POST  /v1/messages/schedule
+//   GET   /v1/messages/schedule              — list scheduled messages (status/phone filter)
+//   GET   /v1/messages/schedule/:sm_id       — get a scheduled message's status
 //   POST  /v1/media/upload                  — multipart upload (≤4.5 MB, Vercel limit)
 //   POST  /v1/media/upload-from-url         — upload via public URL (no size limit)
 //   POST  /v1/media/prepare-upload          — step 1: get Supabase signed URL
@@ -28,6 +30,8 @@ import {
   sendTextMessage,
   sendInteractiveMessage,
   scheduleTemplateMessage,
+  getScheduledMessageStatus,
+  listScheduledMessages,
   uploadMedia,
   uploadMediaFromUrl,
   getMediaUploadUrl,
@@ -227,6 +231,20 @@ router.post(
   "/messages/schedule",
   scopeGuard("send_template"),
   scheduleTemplateMessage,
+);
+
+// GET /v1/messages/schedule  — list scheduled messages (filter by status/phone)
+router.get(
+  "/messages/schedule",
+  scopeGuard("get_scheduled_messages"),
+  listScheduledMessages,
+);
+
+// GET /v1/messages/schedule/:sm_id  — get a single scheduled message's status
+router.get(
+  "/messages/schedule/:sm_id",
+  scopeGuard("get_scheduled_messages"),
+  getScheduledMessageStatus,
 );
 
 // ── Templates (write) ─────────────────────────────────────────────────────────
