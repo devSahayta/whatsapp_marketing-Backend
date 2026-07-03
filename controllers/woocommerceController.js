@@ -16,7 +16,7 @@ function wcClient(storeUrl, consumerKey, consumerSecret) {
       username: consumerKey,
       password: consumerSecret,
     },
-    timeout: 20000,
+    timeout: 15000,
   });
 }
 
