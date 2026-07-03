@@ -1165,11 +1165,37 @@ async function runAutomation(automation, order, phone, connection) {
     }
 
     // ✅ Fetch order notes for shipped orders — needed for tracking fallback
+    // Retry a few times since the tracking note is often added a moment
+    // AFTER the status-change webhook fires (race condition)
     let orderNotes = [];
     if (automation.trigger_event === "order.shipped") {
-      console.log(`   📝 Fetching order notes for tracking info...`);
-      orderNotes = await getOrderNotes(order, connection);
-      console.log(`   📝 Found ${orderNotes.length} order notes`);
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        console.log(
+          `   📝 Fetching order notes for tracking info (attempt ${attempt})...`,
+        );
+        orderNotes = await getOrderNotes(order, connection);
+        const hasTracking =
+          orderNotes.some((n) => /tracking/i.test(n.note || "")) ||
+          (order.meta_data || []).some((m) =>
+            [
+              "awb",
+              "_shipment_awb_code",
+              "track_url",
+              "_shipment_track_url",
+            ].includes(m.key),
+          );
+        if (hasTracking) {
+          console.log(`   📝 Found tracking info on attempt ${attempt}`);
+          break;
+        }
+        if (attempt < 3) {
+          console.log(
+            `   ⏳ No tracking info yet — waiting 4s before retry...`,
+          );
+          await new Promise((r) => setTimeout(r, 4000));
+        }
+      }
+      console.log(`   📝 Final order notes count: ${orderNotes.length}`);
     }
 
     const { variables: templateVariables, awbValue } = buildTemplateVariables(
@@ -1252,6 +1278,34 @@ async function runAutomation(automation, order, phone, connection) {
       console.warn(
         `   ⚠️  No tracking URL found in meta or notes — button will use fallback only`,
       );
+    }
+
+    // ✅ Safety net — never attempt to send if the template requires a button
+    // param but we genuinely have no AWB, even after retries
+    let templateComponentsCheck = template.components;
+    if (typeof templateComponentsCheck === "string") {
+      try {
+        templateComponentsCheck = JSON.parse(templateComponentsCheck);
+      } catch {
+        templateComponentsCheck = [];
+      }
+    }
+    const urlButtonCheck = templateComponentsCheck
+      .find((c) => c.type === "BUTTONS")
+      ?.buttons?.find((b) => b.type === "URL");
+    const buttonNeedsParamCheck = urlButtonCheck?.url?.includes("{{1}}");
+
+    if (buttonNeedsParamCheck && !awbValue) {
+      console.warn(
+        `   ⚠️  Template requires AWB for its button but none found after retries — skipping send`,
+      );
+      await supabase.from("woocommerce_automation_logs").insert({
+        ...logEntry,
+        status: "skipped",
+        error_message:
+          "AWB not available for tracking button even after retry — tracking note may not have synced yet",
+      });
+      return;
     }
 
     const messageBody = buildWhatsAppPayload(
