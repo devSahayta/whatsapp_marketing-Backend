@@ -1,4 +1,5 @@
 import { supabase } from "../config/supabase.js";
+import { getWhatsappAccount } from "../services/waAccountService.js";
 import { sendWhatsAppTextMessage } from "../utils/whatsappClient.js";
 
 const canAdminSendText = async (chat_id) => {
@@ -100,38 +101,72 @@ export const sendAdminMessage = async (req, res) => {
       });
     }
 
-    /* 2️⃣ Save admin message */
-    const { data: msgRow, error: messageError } = await supabase
-      .from("messages")
-      .insert({
-        chat_id,
-        sender_type: "admin",
-        message,
-        message_type: "text",
-        media_path: null,
-        created_at: new Date().toISOString(),
-      })
-      .select()
-      .single();
-
-    if (messageError) throw messageError;
-
-    /* 3️⃣ Update chat preview */
-    await supabase
-      .from("chats")
-      .update({
-        last_message: message,
-        last_message_at: new Date().toISOString(),
-      })
-      .eq("chat_id", chat_id);
-
     /* 4️⃣ Send message to WhatsApp user */
-    await sendWhatsAppTextMessage(chat.phone_number, message);
+    const whatsappResponse = await sendWhatsAppTextMessage(
+      chat.phone_number,
+      message,
+    );
 
-    return res.json({
-      success: true,
-      message: msgRow,
-    });
+    if (whatsappResponse?.messages?.[0]?.id) {
+      // Get WhatsApp account for logging
+      const account = await getWhatsappAccount(chat.user_id);
+      if (!account)
+        return res.status(400).json({ error: "WhatsApp account not found" });
+
+      /* 5️⃣ Log WhatsApp message */
+      const { data: log, error: logError } = await supabase
+        .from("whatsapp_messages")
+        .insert({
+          account_id: account.wa_id,
+          to_number: chat.phone_number,
+          message_body: whatsappResponse,
+          wa_message_id: whatsappResponse.messages?.[0]?.id || null,
+          status: "sent",
+          sent_at: new Date().toISOString(),
+        })
+        .select()
+        .single();
+
+      /* 2️⃣ Save admin message */
+      const { data: msgRow, error: messageError } = await supabase
+        .from("messages")
+        .insert({
+          chat_id,
+          sender_type: "admin",
+          message,
+          message_type: "text",
+          media_path: null,
+          wm_id: log?.wm_id || null,
+          created_at: new Date().toISOString(),
+        })
+        .select()
+        .single();
+
+      if (messageError) throw messageError;
+
+      /* 3️⃣ Update chat preview */
+      await supabase
+        .from("chats")
+        .update({
+          last_message: message,
+          last_message_at: new Date().toISOString(),
+        })
+        .eq("chat_id", chat_id);
+
+      return res.json({
+        success: true,
+        message: msgRow,
+      });
+    } else {
+      console.error(
+        "❌ Failed to send WhatsApp message:",
+        whatsappResponse.error,
+      );
+      return res.status(500).json({
+        error: "Failed to send WhatsApp message",
+        details: whatsappResponse.error,
+      });
+    }
   } catch (err) {
     console.error("❌ Admin send message error:", err);
     return res.status(500).json({ error: "Internal server error" });

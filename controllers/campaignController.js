@@ -649,42 +649,29 @@ export const getCampaignById = async (req, res) => {
   }
 };
 
+//=====================================
+//update get campaign by id to include whatsapp_messages fields in each message
+//=====================================
+
 // export const getCampaignById = async (req, res) => {
 //   try {
 //     const { campaign_id } = req.params;
 //     const { user_id } = req.query;
 
 //     if (!user_id) {
-//       return res.status(400).json({
-//         success: false,
-//         error: "user_id is required",
-//       });
+//       return res
+//         .status(400)
+//         .json({ success: false, error: "user_id is required" });
 //     }
 
-//     /* -------------------------------------
-//        1. Fetch campaign
-//     ------------------------------------- */
 //     const { data: campaign, error: campaignError } = await supabase
 //       .from("campaigns")
 //       .select(
 //         `
 //         *,
-//         groups!fk_campaigns_group_id (
-//           group_name,
-//           description,
-//           status
-//         ),
-//         whatsapp_templates!fk_campaigns_wt_id (
-//           name,
-//           category,
-//           language,
-//           components,
-//           preview,
-//           template_id
-//         ),
-//         whatsapp_accounts!fk_campaigns_account_id (
-//           business_phone_number
-//         )
+//         groups!fk_campaigns_group_id ( group_name, description, status ),
+//         whatsapp_templates!fk_campaigns_wt_id ( name, category, language, components, preview, template_id ),
+//         whatsapp_accounts!fk_campaigns_account_id ( business_phone_number )
 //       `,
 //       )
 //       .eq("campaign_id", campaign_id)
@@ -693,171 +680,63 @@ export const getCampaignById = async (req, res) => {
 
 //     if (campaignError) throw campaignError;
 //     if (!campaign) {
-//       return res.status(404).json({
-//         success: false,
-//         error: "Campaign not found",
-//       });
+//       return res
+//         .status(404)
+//         .json({ success: false, error: "Campaign not found" });
 //     }
 
-//     /* -------------------------------------
-//        2. Fetch campaign messages
-//     ------------------------------------- */
-//     const { data: campaignMessages, error: cmError } = await supabase
-//       .from("campaign_messages")
-//       .select("*")
-//       .eq("campaign_id", campaign_id)
-//       .order("created_at", { ascending: false });
+//     let allMessages = [];
+//     let from = 0;
+//     const batchSize = 1000;
+//     let done = false;
 
-//     if (cmError) throw cmError;
+//     while (!done) {
+//       const { data, error } = await supabase
+//         .from("campaign_messages")
+//         .select(
+//           `cm_id, campaign_id, contact_id, phone_number, contact_name, status, created_at, updated_at,
+//            whatsapp_messages ( status, sent_at, delivered_at, read_at, failed_at, error_code, error_message )`,
+//         )
+//         .eq("campaign_id", campaign_id)
+//         .order("created_at", { ascending: false })
+//         .range(from, from + batchSize - 1);
 
-//     if (!campaignMessages || campaignMessages.length === 0) {
-//       return res.status(200).json({
-//         success: true,
-//         data: {
-//           campaign,
-//           messages: [],
-//           stats: {
-//             total: 0,
-//             pending: 0,
-//             sent: 0,
-//             delivered: 0,
-//             read: 0,
-//             failed: 0,
-//           },
-//         },
-//       });
+//       if (error) throw error;
+//       allMessages = [...allMessages, ...(data || [])];
+//       if (!data || data.length < batchSize) done = true;
+//       else from += batchSize;
 //     }
 
-//     /* -------------------------------------
-//        3. Fetch whatsapp_messages (source of truth)
-//     ------------------------------------- */
-//     const wmIds = campaignMessages.map((m) => m.wm_id).filter(Boolean);
-
-//     const { data: whatsappMessages, error: wmError } = await supabase
-//       .from("whatsapp_messages")
-//       .select("wm_id, status, delivered_at, read_at")
-//       .in("wm_id", wmIds);
-
-//     if (wmError) throw wmError;
-
-//     const wmMap = new Map();
-//     whatsappMessages.forEach((wm) => {
-//       wmMap.set(wm.wm_id, wm);
-//     });
-
-//     /* -------------------------------------
-//        4. Merge delivery/read info
-//     ------------------------------------- */
-//     // const mergedMessages = campaignMessages.map((cm) => {
-//     //   const wm = wmMap.get(cm.wm_id);
-
-//     //   if (!wm) return cm;
-
-//     //   return {
-//     //     ...cm,
-//     //     status: wm.status || cm.status,
-//     //     delivered_at: wm.delivered_at || cm.delivered_at,
-//     //     read_at: wm.read_at || cm.read_at,
-//     //   };
-//     // });
-
-//     const mergedMessages = campaignMessages.map((cm) => {
-//       const wm = wmMap.get(cm.wm_id);
-//       if (!wm) return cm;
-
+//     // Flatten the embedded whatsapp_messages fields onto each row
+//     const messages = allMessages.map((m) => {
+//       const wa = m.whatsapp_messages || {};
 //       return {
-//         ...cm,
-//         status: wm.status, // 🔥 ALWAYS trust whatsapp_messages
-//         delivered_at: wm.delivered_at,
-//         read_at: wm.read_at,
-//         failed_at:
-//           wm.status === "failed"
-//             ? cm.failed_at || new Date().toISOString()
-//             : cm.failed_at,
+//         ...m,
+//         whatsapp_messages: undefined,
+//         wa_status: wa.status || null, // ← the raw whatsapp_messages.status, kept distinct
+//         sent_at: wa.sent_at || null,
+//         delivered_at: wa.delivered_at || null,
+//         read_at: wa.read_at || null,
+//         failed_at: wa.failed_at || null,
+//         error_code: wa.error_code || null,
+//         error_message: wa.error_message || null,
 //       };
 //     });
 
-//     /* -------------------------------------
-//        5. (OPTIONAL BUT RECOMMENDED)
-//        Sync delivery/read back to campaign_messages
-//     ------------------------------------- */
-//     // const updates = mergedMessages.filter(
-//     //   (m) =>
-//     //     m.wm_id &&
-//     //     (m.delivered_at || m.read_at) &&
-//     //     (m.delivered_at !==
-//     //       campaignMessages.find((x) => x.cm_id === m.cm_id)?.delivered_at ||
-//     //       m.read_at !==
-//     //         campaignMessages.find((x) => x.cm_id === m.cm_id)?.read_at),
-//     // );
-
-//     // if (updates.length > 0) {
-//     //   await Promise.all(
-//     //     updates.map((m) =>
-//     //       supabase
-//     //         .from("campaign_messages")
-//     //         .update({
-//     //           status: m.status,
-//     //           delivered_at: m.delivered_at,
-//     //           read_at: m.read_at,
-//     //           updated_at: new Date().toISOString(),
-//     //         })
-//     //         .eq("cm_id", m.cm_id),
-//     //     ),
-//     //   );
-//     // }
-
-//     const updates = mergedMessages.filter((m) => {
-//       const original = campaignMessages.find((x) => x.cm_id === m.cm_id);
-
-//       if (!original) return false;
-
-//       return (
-//         m.status !== original.status || // ✅ status-only changes
-//         m.delivered_at !== original.delivered_at ||
-//         m.read_at !== original.read_at
-//       );
-//     });
-
-//     if (updates.length > 0) {
-//       await Promise.all(
-//         updates.map((m) =>
-//           supabase
-//             .from("campaign_messages")
-//             .update({
-//               status: m.status,
-//               delivered_at: m.delivered_at,
-//               read_at: m.read_at,
-//               failed_at: m.status === "failed" ? m.failed_at : null,
-//               updated_at: new Date().toISOString(),
-//             })
-//             .eq("cm_id", m.cm_id),
-//         ),
-//       );
-//     }
-
-//     /* -------------------------------------
-//        6. Calculate stats (final truth)
-//     ------------------------------------- */
 //     const stats = {
-//       total: mergedMessages.length,
-//       pending: mergedMessages.filter((m) => m.status === "pending").length,
-//       sent: mergedMessages.filter((m) => m.status === "sent").length,
-//       delivered: mergedMessages.filter((m) => m.status === "delivered").length,
-//       read: mergedMessages.filter((m) => m.status === "read").length,
-//       failed: mergedMessages.filter((m) => m.status === "failed").length,
+//       total: messages.length,
+//       pending: messages.filter((m) => m.status === "pending").length,
+//       sent: messages.filter((m) => m.sent_at !== null).length,
+//       delivered: messages.filter((m) => m.delivered_at !== null).length,
+//       read: messages.filter((m) => m.read_at !== null).length,
+//       failed: messages.filter((m) => m.status === "failed").length,
+//       undelivered: messages.filter((m) => m.status === "assumed_failed").length,
+//       processing: messages.filter((m) => m.status === "sent").length,
 //     };
 
-//     /* -------------------------------------
-//        7. Response
-//     ------------------------------------- */
 //     return res.status(200).json({
 //       success: true,
-//       data: {
-//         campaign,
-//         messages: mergedMessages,
-//         stats,
-//       },
+//       data: { campaign, messages, stats },
 //     });
 //   } catch (err) {
 //     console.error("getCampaignById error:", err);
