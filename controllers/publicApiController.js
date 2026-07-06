@@ -169,20 +169,25 @@ export const sendTemplateMessage = async (req, res) => {
     const wa_message_id = graphRes.data?.messages?.[0]?.id;
 
     // Log in whatsapp_messages
-    await supabase.from("whatsapp_messages").insert({
-      account_id: wa_id,
-      to_number: phone,
-      template_name,
-      message_body: payload,
-      wa_message_id,
-      status: "sent",
-      sent_at: new Date().toISOString(),
-    });
+    const { data: wmRecord } = await supabase
+      .from("whatsapp_messages")
+      .insert({
+        account_id: wa_id,
+        to_number: phone,
+        template_name,
+        message_body: payload,
+        wa_message_id,
+        status: "sent",
+        sent_at: new Date().toISOString(),
+      })
+      .select("wm_id")
+      .single();
 
     logUsage(req, 200);
     return res.status(200).json({
       success: true,
       wa_message_id,
+      wm_id: wmRecord?.wm_id,
       message: "Template message sent",
     });
   } catch (err) {
@@ -338,19 +343,24 @@ export const sendTextMessage = async (req, res) => {
     const wa_message_id = graphRes.data?.messages?.[0]?.id;
 
     // Log in whatsapp_messages
-    await supabase.from("whatsapp_messages").insert({
-      account_id: wa_id,
-      to_number: phone,
-      message_body: payload,
-      wa_message_id,
-      status: "sent",
-      sent_at: new Date().toISOString(),
-    });
+    const { data: wmRecord } = await supabase
+      .from("whatsapp_messages")
+      .insert({
+        account_id: wa_id,
+        to_number: phone,
+        message_body: payload,
+        wa_message_id,
+        status: "sent",
+        sent_at: new Date().toISOString(),
+      })
+      .select("wm_id")
+      .single();
 
     logUsage(req, 200);
     return res.status(200).json({
       success: true,
       wa_message_id,
+      wm_id: wmRecord?.wm_id,
       message: "Text message sent",
     });
   } catch (err) {
@@ -484,19 +494,24 @@ export const sendInteractiveMessage = async (req, res) => {
 
     const wa_message_id = graphRes.data?.messages?.[0]?.id;
 
-    await supabase.from("whatsapp_messages").insert({
-      account_id: wa_id,
-      to_number: phone,
-      message_body: payload,
-      wa_message_id,
-      status: "sent",
-      sent_at: new Date().toISOString(),
-    });
+    const { data: wmRecord } = await supabase
+      .from("whatsapp_messages")
+      .insert({
+        account_id: wa_id,
+        to_number: phone,
+        message_body: payload,
+        wa_message_id,
+        status: "sent",
+        sent_at: new Date().toISOString(),
+      })
+      .select("wm_id")
+      .single();
 
     logUsage(req, 200);
     return res.status(200).json({
       success: true,
       wa_message_id,
+      wm_id: wmRecord?.wm_id,
       message: "Interactive message sent",
     });
   } catch (err) {

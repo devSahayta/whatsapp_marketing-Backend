@@ -1403,6 +1403,7 @@ async function runAutomation(automation, order, phone, connection) {
         message: templateText,
         message_type: "template",
         media_path: mediaPath || null,
+        wm_id: wmRecord?.wm_id,
         buttons: buttonsValue || null,
         created_at: new Date().toISOString(),
       };

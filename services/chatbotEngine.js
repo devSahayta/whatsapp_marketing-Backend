@@ -31,6 +31,43 @@ function releaseLock(chat_id) {
 // Fetches account credentials and sends a text message via WhatsApp Cloud API
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Insert a whatsapp_messages tracking row for an outbound send, return its wm_id
+async function trackWhatsAppMessage({
+  account_id,
+  to_number,
+  wa_message_id,
+  message_body,
+  status,
+}) {
+  try {
+    const { data, error } = await supabase
+      .from("whatsapp_messages")
+      .insert({
+        account_id,
+        to_number,
+        wa_message_id,
+        message_body,
+        status,
+        sent_at: new Date().toISOString(),
+      })
+      .select("wm_id")
+      .single();
+
+    if (error) {
+      console.warn(
+        "⚠️ [Engine] whatsapp_messages insert failed:",
+        error.message,
+      );
+      return null;
+    }
+
+    return data?.wm_id || null;
+  } catch (err) {
+    console.warn("⚠️ [Engine] trackWhatsAppMessage error:", err.message);
+    return null;
+  }
+}
+
 async function sendWhatsAppText(phone_number, text, account_id) {
   try {
     // Fetch the WhatsApp account credentials
@@ -45,10 +82,16 @@ async function sendWhatsAppText(phone_number, text, account_id) {
         "❌ [Engine] Could not fetch WA account for sending:",
         error,
       );
-      return;
+      return { wm_id: null };
     }
 
     const url = `https://graph.facebook.com/v19.0/${acc.phone_number_id}/messages`;
+    const payload = {
+      messaging_product: "whatsapp",
+      to: phone_number,
+      type: "text",
+      text: { body: text },
+    };
 
     const response = await fetch(url, {
       method: "POST",
@@ -56,23 +99,37 @@ async function sendWhatsAppText(phone_number, text, account_id) {
         Authorization: `Bearer ${acc.system_user_access_token}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        messaging_product: "whatsapp",
-        to: phone_number,
-        type: "text",
-        text: { body: text },
-      }),
+      body: JSON.stringify(payload),
     });
 
     const result = await response.json();
 
     if (!response.ok) {
       console.error("❌ [Engine] WA send failed:", JSON.stringify(result));
-    } else {
-      console.log("✅ [Engine] Message sent to", phone_number);
+      const wm_id = await trackWhatsAppMessage({
+        account_id,
+        to_number: phone_number,
+        wa_message_id: null,
+        message_body: payload,
+        status: "failed",
+      });
+      return { wm_id };
     }
+
+    console.log("✅ [Engine] Message sent to", phone_number);
+
+    const wm_id = await trackWhatsAppMessage({
+      account_id,
+      to_number: phone_number,
+      wa_message_id: result.messages?.[0]?.id || null,
+      message_body: payload,
+      status: "sent",
+    });
+
+    return { wm_id };
   } catch (err) {
     console.error("❌ [Engine] sendWhatsAppText error:", err.message);
+    return { wm_id: null };
   }
 }
 
@@ -82,6 +139,7 @@ async function saveBotMessage(
   text,
   message_type = "text",
   media_path = null,
+  wm_id = null,
 ) {
   try {
     const now = new Date().toISOString();
@@ -92,6 +150,7 @@ async function saveBotMessage(
       message: text,
       message_type,
       media_path,
+      wm_id,
     });
 
     await supabase
@@ -250,8 +309,8 @@ async function execSendMessage(
 ) {
   const text = interpolate(node.config.text || "", variables);
   if (text) {
-    await sendWhatsAppText(phone_number, text, account_id);
-    await saveBotMessage(chat_id, text);
+    const { wm_id } = await sendWhatsAppText(phone_number, text, account_id);
+    await saveBotMessage(chat_id, text, "text", null, wm_id);
   }
   return { advance: true, variables };
 }
@@ -379,8 +438,8 @@ async function execWaitForInput(
   // First call: send prompt if configured, set sentinel, stop and wait
   if (prompt) {
     const text = interpolate(prompt, variables);
-    await sendWhatsAppText(phone_number, text, account_id);
-    await saveBotMessage(chat_id, text);
+    const { wm_id } = await sendWhatsAppText(phone_number, text, account_id);
+    await saveBotMessage(chat_id, text, "text", null, wm_id);
   }
 
   // Set sentinel so the next incoming message knows to save and advance
@@ -450,8 +509,8 @@ async function execAiFallback(
     node.config.fallback_message || "I'm sorry, I didn't understand that.",
     variables,
   );
-  await sendWhatsAppText(phone_number, text, account_id);
-  await saveBotMessage(chat_id, text);
+  const { wm_id } = await sendWhatsAppText(phone_number, text, account_id);
+  await saveBotMessage(chat_id, text, "text", null, wm_id);
   return { advance: true, variables };
 }
 
@@ -468,8 +527,8 @@ async function execHandoff(
     node.config.message || "Transferring you to a human agent. Please wait…",
     variables,
   );
-  await sendWhatsAppText(phone_number, text, account_id);
-  await saveBotMessage(chat_id, text);
+  const { wm_id } = await sendWhatsAppText(phone_number, text, account_id);
+  await saveBotMessage(chat_id, text, "text", null, wm_id);
   await handoffSession(session_id, chat_id);
   return { advance: false, variables }; // session ends here
 }
@@ -488,8 +547,8 @@ async function execEndFlow(
     variables,
   );
   if (text) {
-    await sendWhatsAppText(phone_number, text, account_id);
-    await saveBotMessage(chat_id, text);
+    const { wm_id } = await sendWhatsAppText(phone_number, text, account_id);
+    await saveBotMessage(chat_id, text, "text", null, wm_id);
   }
   await endSession(session_id, chat_id);
   return { advance: false, variables }; // session ends here
@@ -626,8 +685,12 @@ async function execAiAgent(
         `👤 ${customerName}\n\n` +
         `Thank you for shopping with Baby's Shop! 👶🛍️`;
 
-      await sendWhatsAppText(phone_number, confirmMsg, account_id);
-      await saveBotMessage(chat_id, confirmMsg);
+      const { wm_id: confirmWmId } = await sendWhatsAppText(
+        phone_number,
+        confirmMsg,
+        account_id,
+      );
+      await saveBotMessage(chat_id, confirmMsg, "text", null, confirmWmId);
 
       // Update session — order done, clear stage
       return {
@@ -643,8 +706,8 @@ async function execAiAgent(
 
     // Image received but not in payment flow — ignore gracefully
     const msg = "I can only process text messages. Please type your reply! 😊";
-    await sendWhatsAppText(phone_number, msg, account_id);
-    await saveBotMessage(chat_id, msg);
+    const { wm_id } = await sendWhatsAppText(phone_number, msg, account_id);
+    await saveBotMessage(chat_id, msg, "text", null, wm_id);
     return { advance: false, variables };
   }
 
@@ -692,12 +755,16 @@ async function execAiAgent(
       if (product?.image_url) {
         // Send acknowledgement text first
         const ackMsg = `Here's the photo of *${product.name}*! 📸`;
-        await sendWhatsAppText(phone_number, ackMsg, account_id);
-        await saveBotMessage(chat_id, ackMsg);
+        const { wm_id: ackWmId } = await sendWhatsAppText(
+          phone_number,
+          ackMsg,
+          account_id,
+        );
+        await saveBotMessage(chat_id, ackMsg, "text", null, ackWmId);
 
         // Send the actual image
         const caption = `${product.name} — ₹${product.price}`;
-        await sendWhatsAppImage(
+        const { wm_id: imageWmId } = await sendWhatsAppImage(
           phone_number,
           product.image_url,
           caption,
@@ -708,12 +775,17 @@ async function execAiAgent(
           product.image_url,
           "image",
           product.image_url,
+          imageWmId,
         );
 
         // Follow up
         const followUp = `Would you like to *ORDER* this, or shall I show you more products? 😊`;
-        await sendWhatsAppText(phone_number, followUp, account_id);
-        await saveBotMessage(chat_id, followUp);
+        const { wm_id: followUpWmId } = await sendWhatsAppText(
+          phone_number,
+          followUp,
+          account_id,
+        );
+        await saveBotMessage(chat_id, followUp, "text", null, followUpWmId);
 
         console.log(`📸 [Engine] Image sent for: ${product.name}`);
 
@@ -739,8 +811,12 @@ async function execAiAgent(
       } else {
         // No image in DB — let Claude respond naturally
         const noPhotoMsg = `Sorry, I don't have a photo for *${product?.name || lastProduct}* right now. Would you like to ORDER it or see other products? 😊`;
-        await sendWhatsAppText(phone_number, noPhotoMsg, account_id);
-        await saveBotMessage(chat_id, noPhotoMsg);
+        const { wm_id: noPhotoWmId } = await sendWhatsAppText(
+          phone_number,
+          noPhotoMsg,
+          account_id,
+        );
+        await saveBotMessage(chat_id, noPhotoMsg, "text", null, noPhotoWmId);
 
         const newHistory = [
           ...(variables._agent_history || []),
@@ -776,8 +852,8 @@ async function execAiAgent(
     if (agent.fallback_action === "handoff_to_agent") {
       const msg =
         "Let me connect you with our team directly. Please wait a moment! 🙏";
-      await sendWhatsAppText(phone_number, msg, account_id);
-      await saveBotMessage(chat_id, msg);
+      const { wm_id } = await sendWhatsAppText(phone_number, msg, account_id);
+      await saveBotMessage(chat_id, msg, "text", null, wm_id);
       await handoffSession(session_id, chat_id);
       return { advance: false, variables };
     } else {
@@ -821,8 +897,12 @@ async function execAiAgent(
   }
 
   // ── Send Claude's text reply ──────────────────────────────────────────────
-  await sendWhatsAppText(phone_number, reply, account_id);
-  await saveBotMessage(chat_id, reply);
+  const { wm_id: replyWmId } = await sendWhatsAppText(
+    phone_number,
+    reply,
+    account_id,
+  );
+  await saveBotMessage(chat_id, reply, "text", null, replyWmId);
 
   // After the UPI stage detection above
 
@@ -861,7 +941,7 @@ async function execAiAgent(
 
       if (product?.image_url) {
         const caption = `${product.name} — ₹${product.price}`;
-        await sendWhatsAppImage(
+        const { wm_id: promisedImageWmId } = await sendWhatsAppImage(
           phone_number,
           product.image_url,
           caption,
@@ -872,6 +952,7 @@ async function execAiAgent(
           product.image_url,
           "image",
           product.image_url,
+          promisedImageWmId,
         );
         console.log(
           `📸 [Engine] Auto-sent promised image for: ${product.name}`,
@@ -1016,13 +1097,13 @@ async function execAiAgent(
     const qrUrl = process.env.UPI_QR_URL;
     console.log("💳 [Engine] QR URL being sent:", qrUrl);
     if (qrUrl) {
-      await sendWhatsAppImage(
+      const { wm_id: qrWmId } = await sendWhatsAppImage(
         phone_number,
         qrUrl,
         "Scan to pay via UPI — babyshop@ybl",
         account_id,
       );
-      await saveBotMessage(chat_id, qrUrl, "image", qrUrl);
+      await saveBotMessage(chat_id, qrUrl, "image", qrUrl, qrWmId);
       console.log("💳 [Engine] UPI QR image sent");
     } else {
       console.warn("⚠️ [Engine] UPI_QR_URL not set in .env");
@@ -1051,10 +1132,19 @@ async function sendWhatsAppImage(phone_number, image_url, caption, account_id) {
         "❌ [Engine] Could not fetch WA account for image send:",
         error,
       );
-      return;
+      return { wm_id: null };
     }
 
     const url = `https://graph.facebook.com/v19.0/${acc.phone_number_id}/messages`;
+    const payload = {
+      messaging_product: "whatsapp",
+      to: phone_number,
+      type: "image",
+      image: {
+        link: image_url,
+        caption: caption || "",
+      },
+    };
 
     const response = await fetch(url, {
       method: "POST",
@@ -1062,15 +1152,7 @@ async function sendWhatsAppImage(phone_number, image_url, caption, account_id) {
         Authorization: `Bearer ${acc.system_user_access_token}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        messaging_product: "whatsapp",
-        to: phone_number,
-        type: "image",
-        image: {
-          link: image_url,
-          caption: caption || "",
-        },
-      }),
+      body: JSON.stringify(payload),
     });
 
     const result = await response.json();
@@ -1080,11 +1162,30 @@ async function sendWhatsAppImage(phone_number, image_url, caption, account_id) {
         "❌ [Engine] WA image send failed:",
         JSON.stringify(result),
       );
-    } else {
-      console.log("✅ [Engine] Image sent to", phone_number);
+      const wm_id = await trackWhatsAppMessage({
+        account_id,
+        to_number: phone_number,
+        wa_message_id: null,
+        message_body: payload,
+        status: "failed",
+      });
+      return { wm_id };
     }
+
+    console.log("✅ [Engine] Image sent to", phone_number);
+
+    const wm_id = await trackWhatsAppMessage({
+      account_id,
+      to_number: phone_number,
+      wa_message_id: result.messages?.[0]?.id || null,
+      message_body: payload,
+      status: "sent",
+    });
+
+    return { wm_id };
   } catch (err) {
     console.error("❌ [Engine] sendWhatsAppImage error:", err.message);
+    return { wm_id: null };
   }
 }
 
@@ -1250,12 +1351,18 @@ async function handlePhotoRequest(
   // Get the last product the user was looking at (stored in session variables)
   const lastProduct = variables._last_product_name;
   if (!lastProduct) {
-    await sendWhatsAppText(
+    const { wm_id } = await sendWhatsAppText(
       phone_number,
       "Which product would you like to see? Please tell me the product name first.",
       account_id,
     );
-    await saveBotMessage(chat_id, "Which product would you like to see?");
+    await saveBotMessage(
+      chat_id,
+      "Which product would you like to see?",
+      "text",
+      null,
+      wm_id,
+    );
     return true;
   }
 
@@ -1270,7 +1377,7 @@ async function handlePhotoRequest(
   const product = products?.[0];
 
   if (!product?.image_url) {
-    await sendWhatsAppText(
+    const { wm_id } = await sendWhatsAppText(
       phone_number,
       `Sorry, no photo available for ${lastProduct} right now. Would you like to order it?`,
       account_id,
@@ -1278,19 +1385,37 @@ async function handlePhotoRequest(
     await saveBotMessage(
       chat_id,
       `Sorry, no photo available for ${lastProduct}.`,
+      "text",
+      null,
+      wm_id,
     );
     return true;
   }
 
   // Send the image
   const caption = `${product.name}\n₹${product.price}\n${product.description || ""}`;
-  await sendWhatsAppImage(phone_number, product.image_url, caption, account_id);
-  await saveBotMessage(chat_id, product.image_url, "image", product.image_url);
+  const { wm_id: imageWmId } = await sendWhatsAppImage(
+    phone_number,
+    product.image_url,
+    caption,
+    account_id,
+  );
+  await saveBotMessage(
+    chat_id,
+    product.image_url,
+    "image",
+    product.image_url,
+    imageWmId,
+  );
 
   // Follow up with order prompt
   const followUp = `Here's the photo of *${product.name}*! 😊\n\nWould you like to order it?\nReply *ORDER* to proceed or *BACK* to see more products.`;
-  await sendWhatsAppText(phone_number, followUp, account_id);
-  await saveBotMessage(chat_id, followUp);
+  const { wm_id: followUpWmId } = await sendWhatsAppText(
+    phone_number,
+    followUp,
+    account_id,
+  );
+  await saveBotMessage(chat_id, followUp, "text", null, followUpWmId);
 
   return true;
 }
