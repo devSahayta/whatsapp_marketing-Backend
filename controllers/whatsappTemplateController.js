@@ -1254,6 +1254,7 @@ export async function sendTemplateBulk(req, res) {
                 message_type: msgType,
                 media_path: mediaPath,
                 buttons,
+                wm_id: log.wm_id,
                 created_at: new Date(),
               });
 
