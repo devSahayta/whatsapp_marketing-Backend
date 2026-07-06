@@ -5,6 +5,7 @@
 import { supabase } from "../config/supabase.js";
 import Anthropic from "@anthropic-ai/sdk";
 import { ANTHROPIC_API_KEY } from "../config/anthropic.js";
+import { renderTemplateBody } from "../utils/whatsappTemplateHelpers.js";
 
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
@@ -380,7 +381,18 @@ async function execSendTemplate(
 
     if (!acc) return { advance: true, variables };
 
-    await fetch(
+    const payload = {
+      messaging_product: "whatsapp",
+      to: phone_number,
+      type: "template",
+      template: {
+        name: template_name,
+        language: { code: "en_US" },
+        components: components.length ? components : undefined,
+      },
+    };
+
+    const response = await fetch(
       `https://graph.facebook.com/v19.0/${acc.phone_number_id}/messages`,
       {
         method: "POST",
@@ -388,20 +400,47 @@ async function execSendTemplate(
           Authorization: `Bearer ${acc.system_user_access_token}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          messaging_product: "whatsapp",
-          to: phone_number,
-          type: "template",
-          template: {
-            name: template_name,
-            language: { code: "en_US" },
-            components: components.length ? components : undefined,
-          },
-        }),
+        body: JSON.stringify(payload),
       },
     );
 
-    console.log("✅ Template sent:", template_name);
+    const result = await response.json();
+
+    if (!response.ok) {
+      console.error(
+        "❌ execSendTemplate send failed:",
+        JSON.stringify(result),
+      );
+    } else {
+      console.log("✅ Template sent:", template_name);
+    }
+
+    const wm_id = await trackWhatsAppMessage({
+      account_id,
+      to_number: phone_number,
+      wa_message_id: result.messages?.[0]?.id || null,
+      message_body: payload,
+      status: response.ok ? "sent" : "failed",
+    });
+
+    // ── Save to chat dashboard ─────────────────────────────────────────────
+    const { data: tpl } = await supabase
+      .from("whatsapp_templates")
+      .select("components")
+      .eq("account_id", account_id)
+      .eq("name", template_name)
+      .maybeSingle();
+
+    const renderedText =
+      (tpl && renderTemplateBody(tpl, components)) || template_name;
+
+    await saveBotMessage(
+      chat_id,
+      renderedText,
+      "template",
+      media_id || null,
+      wm_id,
+    );
   } catch (err) {
     console.error("❌ execSendTemplate error:", err.message);
   }
