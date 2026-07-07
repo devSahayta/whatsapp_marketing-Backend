@@ -4,6 +4,34 @@ import axios from "axios";
 import FormData from "form-data";
 import { supabase } from "../config/supabase.js";
 
+// ─── Retry wrapper for flaky network calls (socket hang up, ECONNRESET, timeouts) ──
+async function axiosWithRetry(
+  fn,
+  { retries = 2, delayMs = 1000, label = "request" } = {},
+) {
+  let lastErr;
+  for (let attempt = 1; attempt <= retries + 1; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const isRetryable =
+        err.code === "ECONNRESET" ||
+        err.code === "ETIMEDOUT" ||
+        err.message?.includes("socket hang up") ||
+        err.message?.includes("timeout");
+
+      console.warn(
+        `   ⚠️  ${label} attempt ${attempt} failed: ${err.message}${isRetryable ? " (retryable)" : " (not retryable)"}`,
+      );
+
+      if (!isRetryable || attempt > retries) break;
+      await new Promise((r) => setTimeout(r, delayMs * attempt)); // backoff
+    }
+  }
+  throw lastErr;
+}
+
 // ─── Helpers ────────────────────────────────────────────────────
 
 /**
@@ -16,7 +44,7 @@ function wcClient(storeUrl, consumerKey, consumerSecret) {
       username: consumerKey,
       password: consumerSecret,
     },
-    timeout: 15000,
+    timeout: 25000,
   });
 }
 
@@ -285,7 +313,10 @@ async function fetchProductImage(order, connection) {
       connection.consumer_secret,
     );
 
-    const response = await client.get(`/products/${productId}`);
+    const response = await axiosWithRetry(
+      () => client.get(`/products/${productId}`),
+      { retries: 2, delayMs: 1000, label: "fetchProductImage" },
+    );
     const imageUrl = response.data?.images?.[0]?.src;
 
     if (!imageUrl) {
@@ -1110,7 +1141,6 @@ async function findOrCreateWooChat(
   }
 }
 
-// ─── Fetch order notes from WooCommerce API ───────────────────────────────────
 async function getOrderNotes(order, connection) {
   try {
     const client = wcClient(
@@ -1118,10 +1148,16 @@ async function getOrderNotes(order, connection) {
       connection.consumer_key,
       connection.consumer_secret,
     );
-    const res = await client.get(`/orders/${order.id}/notes`);
+    const res = await axiosWithRetry(
+      () => client.get(`/orders/${order.id}/notes`),
+      { retries: 2, delayMs: 1000, label: "getOrderNotes" },
+    );
     return res.data || [];
   } catch (err) {
-    console.warn("   ⚠️  Could not fetch order notes:", err.message);
+    console.warn(
+      "   ⚠️  Could not fetch order notes after retries:",
+      err.message,
+    );
     return [];
   }
 }
@@ -1321,16 +1357,20 @@ async function runAutomation(automation, order, phone, connection) {
       console.log(`   🖼️  With product image (media_id: ${mediaId})`);
     }
 
-    const waResponse = await axios.post(
-      `https://graph.facebook.com/v21.0/${account.phone_number_id}/messages`,
-      messageBody,
-      {
-        headers: {
-          Authorization: `Bearer ${account.system_user_access_token}`,
-          "Content-Type": "application/json",
-        },
-        timeout: 60000,
-      },
+    const waResponse = await axiosWithRetry(
+      () =>
+        axios.post(
+          `https://graph.facebook.com/v21.0/${account.phone_number_id}/messages`,
+          messageBody,
+          {
+            headers: {
+              Authorization: `Bearer ${account.system_user_access_token}`,
+              "Content-Type": "application/json",
+            },
+            timeout: 60000,
+          },
+        ),
+      { retries: 2, delayMs: 1500, label: "Meta send message" },
     );
     const wa_message_id = waResponse.data.messages?.[0]?.id;
 
