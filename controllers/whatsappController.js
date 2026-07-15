@@ -387,7 +387,7 @@ export const handleIncomingMessage = async (req, res) => {
         const ts = Date.now();
         const ext = contentType.split("/")[1] || "bin";
         const fileName = `${message.type}_${ts}.${ext}`;
-        const storagePath = `${chatRow.chat_id}/${fileName}`;
+        const storagePath = `${from}/${fileName}`; // ← fixed: use `from` instead of chatRow.chat_id
 
         const { error: uploadError } = await supabase.storage
           .from("message_media")
@@ -400,7 +400,7 @@ export const handleIncomingMessage = async (req, res) => {
             .from("message_media")
             .getPublicUrl(storagePath);
 
-          storedMediaPath = data.publicUrl; // ✅ PUBLIC URL
+          storedMediaPath = data.publicUrl;
           console.log("✅ Public media URL:", storedMediaPath);
         }
       } catch (err) {
