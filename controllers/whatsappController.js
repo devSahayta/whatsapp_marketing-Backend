@@ -16,6 +16,7 @@ import {
   matchKeywordTrigger,
 } from "../services/chatbotEngine.js";
 import { createNotification } from "../controllers/notificationController.js";
+import { markCodOrderConfirmed } from "./woocommerceController.js";
 
 /* ─── Webhook Forwarding ────────────────────────────────────────────────────
    Forward incoming messages to any external app that has registered a
@@ -332,7 +333,24 @@ export const handleIncomingMessage = async (req, res) => {
     const from = message.from.trim();
     let userText = message.text?.body?.trim() || "";
     if (message.type === "button") {
-      userText = message?.button?.payload || message?.button?.text || userText;
+      const rawPayload = message?.button?.payload || "";
+      const rawText = message?.button?.text || "";
+      // Only the new COD-confirm payload gets special handling — everything
+      // else keeps the exact original precedence (payload, then text).
+      userText = rawPayload.startsWith("cod_confirm_")
+        ? rawText || rawPayload
+        : rawPayload || rawText || userText;
+    }
+
+    // ── COD confirmation — isolated, fire-and-forget, no impact on chatbot/other flows ──
+    if (message.type === "button") {
+      const rawPayload = message?.button?.payload || "";
+      if (rawPayload.startsWith("cod_confirm_")) {
+        const orderReference = rawPayload.replace("cod_confirm_", "");
+        markCodOrderConfirmed(orderReference, from).catch((e) =>
+          console.error("❌ markCodOrderConfirmed error:", e.message),
+        );
+      }
     }
 
     // engineText is what gets sent to the bot engine
