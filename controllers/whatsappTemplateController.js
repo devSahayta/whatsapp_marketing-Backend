@@ -710,6 +710,91 @@ export async function getAllTemplates(req, res) {
   }
 }
 
+// NEW — paginated list for the Template List page
+export async function listTemplatesPaginated(req, res) {
+  try {
+    const user_id = req.query.user_id;
+    if (!user_id) return res.status(400).json({ error: "user_id required" });
+
+    const account = await getWhatsappAccount(user_id);
+    if (!account)
+      return res.status(404).json({ error: "WhatsApp account not found" });
+
+    // ---- pagination params ----
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(
+      Math.max(parseInt(req.query.limit, 10) || 10, 1),
+      100,
+    );
+    const from = (page - 1) * limit;
+    const to = from + limit - 1;
+
+    const search = (req.query.search || "").trim();
+    const status = req.query.status; // "ALL" | "APPROVED" | "PENDING" | "REJECTED" | "PAUSED"
+
+    // escape % and _ so user input can't break the LIKE pattern
+    const likePattern = (value) =>
+      `%${value.replace(/[%_]/g, (m) => `\\${m}`)}%`;
+
+    const applySearch = (q) => {
+      if (!search) return q;
+      const p = likePattern(search);
+      return q.or(`name.ilike.${p},category.ilike.${p},language.ilike.${p}`);
+    };
+
+    // ---- current page of results ----
+    let dataQuery = supabase
+      .from("whatsapp_templates")
+      .select("*", { count: "exact" })
+      .eq("account_id", account.wa_id);
+
+    if (status && status !== "ALL") dataQuery = dataQuery.eq("status", status);
+    dataQuery = applySearch(dataQuery)
+      .order("created_at", { ascending: false })
+      .range(from, to);
+
+    const { data, error, count } = await dataQuery;
+    if (error) throw error;
+
+    // ---- status counts, independent of pagination/status filter, respecting search ----
+    const countFor = async (statusValue) => {
+      let q = supabase
+        .from("whatsapp_templates")
+        .select("wt_id", { count: "exact", head: true })
+        .eq("account_id", account.wa_id);
+      if (statusValue) q = q.eq("status", statusValue);
+      q = applySearch(q);
+      const { count: c, error: cErr } = await q;
+      if (cErr) throw cErr;
+      return c || 0;
+    };
+
+    const [totalCount, approvedCount, pendingCount] = await Promise.all([
+      countFor(null),
+      countFor("APPROVED"),
+      countFor("PENDING"),
+    ]);
+
+    return res.json({
+      data,
+      pagination: {
+        page,
+        limit,
+        total: count ?? totalCount,
+        totalPages: Math.max(Math.ceil((count ?? totalCount) / limit), 1),
+      },
+      stats: {
+        total: totalCount,
+        approved: approvedCount,
+        pending: pendingCount,
+      },
+    });
+  } catch (err) {
+    console.error("LIST TEMPLATES PAGINATED ERROR:", err);
+    return res.status(500).json({ error: err.message || err });
+  }
+}
+
 export async function getTemplateById(req, res) {
   try {
     const { wt_id } = req.params;
