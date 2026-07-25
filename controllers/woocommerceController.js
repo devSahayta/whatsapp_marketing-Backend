@@ -82,6 +82,16 @@ function normalizePhone(phone, defaultCountryCode = "91") {
   return defaultCountryCode + cleaned; // ✅ no +
 }
 
+function isCodOrder(order) {
+  const method = (order.payment_method || "").toLowerCase();
+  const methodTitle = (order.payment_method_title || "").toLowerCase();
+  return (
+    method === "cod" ||
+    methodTitle.includes("cash on delivery") ||
+    methodTitle.includes("cod")
+  );
+}
+
 /**
  * Extract template variable values from a WooCommerce order
  * template_variable_map example:
@@ -617,6 +627,7 @@ export async function createAutomation(req, res) {
     "order.shipped",
     "cart.abandoned",
     "order.delayed",
+    "order.cod_confirmation",
   ];
 
   if (!validEvents.includes(trigger_event)) {
@@ -1004,15 +1015,10 @@ export async function handleWebhook(req, res) {
     }
 
     // 3. Find active automations matching this connection + trigger
+    // 3. Find active automations matching this connection + trigger
     const { data: automations, error: autoError } = await supabase
       .from("woocommerce_automations")
-      .select(
-        `
-        *,
-        whatsapp_templates (*),
-        whatsapp_accounts (*)
-      `,
-      )
+      .select(`*, whatsapp_templates (*), whatsapp_accounts (*)`)
       .eq("connection_id", connection_id)
       .eq("trigger_event", triggerEvent)
       .eq("is_active", true);
@@ -1022,12 +1028,37 @@ export async function handleWebhook(req, res) {
       return;
     }
 
-    if (!automations || automations.length === 0) {
+    // ✅ COD confirmation — independent of whether order.created is configured
+    let codAutomations = [];
+    if (triggerEvent === "order.created" && isCodOrder(payload)) {
+      console.log(
+        `   💵 COD order detected — checking for confirmation automation`,
+      );
+      const { data: codData, error: codError } = await supabase
+        .from("woocommerce_automations")
+        .select(`*, whatsapp_templates (*), whatsapp_accounts (*)`)
+        .eq("connection_id", connection_id)
+        .eq("trigger_event", "order.cod_confirmation")
+        .eq("is_active", true);
+
+      if (codError) {
+        console.error(
+          "   ❌ Error fetching COD confirmation automations:",
+          codError,
+        );
+      } else {
+        codAutomations = codData || [];
+      }
+    }
+
+    const automationsToRun = [...(automations || []), ...codAutomations];
+
+    if (automationsToRun.length === 0) {
       console.log(`   ℹ️  No active automations for: ${triggerEvent}`);
       return;
     }
 
-    console.log(`   ✅ Found ${automations.length} automation(s) to run`);
+    console.log(`   ✅ Found ${automationsToRun.length} automation(s) to run`);
 
     // 4. Get phone number from the order
     const rawPhone = payload.billing?.phone;
@@ -1035,13 +1066,12 @@ export async function handleWebhook(req, res) {
 
     if (!phone) {
       console.warn(`   ⚠️  No valid phone number in order ${payload.id}`);
-      // Log as skipped
-      for (const automation of automations) {
+      for (const automation of automationsToRun) {
         await supabase.from("woocommerce_automation_logs").insert({
           automation_id: automation.id,
           user_id: connection.user_id,
           connection_id,
-          trigger_event: triggerEvent,
+          trigger_event: automation.trigger_event,
           wc_order_id: String(payload.id),
           phone_number: rawPhone || "unknown",
           status: "skipped",
@@ -1054,7 +1084,7 @@ export async function handleWebhook(req, res) {
     console.log(`   📱 Phone: ${phone}`);
 
     // 5. Run each matching automation
-    for (const automation of automations) {
+    for (const automation of automationsToRun) {
       await runAutomation(automation, payload, phone, connection);
     }
   } catch (err) {
@@ -1350,6 +1380,7 @@ async function runAutomation(automation, order, phone, connection) {
       templateVariables,
       mediaId,
       awbValue,
+      order.id, // ✅
     );
 
     console.log(`   📤 Sending WhatsApp message...`);
@@ -1502,6 +1533,7 @@ function buildWhatsAppPayload(
   variables,
   mediaId = null,
   awbForButton = null, // ✅ now expects a clean AWB, not a full URL
+  orderReference = null, // ✅ new
 ) {
   let templateComponents = template.components;
   if (typeof templateComponents === "string") {
@@ -1512,10 +1544,8 @@ function buildWhatsAppPayload(
     }
   }
 
-  // ✅ Only treat the button as needing a param if its URL actually has {{1}}
-  const urlButton = templateComponents
-    .find((c) => c.type === "BUTTONS")
-    ?.buttons?.find((b) => b.type === "URL");
+  const buttonsComponent = templateComponents.find((c) => c.type === "BUTTONS"); // ✅ add this
+  const urlButton = buttonsComponent?.buttons?.find((b) => b.type === "URL");
   const buttonNeedsParam = urlButton?.url?.includes("{{1}}");
 
   const messageBody = {
@@ -1568,6 +1598,29 @@ function buildWhatsAppPayload(
     console.log(
       `   ℹ️  Static URL button — no parameter sent (template URL has no {{1}})`,
     );
+  }
+
+  // ✅ Quick Reply buttons — e.g. "Confirm the Order"
+  const quickReplyButtons =
+    buttonsComponent?.buttons?.filter((b) => b.type === "QUICK_REPLY") || [];
+  quickReplyButtons.forEach((btn) => {
+    const fullIndex = buttonsComponent.buttons.indexOf(btn);
+    messageBody.template.components.push({
+      type: "button",
+      sub_type: "quick_reply",
+      index: String(fullIndex),
+      parameters: [
+        {
+          type: "payload",
+          payload: orderReference
+            ? `cod_confirm_${orderReference}`
+            : "confirm_order",
+        },
+      ],
+    });
+  });
+  if (quickReplyButtons.length > 0) {
+    console.log(`   🔘 Quick reply payload set: cod_confirm_${orderReference}`);
   }
 
   return messageBody;
@@ -1685,5 +1738,62 @@ export async function getPlaceholderHandle(req, res) {
       success: false,
       message: err.message,
     });
+  }
+}
+
+export async function markCodOrderConfirmed(orderReference, phoneNumber) {
+  try {
+    const cleanPhone = String(phoneNumber || "").replace(/\D/g, "");
+
+    const { data: log, error } = await supabase
+      .from("woocommerce_automation_logs")
+      .select("id, connection_id, wc_order_id")
+      .eq("trigger_event", "order.cod_confirmation")
+      .eq("wc_order_id", String(orderReference))
+      .eq("phone_number", cleanPhone)
+      .order("triggered_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error || !log) {
+      console.warn(
+        `   ⚠️  No COD confirmation log matched order ${orderReference} / ${cleanPhone}`,
+      );
+      return false;
+    }
+
+    await supabase
+      .from("woocommerce_automation_logs")
+      .update({ customer_confirmed_at: new Date().toISOString() })
+      .eq("id", log.id);
+
+    // Best-effort: leave a note on the WooCommerce order too
+    const { data: connection } = await supabase
+      .from("user_woocommerce_connections")
+      .select("store_url, consumer_key, consumer_secret")
+      .eq("id", log.connection_id)
+      .maybeSingle();
+
+    if (connection) {
+      const client = wcClient(
+        connection.store_url,
+        connection.consumer_key,
+        connection.consumer_secret,
+      );
+      client
+        .post(`/orders/${log.wc_order_id}/notes`, {
+          note: "✅ Customer confirmed this COD order via WhatsApp.",
+          customer_note: false,
+        })
+        .catch((e) =>
+          console.warn("   ⚠️  Failed to add WC order note:", e.message),
+        );
+    }
+
+    console.log(`   ✅ COD order ${orderReference} confirmed by customer`);
+    return true;
+  } catch (err) {
+    console.error("   ❌ markCodOrderConfirmed error:", err.message);
+    return false;
   }
 }
