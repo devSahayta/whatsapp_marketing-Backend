@@ -103,3 +103,28 @@ export const fetchWABADetails = async (accessToken) => {
     business_phone_number: phone.display_phone_number,
   };
 };
+
+// ------------------------------------------------------
+// 4. Subscribe our app to this WABA's webhooks
+// Required for both flows, but especially for coexistence:
+// without this, messages sent from the client's WhatsApp
+// Business App never reach our webhook.
+// ------------------------------------------------------
+export const subscribeAppToWaba = async (wabaId, accessToken) => {
+  const res = await fetch(
+    `${GRAPH_URL}/${wabaId}/subscribed_apps`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ access_token: accessToken }),
+    },
+  );
+  const data = await res.json();
+
+  if (data.error) {
+    console.error("Failed to subscribe app to WABA:", data.error);
+    throw new Error(data.error.message || "Failed to subscribe app to WABA");
+  }
+
+  return data;
+};
