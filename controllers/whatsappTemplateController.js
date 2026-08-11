@@ -139,13 +139,52 @@ export async function createTemplate(req, res) {
       bodyVariables = bodyComponent.example.body_text[0];
     }
 
-    // Extract buttons safely
+    // Detect carousel (Media Card Carousel template)
+    const carouselComponent = payload.components?.find(
+      (c) => c.type?.toUpperCase() === "CAROUSEL",
+    );
+    const isCarousel = !!carouselComponent;
+    const cardCount = carouselComponent?.cards?.length || null;
+
+    // Extract buttons safely — carousels have no top-level BUTTONS component,
+    // their (shared) button shape lives on every card, so fall back to card 0.
     let buttonList = [];
     const buttonComponent = payload.components?.find(
-      (c) => c.type === "BUTTONS",
+      (c) => c.type?.toUpperCase() === "BUTTONS",
     );
     if (buttonComponent?.buttons) {
       buttonList = buttonComponent.buttons;
+    } else if (isCarousel) {
+      const firstCardButtons = carouselComponent.cards?.[0]?.components?.find(
+        (c) => c.type?.toUpperCase() === "BUTTONS",
+      )?.buttons;
+      if (firstCardButtons) buttonList = firstCardButtons;
+    }
+
+    // Extract the URL button's variable example(s). Meta allows at most one
+    // trailing {{1}} in a URL button — for a normal template that's a single
+    // example, for a carousel the button is shared but each card can supply
+    // its own example value (since each card links to a different item).
+    let buttonVariables = [];
+    if (isCarousel) {
+      buttonVariables = (carouselComponent.cards || [])
+        .map((card, idx) => {
+          const btnComp = card.components?.find(
+            (c) => c.type?.toUpperCase() === "BUTTONS",
+          );
+          const urlBtn = btnComp?.buttons?.find(
+            (b) => b.type?.toUpperCase() === "URL",
+          );
+          return urlBtn?.example?.[0]
+            ? { card_index: idx, example: urlBtn.example[0] }
+            : null;
+        })
+        .filter(Boolean);
+    } else {
+      const urlBtn = buttonList.find((b) => b.type?.toUpperCase() === "URL");
+      if (urlBtn?.example?.[0]) {
+        buttonVariables = [{ example: urlBtn.example[0] }];
+      }
     }
 
     if (account?.system_user_access_token && account.waba_id) {
@@ -218,9 +257,13 @@ export async function createTemplate(req, res) {
         header_handle: payload.header_handle || null,
         variables: payload.variables || bodyVariables,
         buttons: payload.buttons || buttonList,
+        button_variables: payload.button_variables || buttonVariables,
         preview: preview || {},
         status: preview?.status || metaResp.status || "PENDING",
         media_id: payload.media_id || null,
+        is_carousel: isCarousel,
+        card_count: cardCount,
+        carousel_media: payload.carousel_media || [],
       };
 
       const { error: insertErr } = await supabase
@@ -1723,6 +1766,63 @@ export async function updateTemplateMediaId(req, res) {
     return res.json({ success: true, template: data });
   } catch (err) {
     console.error("UPDATE TEMPLATE MEDIA ID ERROR:", err);
+    return res.status(500).json({ error: err.message || err });
+  }
+}
+
+// Update (or add) a single card's media_id inside a carousel template's
+// carousel_media[] column — used when a card's media has expired (>25 days)
+// and the user re-uploads a fresh file for that card only.
+export async function updateCarouselCardMedia(req, res) {
+  try {
+    const { wt_id } = req.params;
+    const { user_id, card_index, media_id, header_format } = req.body;
+
+    if (!wt_id) return res.status(400).json({ error: "wt_id is required" });
+    if (card_index === undefined || card_index === null)
+      return res.status(400).json({ error: "card_index is required" });
+    if (!media_id) return res.status(400).json({ error: "media_id is required" });
+    if (!user_id) return res.status(400).json({ error: "user_id is required" });
+
+    const account = await getWhatsappAccount(user_id);
+    if (!account)
+      return res.status(404).json({ error: "WhatsApp account not found" });
+
+    const { data: tpl, error: tplErr } = await supabase
+      .from("whatsapp_templates")
+      .select("carousel_media")
+      .eq("wt_id", wt_id)
+      .eq("account_id", account.wa_id)
+      .single();
+
+    if (tplErr || !tpl)
+      return res.status(404).json({ error: "Template not found" });
+
+    const existing = Array.isArray(tpl.carousel_media) ? tpl.carousel_media : [];
+    const previousEntry = existing.find((c) => c.card_index === card_index);
+
+    const nextCarouselMedia = [
+      ...existing.filter((c) => c.card_index !== card_index),
+      {
+        card_index,
+        media_id,
+        header_format: header_format || previousEntry?.header_format || null,
+      },
+    ].sort((a, b) => a.card_index - b.card_index);
+
+    const { data, error } = await supabase
+      .from("whatsapp_templates")
+      .update({ carousel_media: nextCarouselMedia })
+      .eq("wt_id", wt_id)
+      .eq("account_id", account.wa_id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    return res.json({ success: true, template: data });
+  } catch (err) {
+    console.error("UPDATE CAROUSEL CARD MEDIA ERROR:", err);
     return res.status(500).json({ error: err.message || err });
   }
 }
