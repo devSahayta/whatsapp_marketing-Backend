@@ -20,6 +20,7 @@ import {
   getBulkProgress,
   getTemplateById,
   getAllTemplates,
+  listTemplatesPaginated,
   getSupabaseUploadUrl,
   uploadBinaryFromStorage,
   uploadMediaFromStorage,
@@ -73,6 +74,7 @@ router.get("/:wt_id/status", checkTemplateStatus);
 router.patch("/:wt_id/media-id", updateTemplateMediaId);
 router.get("/", listTemplates);
 router.get("/all", getAllTemplates);
+router.get("/list", listTemplatesPaginated); // NEW — paginated list for the Template List page
 router.get("/:wt_id", getTemplateById);
 
 // DELETE template from Meta

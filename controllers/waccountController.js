@@ -375,11 +375,19 @@ import {
   exchangeCodeForToken,
   getLongLivedToken,
   fetchWABADetails,
+  subscribeAppToWaba,
 } from "../services/metaEmbeddedSignup.js";
 
 export const embeddedSignupHandler = async (req, res) => {
   try {
-    const { code, user_id } = req.body;
+    const { code, user_id, signup_event } = req.body;
+
+    // Meta sends this via postMessage during the popup flow (frontend
+    // forwards it here). FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING means the
+    // client kept using the WhatsApp Business App alongside Samvaadik
+    // (coexistence) instead of fully migrating the number to the Cloud API.
+    const isCoexistence =
+      signup_event === "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING";
 
     if (!code || !user_id) {
       return res.status(400).json({
@@ -436,9 +444,16 @@ export const embeddedSignupHandler = async (req, res) => {
     const warmupConfig = getWarmupConfig(tier);
 
     // -------------------------------------
-    // Step 5: Save to DB
+    // Step 5: Subscribe our app to this WABA's webhooks.
+    // Required in both flows, but critical for coexistence — without it,
+    // messages sent from the client's WhatsApp Business App never reach
+    // our webhook.
     // -------------------------------------
-    // Step 5: Save to DB
+    await subscribeAppToWaba(waba_id, longLivedToken);
+
+    // -------------------------------------
+    // Step 6: Save to DB
+    // -------------------------------------
     const { data, error } = await supabase
       .from("whatsapp_accounts")
       .insert([
@@ -457,6 +472,11 @@ export const embeddedSignupHandler = async (req, res) => {
           messaging_limit_per_day: limit,
           quality_rating,
           last_tier_updated_at: new Date(),
+
+          // Coexistence vs full migration
+          connection_type: isCoexistence ? "coexistence" : "full_migration",
+          history_sync_status: isCoexistence ? "pending" : "not_applicable",
+          whatsapp_business_app_registered: isCoexistence,
 
           // Warmup
           ...warmupConfig,
