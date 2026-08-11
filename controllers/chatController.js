@@ -252,7 +252,7 @@ export async function getMessagesForChat({
   let query = supabase
     .from("messages")
     .select(
-      `message_id, chat_id, sender_type, message, message_type, media_path, created_at, buttons, wm_id,
+      `message_id, chat_id, sender_type, message, message_type, media_path, created_at, buttons, wm_id, carousel_cards,
        whatsapp_messages ( status, sent_at, delivered_at, read_at, failed_at, error_code, error_message )`,
     )
     .eq("chat_id", chat_id)

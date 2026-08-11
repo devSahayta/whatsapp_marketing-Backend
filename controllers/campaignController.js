@@ -50,14 +50,13 @@ export const createCampaign = async (req, res) => {
       });
     }
 
-    // Validate media if template requires it
     const { data: template } = await supabase
       .from("whatsapp_templates")
-      .select("components")
+      .select("components, is_carousel")
       .eq("wt_id", wt_id)
       .single();
 
-    if (template) {
+    if (template && !template.is_carousel) {
       let components = template.components;
       if (typeof components === "string") {
         components = JSON.parse(components);
@@ -75,6 +74,8 @@ export const createCampaign = async (req, res) => {
         });
       }
     }
+    // Carousel templates skip this check entirely — carousel media comes
+    // from whatsapp_templates.carousel_media, not campaigns.media_id.
 
     console.log(`📊 Fetching contacts for group: ${group_id}`);
 
@@ -1078,7 +1079,10 @@ export const getUserTemplates = async (req, res) => {
         variables,
         buttons,
         preview,
-        status
+        status,
+        is_carousel,
+        carousel_media,
+        card_count
       `,
       )
       .in("account_id", accountIds)
