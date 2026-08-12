@@ -389,6 +389,8 @@ async function execSendTemplate(
         (c) => c.type === "CAROUSEL",
       );
 
+      let carouselValidationFailed = false;
+
       const carouselComp = templateComponents.find(
         (c) => c.type === "CAROUSEL",
       );
@@ -469,6 +471,12 @@ async function execSendTemplate(
               const resolvedValue = varRef
                 ? interpolate(varRef, variables)
                 : "";
+              if (!resolvedValue) {
+                console.error(
+                  `❌ [Engine] send_template: card ${cardIndex} button ${btnIndex} needs a value but carousel_variable_map has none configured for template "${template_name}". Set node.config.carousel_variable_map["${cardIndex}"]["${btnIndex}"] to a session variable or literal string.`,
+                );
+                carouselValidationFailed = true;
+              }
               cardComponents.push({
                 type: "button",
                 sub_type: "url",
@@ -515,6 +523,16 @@ async function execSendTemplate(
           buttons: resolvedButtonsForDisplay,
         });
       });
+
+      if (carouselValidationFailed) {
+        console.error(
+          `❌ [Engine] send_template: aborting send for "${template_name}" — one or more required button values are missing. See errors above.`,
+        );
+        return { advance: true, variables };
+      }
+
+      components.push({ type: "carousel", cards: cardsPayload });
+      carouselCardsForDisplay = displayCards;
 
       components.push({ type: "carousel", cards: cardsPayload });
       carouselCardsForDisplay = displayCards;

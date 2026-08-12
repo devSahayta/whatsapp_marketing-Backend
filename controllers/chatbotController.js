@@ -11,12 +11,10 @@ export const createFlow = async (req, res) => {
     const { user_id, account_id, name, description } = req.body;
 
     if (!user_id || !account_id || !name) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          error: "user_id, account_id and name are required",
-        });
+      return res.status(400).json({
+        success: false,
+        error: "user_id, account_id and name are required",
+      });
     }
 
     const { data, error } = await supabase
@@ -159,12 +157,10 @@ export const createNode = async (req, res) => {
     ];
 
     if (!node_type || !VALID_TYPES.includes(node_type)) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          error: `Invalid node_type. Must be one of: ${VALID_TYPES.join(", ")}`,
-        });
+      return res.status(400).json({
+        success: false,
+        error: `Invalid node_type. Must be one of: ${VALID_TYPES.join(", ")}`,
+      });
     }
 
     const { data, error } = await supabase
@@ -240,12 +236,10 @@ export const createEdge = async (req, res) => {
     const { source_node_id, target_node_id, condition_label = null } = req.body;
 
     if (!source_node_id || !target_node_id) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          error: "source_node_id and target_node_id are required",
-        });
+      return res.status(400).json({
+        success: false,
+        error: "source_node_id and target_node_id are required",
+      });
     }
 
     const { data, error } = await supabase
@@ -391,10 +385,10 @@ export const getTemplatesForAccount = async (req, res) => {
     const { data, error } = await supabase
       .from("whatsapp_templates")
       .select(
-        "wt_id, name, language, category, components, header_format, variables, buttons, status",
+        "wt_id, name, language, category, components, header_format, variables, buttons, status, is_carousel, carousel_media, preview",
       )
       .eq("account_id", account_id)
-      .eq("status", "approved")
+      .eq("status", "APPROVED")
       .order("name");
 
     if (error) throw error;
