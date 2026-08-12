@@ -2,6 +2,7 @@
 // CRUD for chatbot flows, nodes, edges + session listing
 
 import { supabase } from "../config/supabase.js";
+import crypto from "crypto";
 
 // ─── FLOWS ────────────────────────────────────────────────────────────────────
 
@@ -289,7 +290,7 @@ export const saveFlow = async (req, res) => {
     const { flow_id } = req.params;
     const { nodes = [], edges = [] } = req.body;
 
-    // 1. Delete existing nodes (cascade deletes edges too via FK)
+    // 1. Delete existing nodes for THIS flow (cascade deletes edges too via FK)
     await supabase.from("chatbot_edges").delete().eq("flow_id", flow_id);
     await supabase.from("chatbot_nodes").delete().eq("flow_id", flow_id);
 
@@ -297,15 +298,52 @@ export const saveFlow = async (req, res) => {
       return res.json({ success: true, nodes: [], edges: [] });
     }
 
-    // 2. Insert nodes — keep client-provided node_id so edges can reference them
-    const nodeRows = nodes.map((n) => ({
-      ...(n.node_id ? { node_id: n.node_id } : {}),
-      flow_id,
-      node_type: n.node_type,
-      config: n.config || {},
-      position_x: n.position_x || 0,
-      position_y: n.position_y || 0,
-    }));
+    // 1b. Guard against node_id collisions with OTHER flows. node_id is a
+    // global primary key — if a node was cloned/duplicated from another
+    // flow without a fresh id, inserting it here would either crash (id
+    // still belongs to the other flow) or silently steal it from that flow.
+    // Check which incoming ids already exist elsewhere, and remap those to
+    // brand-new ids before inserting — fixing corrupted/duplicated flows
+    // automatically instead of failing the save.
+    const incomingIds = nodes.map((n) => n.node_id).filter(Boolean);
+    let idRemap = {};
+
+    if (incomingIds.length > 0) {
+      const { data: existingElsewhere, error: checkErr } = await supabase
+        .from("chatbot_nodes")
+        .select("node_id, flow_id")
+        .in("node_id", incomingIds)
+        .neq("flow_id", flow_id);
+
+      if (checkErr) throw checkErr;
+
+      if (existingElsewhere && existingElsewhere.length > 0) {
+        console.warn(
+          `⚠️ saveFlow: ${existingElsewhere.length} node_id(s) already belong to another flow — generating fresh ids`,
+          existingElsewhere.map((r) => r.node_id),
+        );
+        for (const row of existingElsewhere) {
+          idRemap[row.node_id] = crypto.randomUUID();
+        }
+      }
+    }
+
+    // 2. Insert nodes — keep client-provided node_id so edges can reference
+    // them, UNLESS it collided with another flow above, in which case use
+    // the freshly generated id instead.
+    const nodeRows = nodes.map((n) => {
+      const resolvedId = n.node_id
+        ? idRemap[n.node_id] || n.node_id
+        : undefined;
+      return {
+        ...(resolvedId ? { node_id: resolvedId } : {}),
+        flow_id,
+        node_type: n.node_type,
+        config: n.config || {},
+        position_x: n.position_x || 0,
+        position_y: n.position_y || 0,
+      };
+    });
 
     const { data: insertedNodes, error: nodeErr } = await supabase
       .from("chatbot_nodes")
@@ -314,12 +352,13 @@ export const saveFlow = async (req, res) => {
 
     if (nodeErr) throw nodeErr;
 
-    // 3. Insert edges
+    // 3. Insert edges — remap source/target through idRemap so edges still
+    // point at the correct (possibly regenerated) node ids.
     if (edges.length > 0) {
       const edgeRows = edges.map((e) => ({
         flow_id,
-        source_node_id: e.source_node_id,
-        target_node_id: e.target_node_id,
+        source_node_id: idRemap[e.source_node_id] || e.source_node_id,
+        target_node_id: idRemap[e.target_node_id] || e.target_node_id,
         condition_label: e.condition_label || null,
       }));
 
@@ -336,7 +375,11 @@ export const saveFlow = async (req, res) => {
       .update({ updated_at: new Date().toISOString() })
       .eq("flow_id", flow_id);
 
-    return res.json({ success: true, nodes: insertedNodes });
+    return res.json({
+      success: true,
+      nodes: insertedNodes,
+      id_remap: idRemap, // frontend can use this to update its own canvas state if needed
+    });
   } catch (err) {
     console.error("❌ saveFlow:", err);
     return res.status(500).json({ success: false, error: err.message });
