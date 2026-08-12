@@ -317,6 +317,7 @@ async function execSendMessage(
 }
 
 // send_template: send a WhatsApp template message with variable mapping and optional media
+// Now carousel-aware — mirrors the campaign scheduler's carousel handling.
 async function execSendTemplate(
   node,
   variables,
@@ -328,47 +329,255 @@ async function execSendTemplate(
     const {
       template_name,
       template_variable_map = {},
+      carousel_variable_map = {}, // NEW: { "<card_index>": { "<button_index>": "{{var}}" } }
       media_id,
       header_format,
     } = node.config;
 
     if (!template_name) return { advance: true, variables };
 
-    const components = [];
+    // ── Fetch full template row up front (needed for carousel handling) ────
+    const { data: tpl, error: tplErr } = await supabase
+      .from("whatsapp_templates")
+      .select("components, is_carousel, carousel_media, preview")
+      .eq("account_id", account_id)
+      .eq("name", template_name)
+      .maybeSingle();
 
-    /*
-      HEADER MEDIA SUPPORT
-    */
-    if (media_id) {
-      const type = header_format.toLowerCase();
-      components.push({
-        type: "header",
-        parameters: [
-          {
-            type,
-            [type]: { id: media_id },
-          },
-        ],
-      });
+    if (tplErr || !tpl) {
+      console.error(
+        `❌ [Engine] send_template: template "${template_name}" not found for account ${account_id}`,
+      );
+      return { advance: true, variables };
     }
 
-    /*
-      BODY VARIABLES
-    */
-    const mappedVars = Object.entries(template_variable_map).sort(
-      (a, b) => Number(a[0]) - Number(b[0]),
-    );
+    let templateComponents = tpl.components;
+    if (typeof templateComponents === "string") {
+      try {
+        templateComponents = JSON.parse(templateComponents);
+      } catch {
+        templateComponents = [];
+      }
+    }
 
-    if (mappedVars.length > 0) {
-      const bodyParams = mappedVars.map(([pos, varName]) => ({
-        type: "text",
-        text: interpolate(varName, variables) || "",
-      }));
+    const isCarousel = tpl.is_carousel === true;
+    const components = [];
+    let displayText = template_name;
+    let carouselCardsForDisplay = null;
 
-      components.push({
-        type: "body",
-        parameters: bodyParams,
+    if (isCarousel) {
+      // ── CAROUSEL BRANCH ────────────────────────────────────────────────
+      let carouselMedia = tpl.carousel_media;
+      if (typeof carouselMedia === "string") {
+        try {
+          carouselMedia = JSON.parse(carouselMedia);
+        } catch {
+          carouselMedia = [];
+        }
+      }
+      carouselMedia = Array.isArray(carouselMedia) ? carouselMedia : [];
+
+      let preview = tpl.preview;
+      if (typeof preview === "string") {
+        try {
+          preview = JSON.parse(preview);
+        } catch {
+          preview = null;
+        }
+      }
+      const previewCarouselComp = preview?.components?.find(
+        (c) => c.type === "CAROUSEL",
+      );
+
+      const carouselComp = templateComponents.find(
+        (c) => c.type === "CAROUSEL",
+      );
+      if (!carouselComp || !Array.isArray(carouselComp.cards)) {
+        console.error(
+          `❌ [Engine] send_template: template "${template_name}" is flagged is_carousel but has no CAROUSEL component`,
+        );
+        return { advance: true, variables };
+      }
+
+      // Body — resolve {{n}} against session variables via interpolate()
+      const bodyDef = templateComponents.find((c) => c.type === "BODY");
+      const mappedBodyVars = Object.entries(template_variable_map).sort(
+        (a, b) => Number(a[0]) - Number(b[0]),
+      );
+      const resolvedBodyValues = {};
+      if (mappedBodyVars.length > 0) {
+        mappedBodyVars.forEach(([pos, varRef]) => {
+          resolvedBodyValues[pos] = interpolate(varRef, variables) || "";
+        });
+        components.push({
+          type: "body",
+          parameters: Object.values(resolvedBodyValues).map((v) => ({
+            type: "text",
+            text: String(v),
+          })),
+        });
+      }
+
+      // Cards
+      const cardsPayload = [];
+      const displayCards = [];
+
+      carouselComp.cards.forEach((card, cardIndex) => {
+        const mediaEntry = carouselMedia.find(
+          (m) => m.card_index === cardIndex,
+        );
+        const cardComponents = [];
+
+        const headerDef = card.components.find((c) => c.type === "HEADER");
+        if (headerDef) {
+          if (!mediaEntry || !mediaEntry.media_id) {
+            console.error(
+              `❌ [Engine] send_template: no uploaded media_id for carousel card_index ${cardIndex} on template "${template_name}"`,
+            );
+            return; // skip this card's header, but keep going — matches upstream throw-on-missing intent without crashing whole flow
+          }
+          const format = (
+            headerDef.format ||
+            mediaEntry.header_format ||
+            "IMAGE"
+          ).toLowerCase();
+          cardComponents.push({
+            type: "header",
+            parameters: [
+              { type: format, [format]: { id: mediaEntry.media_id } },
+            ],
+          });
+        }
+
+        const cardBodyDef = card.components.find((c) => c.type === "BODY");
+        if (cardBodyDef) {
+          cardComponents.push({
+            type: "body",
+            parameters: [{ type: "text", text: cardBodyDef.text || "" }],
+          });
+        }
+
+        const buttonsDef = card.components.find((c) => c.type === "BUTTONS");
+        const resolvedButtonsForDisplay = [];
+        if (buttonsDef && Array.isArray(buttonsDef.buttons)) {
+          const cardVarMap = carousel_variable_map[String(cardIndex)] || {};
+          buttonsDef.buttons.forEach((btn, btnIndex) => {
+            const type = (btn.type || "").toUpperCase();
+            const varRef = cardVarMap[String(btnIndex)];
+
+            if (type === "URL" && btn.url && btn.url.includes("{{")) {
+              const resolvedValue = varRef
+                ? interpolate(varRef, variables)
+                : "";
+              cardComponents.push({
+                type: "button",
+                sub_type: "url",
+                index: String(btnIndex),
+                parameters: [{ type: "text", text: String(resolvedValue) }],
+              });
+              resolvedButtonsForDisplay.push({
+                ...btn,
+                resolved_value: resolvedValue,
+              });
+            } else if (type === "QUICK_REPLY") {
+              const payload =
+                (varRef && interpolate(varRef, variables)) ||
+                `card-${cardIndex}-btn-${btnIndex}`;
+              cardComponents.push({
+                type: "button",
+                sub_type: "quick_reply",
+                index: String(btnIndex),
+                parameters: [{ type: "payload", payload }],
+              });
+              resolvedButtonsForDisplay.push({ ...btn, resolved_value: null });
+            } else {
+              resolvedButtonsForDisplay.push({ ...btn, resolved_value: null });
+            }
+          });
+        }
+
+        cardsPayload.push({
+          card_index: cardIndex,
+          components: cardComponents,
+        });
+
+        const previewCard = previewCarouselComp?.cards?.[cardIndex];
+        const previewImageUrl = previewCard?.components?.find(
+          (c) => c.type === "HEADER",
+        )?.example?.header_handle?.[0];
+
+        displayCards.push({
+          card_index: cardIndex,
+          media_id: mediaEntry?.media_id || null,
+          header_format: mediaEntry?.header_format || null,
+          preview_image_url: previewImageUrl || null,
+          body_text: cardBodyDef?.text || null,
+          buttons: resolvedButtonsForDisplay,
+        });
       });
+
+      components.push({ type: "carousel", cards: cardsPayload });
+      carouselCardsForDisplay = displayCards;
+
+      // Build display text with resolved body vars substituted in
+      const rawBodyText = bodyDef?.text || template_name;
+      displayText = rawBodyText.replace(/\{\{(\d+)\}\}/g, (match, num) => {
+        const val = resolvedBodyValues[num];
+        return val !== undefined && val !== "" ? String(val) : match;
+      });
+    } else {
+      // ── EXISTING NON-CAROUSEL LOGIC — UNCHANGED ─────────────────────────
+      if (media_id) {
+        if (!header_format) {
+          console.error(
+            `❌ [Engine] send_template: template "${template_name}" has media_id but no header_format configured on the node — skipping send`,
+          );
+          return { advance: true, variables };
+        }
+        const type = header_format.toLowerCase();
+        components.push({
+          type: "header",
+          parameters: [
+            {
+              type,
+              [type]: { id: media_id },
+            },
+          ],
+        });
+      } else {
+        // NEW: catch the exact failure mode from the logs — template needs a
+        // media header but the node has no media_id configured, so instead of
+        // silently sending a headerless payload (which Meta rejects with
+        // 132012), fail clearly here before ever calling the API.
+        const headerDef = templateComponents.find((c) => c.type === "HEADER");
+        if (
+          headerDef &&
+          ["IMAGE", "VIDEO", "DOCUMENT"].includes(
+            (headerDef.format || "").toUpperCase(),
+          )
+        ) {
+          console.error(
+            `❌ [Engine] send_template: template "${template_name}" requires ${headerDef.format} media but node has no media_id configured — skipping send. Set media_id in this send_template node's config.`,
+          );
+          return { advance: true, variables };
+        }
+      }
+
+      const mappedVars = Object.entries(template_variable_map).sort(
+        (a, b) => Number(a[0]) - Number(b[0]),
+      );
+
+      if (mappedVars.length > 0) {
+        const bodyParams = mappedVars.map(([pos, varName]) => ({
+          type: "text",
+          text: interpolate(varName, variables) || "",
+        }));
+
+        components.push({
+          type: "body",
+          parameters: bodyParams,
+        });
+      }
     }
 
     const { data: acc } = await supabase
@@ -407,10 +616,7 @@ async function execSendTemplate(
     const result = await response.json();
 
     if (!response.ok) {
-      console.error(
-        "❌ execSendTemplate send failed:",
-        JSON.stringify(result),
-      );
+      console.error("❌ execSendTemplate send failed:", JSON.stringify(result));
     } else {
       console.log("✅ Template sent:", template_name);
     }
@@ -424,23 +630,31 @@ async function execSendTemplate(
     });
 
     // ── Save to chat dashboard ─────────────────────────────────────────────
-    const { data: tpl } = await supabase
-      .from("whatsapp_templates")
-      .select("components")
-      .eq("account_id", account_id)
-      .eq("name", template_name)
-      .maybeSingle();
-
-    const renderedText =
-      (tpl && renderTemplateBody(tpl, components)) || template_name;
+    if (!isCarousel) {
+      const renderedText =
+        (tpl && renderTemplateBody(tpl, components)) || template_name;
+      displayText = renderedText;
+    }
 
     await saveBotMessage(
       chat_id,
-      renderedText,
-      "template",
-      media_id || null,
+      displayText,
+      isCarousel ? "template_carousel" : "template",
+      isCarousel ? null : media_id || null,
       wm_id,
     );
+
+    // For carousel, saveBotMessage doesn't currently accept carousel_cards —
+    // write it directly since the helper's signature is fixed elsewhere.
+    // Guard against wm_id being null (failed send) — updating on a null
+    // wm_id would match every null-wm_id row in this chat, not just this one.
+    if (isCarousel && wm_id) {
+      await supabase
+        .from("messages")
+        .update({ carousel_cards: carouselCardsForDisplay })
+        .eq("wm_id", wm_id)
+        .eq("chat_id", chat_id);
+    }
   } catch (err) {
     console.error("❌ execSendTemplate error:", err.message);
   }
