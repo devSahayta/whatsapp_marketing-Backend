@@ -3,7 +3,6 @@
 
 import { supabase } from "../config/supabase.js";
 import crypto from "crypto";
-
 // ─── FLOWS ────────────────────────────────────────────────────────────────────
 
 /** POST /api/chatbot/flows */
@@ -298,14 +297,25 @@ export const saveFlow = async (req, res) => {
       return res.json({ success: true, nodes: [], edges: [] });
     }
 
-    // 1b. Guard against node_id collisions with OTHER flows. node_id is a
-    // global primary key — if a node was cloned/duplicated from another
-    // flow without a fresh id, inserting it here would either crash (id
-    // still belongs to the other flow) or silently steal it from that flow.
-    // Check which incoming ids already exist elsewhere, and remap those to
-    // brand-new ids before inserting — fixing corrupted/duplicated flows
-    // automatically instead of failing the save.
-    const incomingIds = nodes.map((n) => n.node_id).filter(Boolean);
+    // Dedup the incoming array itself first — if the same node_id appears
+    // twice in one save request (stale canvas state, duplicate-flow leftover,
+    // etc.), a bulk insert with two rows sharing a primary key fails
+    // regardless of any cross-flow remap logic below. Keep the LAST
+    // occurrence of each id, since that reflects the most recent edit.
+    const seenIds = new Map();
+    nodes.forEach((n, idx) => {
+      if (n.node_id) seenIds.set(n.node_id, idx);
+    });
+    const dedupedNodes = nodes.filter(
+      (n, idx) => !n.node_id || seenIds.get(n.node_id) === idx,
+    );
+    if (dedupedNodes.length !== nodes.length) {
+      console.warn(
+        `⚠️ saveFlow: removed ${nodes.length - dedupedNodes.length} duplicate node_id(s) within the same save request`,
+      );
+    }
+
+    const incomingIds = dedupedNodes.map((n) => n.node_id).filter(Boolean);
     let idRemap = {};
 
     if (incomingIds.length > 0) {
@@ -331,7 +341,7 @@ export const saveFlow = async (req, res) => {
     // 2. Insert nodes — keep client-provided node_id so edges can reference
     // them, UNLESS it collided with another flow above, in which case use
     // the freshly generated id instead.
-    const nodeRows = nodes.map((n) => {
+    const nodeRows = dedupedNodes.map((n) => {
       const resolvedId = n.node_id
         ? idRemap[n.node_id] || n.node_id
         : undefined;
