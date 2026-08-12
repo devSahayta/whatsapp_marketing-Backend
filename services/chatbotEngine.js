@@ -534,8 +534,8 @@ async function execSendTemplate(
       components.push({ type: "carousel", cards: cardsPayload });
       carouselCardsForDisplay = displayCards;
 
-      components.push({ type: "carousel", cards: cardsPayload });
-      carouselCardsForDisplay = displayCards;
+      // components.push({ type: "carousel", cards: cardsPayload });
+      // carouselCardsForDisplay = displayCards;
 
       // Build display text with resolved body vars substituted in
       const rawBodyText = bodyDef?.text || template_name;
