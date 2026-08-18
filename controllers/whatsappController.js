@@ -532,7 +532,10 @@ export const handleIncomingMessage = async (req, res) => {
       // Check if the active flow is still active before resuming session
       let shouldResume = false;
 
-      if (chatRow.mode === "BOT" && chatRow.active_flow_id) {
+      if (
+        (chatRow.mode === "BOT" || chatRow.mode === "AI") &&
+        chatRow.active_flow_id
+      ) {
         const { data: activeFlow } = await supabase
           .from("chatbot_flows")
           .select("status")
