@@ -106,6 +106,37 @@ export const updateFlow = async (req, res) => {
       .single();
 
     if (error) throw error;
+
+    // NEW: if the flow was just turned off, close out any active sessions
+    // and free up the chats they were occupying so new triggers can fire.
+    if (status && status !== "active") {
+      const { error: sessionErr } = await supabase
+        .from("chatbot_sessions")
+        .update({ status: "completed", updated_at: new Date().toISOString() })
+        .eq("flow_id", flow_id)
+        .in("status", ["active", "handed_off"]);
+
+      if (sessionErr) {
+        console.error(
+          "❌ updateFlow: failed to close sessions:",
+          sessionErr.message,
+        );
+      }
+
+      const { error: chatErr } = await supabase
+        .from("chats")
+        .update({ mode: "AI", active_flow_id: null })
+        .eq("active_flow_id", flow_id);
+
+      if (chatErr) {
+        console.error("❌ updateFlow: failed to reset chats:", chatErr.message);
+      }
+
+      console.log(
+        `🔌 [Flow] Deactivated ${flow_id} — closed sessions and reset chats`,
+      );
+    }
+
     return res.json({ success: true, flow: data });
   } catch (err) {
     console.error("❌ updateFlow:", err);
@@ -448,6 +479,104 @@ export const getTemplatesForAccount = async (req, res) => {
     return res.json({ success: true, templates: data });
   } catch (err) {
     console.error("❌ getTemplatesForAccount:", err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+};
+
+/** GET /api/chatbot/flows/:flow_id/keyword-conflicts
+ *  Checks if this flow's trigger keywords collide with:
+ *  (a) another currently-active flow's trigger keywords, or
+ *  (b) the exit_keywords of the ai_agent this flow uses.
+ *  Call this before activating a flow from the UI.
+ */
+export const checkKeywordConflicts = async (req, res) => {
+  try {
+    const { flow_id } = req.params;
+
+    const { data: thisFlow } = await supabase
+      .from("chatbot_flows")
+      .select("account_id")
+      .eq("flow_id", flow_id)
+      .single();
+
+    if (!thisFlow) {
+      return res.status(404).json({ success: false, error: "Flow not found" });
+    }
+
+    const { data: myNodes } = await supabase
+      .from("chatbot_nodes")
+      .select("node_type, config")
+      .eq("flow_id", flow_id);
+
+    const myTrigger = myNodes?.find((n) => n.node_type === "keyword_trigger");
+    const myKeywords = (myTrigger?.config?.keywords || []).map((k) =>
+      k.toUpperCase(),
+    );
+    const myAgentNode = myNodes?.find((n) => n.node_type === "ai_agent");
+
+    const conflicts = [];
+
+    // (a) other active flows with overlapping trigger keywords
+    if (myKeywords.length > 0) {
+      const { data: otherFlows } = await supabase
+        .from("chatbot_flows")
+        .select("flow_id, name")
+        .eq("account_id", thisFlow.account_id)
+        .eq("status", "active")
+        .neq("flow_id", flow_id);
+
+      if (otherFlows?.length) {
+        const otherFlowIds = otherFlows.map((f) => f.flow_id);
+        const { data: otherTriggers } = await supabase
+          .from("chatbot_nodes")
+          .select("flow_id, config")
+          .in("flow_id", otherFlowIds)
+          .eq("node_type", "keyword_trigger");
+
+        for (const t of otherTriggers || []) {
+          const theirKeywords = (t.config?.keywords || []).map((k) =>
+            k.toUpperCase(),
+          );
+          const shared = myKeywords.filter((k) => theirKeywords.includes(k));
+          if (shared.length) {
+            const flowName = otherFlows.find(
+              (f) => f.flow_id === t.flow_id,
+            )?.name;
+            conflicts.push({
+              type: "flow_keyword_overlap",
+              flow_id: t.flow_id,
+              flow_name: flowName,
+              shared_keywords: shared,
+            });
+          }
+        }
+      }
+    }
+
+    // (b) this flow's own agent's exit_keywords overlapping its trigger keywords
+    if (myAgentNode?.config?.agent_id && myKeywords.length > 0) {
+      const { data: agent } = await supabase
+        .from("chatbot_agents")
+        .select("name, exit_keywords")
+        .eq("agent_id", myAgentNode.config.agent_id)
+        .single();
+
+      const exitKeywords = (agent?.exit_keywords || []).map((k) =>
+        k.toUpperCase(),
+      );
+      const shared = myKeywords.filter((k) => exitKeywords.includes(k));
+      if (shared.length) {
+        conflicts.push({
+          type: "agent_exit_keyword_overlap",
+          agent_name: agent?.name,
+          shared_keywords: shared,
+        });
+      }
+    }
+
+    return res.json({ success: true, conflicts });
+  } catch (err) {
+    console.error("❌ checkKeywordConflicts:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 };
