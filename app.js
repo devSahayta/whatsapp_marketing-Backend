@@ -30,6 +30,7 @@ import chatbotRoutes from "./routes/chatbotRoutes.js";
 
 import woocommerceRoutes from "./routes/woocommerceRoutes.js";
 import woocommerceWebhookRoutes from "./routes/woocommerceWebhookRoutes.js";
+import shopifyRoutes from "./routes/shopifyRoutes.js";
 import apiKeyRoutes from "./routes/apiKeyRoutes.js";
 import publicApiRoutes from "./routes/publicApiRoutes.js";
 import notificationRoutes from "./routes/notificationRoutes.js";
@@ -91,6 +92,9 @@ app.use("/api/warmup", WarmupRoute);
 //routes for woocommerce integration
 app.use("/api/woocommerce", woocommerceRoutes);
 app.use("/webhooks/woocommerce", woocommerceWebhookRoutes);
+
+//routes for shopify integration
+app.use("/api/shopify", shopifyRoutes);
 //google integration routes
 app.use("/api/integrations/google", googleRoutes);
 
