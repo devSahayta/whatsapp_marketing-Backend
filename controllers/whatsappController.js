@@ -3,6 +3,7 @@
 import dotenv from "dotenv";
 dotenv.config();
 import axios from "axios";
+import { waitUntil } from "@vercel/functions";
 import {
   sendWhatsAppTextMessage,
   fetchMediaUrl,
@@ -22,7 +23,42 @@ import { markCodOrderConfirmed } from "./woocommerceController.js";
    Forward incoming messages to any external app that has registered a
    webhook_url on their API key for this WhatsApp account.
    Runs fire-and-forget — never blocks the main webhook response.
+
+   UPDATED: now retries with backoff (3 attempts: immediate, +1s, +2s)
+   instead of giving up after a single failed POST. Previously, if a
+   receiving endpoint was slow once (cold start, a busy moment — anything
+   transient), that single forward attempt was simply lost: logged as an
+   error and never retried by anything in this codebase. This made a
+   one-off slow response indistinguishable from a permanently dead
+   endpoint. Retrying gives transient slowness a real chance to succeed
+   without needing the receiving endpoint to always respond in under
+   10s on the very first try. Still entirely fire-and-forget from the
+   caller's perspective — forwardToApiWebhooks itself is never awaited
+   by handleIncomingMessage, so this adds resilience without adding any
+   latency to the webhook response Meta/Samvaadik itself receives.
    ─────────────────────────────────────────────────────────────────────────── */
+async function postWithRetry(url, payload, attempts = 3) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await axios.post(url, payload, {
+        headers: { "Content-Type": "application/json" },
+        timeout: 10000,
+      });
+      return true;
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts - 1) {
+        // backoff: 1s, then 2s — short enough this still finishes well
+        // within a few seconds even in the worst case, since this whole
+        // thing already runs fire-and-forget and isn't blocking anything.
+        await new Promise((r) => setTimeout(r, 1000 * 2 ** i));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 async function forwardToApiWebhooks(account_id, payload) {
   try {
     const { data: apiKeys } = await supabase
@@ -35,11 +71,7 @@ async function forwardToApiWebhooks(account_id, payload) {
     if (!apiKeys?.length) return;
 
     for (const key of apiKeys) {
-      axios
-        .post(key.webhook_url, payload, {
-          headers: { "Content-Type": "application/json" },
-          timeout: 10000,
-        })
+      postWithRetry(key.webhook_url, payload)
         .then(() => {
           console.log(
             `✅ Webhook forwarded to [${key.key_name}]: ${key.webhook_url}`,
@@ -47,7 +79,7 @@ async function forwardToApiWebhooks(account_id, payload) {
         })
         .catch((err) => {
           console.error(
-            `❌ Webhook forward failed for [${key.key_name}]:`,
+            `❌ Webhook forward failed for [${key.key_name}] after retries:`,
             err.message,
           );
         });
@@ -194,141 +226,25 @@ export const verifyWebhook = (req, res) => {
   return res.sendStatus(400);
 };
 
-/* ---------------------------
-   🔹 MAIN WEBHOOK HANDLER
-   --------------------------- */
-export const handleIncomingMessage = async (req, res) => {
-  console.log("🔹 FULL WHATSAPP PAYLOAD:", JSON.stringify(req.body, null, 2));
-
-  const change = req.body.entry?.[0]?.changes?.[0];
-  const value = change?.value;
-
-  const wabaId = req.body.entry?.[0]?.id;
-  const phoneNumberId = value?.metadata?.phone_number_id;
-
-  if (change?.field === "message_template_status_update") {
-    try {
-      await handleTemplateStatusUpdate(wabaId, value);
-    } catch (err) {
-      console.error("Template status webhook handler error:", err);
-    }
-    return res.sendStatus(200);
-  }
-
-  if (!wabaId || !phoneNumberId) {
-    console.error("❌ Missing WABA ID or phone_number_id");
-    return res.sendStatus(200);
-  }
-
-  // if (value?.statuses) {
-  //   console.log("ℹ️ Status notification received:", value.statuses[0]?.status);
-  //   return res.sendStatus(200);
-  // }
-
-  if (value?.statuses) {
-    for (const statusObj of value.statuses) {
-      const waMessageId = statusObj.id;
-      const status = statusObj.status; // sent | delivered | read
-      const timestamp = new Date(Number(statusObj.timestamp) * 1000);
-
-      console.log("📌 WA Status Update:", waMessageId, status);
-
-      const updateData = {
-        status,
-      };
-
-      if (status === "sent") updateData.sent_at = timestamp;
-      if (status === "delivered") updateData.delivered_at = timestamp;
-      if (status === "read") updateData.read_at = timestamp;
-      if (status === "failed") updateData.failed_at = timestamp;
-
-      if (statusObj.errors && statusObj.errors.length > 0) {
-        const err = statusObj.errors[0];
-
-        updateData.error_code = err.code || "unknown_error";
-
-        updateData.error_message =
-          err.message ||
-          err?.error_data?.details ||
-          err?.title ||
-          "Unknown error";
-      }
-
-      // new logic to also update campaign_messages when whatsapp_messages is updated
-      const { data: updatedMsg, error } = await supabase
-        .from("whatsapp_messages")
-        .update(updateData)
-        .eq("wa_message_id", waMessageId)
-        .select("wm_id")
-        .maybeSingle();
-
-      if (error) {
-        console.error("❌ Failed to update message status:", error);
-      }
-
-      console.log({ updatedMsg });
-
-      // 🔹 NEW: log this status event into whatsapp_status_events so the
-      // sync scheduler/cron can pick it up and propagate it to whichever
-      // tables need it (campaign_messages, scheduled_messages, etc.)
-      // instead of us having to hardcode every table update right here.
-      const { error: eventError } = await supabase
-        .from("whatsapp_status_events")
-        .insert({
-          wm_id: updatedMsg?.wm_id || null,
-          wa_message_id: waMessageId,
-          status,
-          event_at: timestamp,
-          error_code: updateData.error_code || null,
-          error_message: updateData.error_message || null,
-        });
-
-      if (eventError) {
-        console.error(
-          "❌ Failed to insert whatsapp_status_events:",
-          eventError,
-        );
-      }
-
-      // if (updatedMsg?.wm_id) {
-      //   // 🔹 ALSO UPDATE CAMPAIGN MESSAGE
-      //   const { data: campaignMsg, error: cmError } = await supabase
-      //     .from("campaign_messages")
-      //     .update({
-      //       status: status,
-      //       delivered_at: updateData.delivered_at || undefined,
-      //       read_at: updateData.read_at || undefined,
-      //       sent_at: updateData.sent_at || undefined,
-      //       failed_at: updateData.failed_at || undefined,
-      //       error_code: updateData.error_code || undefined,
-      //       error_message: updateData.error_message || undefined,
-      //       updated_at: new Date().toISOString(),
-      //     })
-      //     .eq("wm_id", updatedMsg.wm_id);
-
-      //   if (cmError) {
-      //     console.error("❌ Failed to update campaign message:", cmError);
-      //   }
-
-      //   console.log(
-      //     campaignMsg
-      //       ? { campaignMsg }
-      //       : `No campaign message linked to this WhatsApp message`,
-      //   );
-      // }
-    }
-
-    return res.sendStatus(200);
-  }
-
-  if (!value?.messages) {
-    console.log("⚠️ No messages field in webhook (not a user message)");
-    return res.sendStatus(200);
-  }
-
+/* ─── Incoming user-message processing ─────────────────────────────────────
+   UPDATED: extracted out of handleIncomingMessage unchanged (this is a
+   straight cut-and-paste of the exact same logic that used to run inline,
+   including the exact same bugs/TODOs/comments already in it — nothing
+   about WHAT it does has changed, only WHEN it runs relative to the HTTP
+   response). handleIncomingMessage now responds 200 immediately once it
+   has validated the payload, then hands this function to Vercel's
+   waitUntil() to run in the background. This is what actually fixes the
+   delay: previously, Meta/Samvaadik's forwarder waited for this ENTIRE
+   function (media download, DB writes, bot engine calls, webhook forward)
+   to finish before getting its 200 back — easily exceeding a 10s timeout
+   and triggering the retry/backoff cycle that was producing multi-minute
+   delays. Now the 200 is sent before any of this runs, so the forwarder
+   is never waiting on it.
+   ───────────────────────────────────────────────────────────────────────── */
+async function processIncomingUserMessage(reqBody, value, wabaId, phoneNumberId) {
   try {
     const message = value?.messages?.[0];
-    if (!message) return res.sendStatus(200);
+    if (!message) return;
 
     const from = message.from.trim();
     let userText = message.text?.body?.trim() || "";
@@ -393,7 +309,7 @@ export const handleIncomingMessage = async (req, res) => {
         wabaId,
         phoneNumberId,
       });
-      return res.sendStatus(200);
+      return;
     }
 
     let storedMediaPath = mediaId || null;
@@ -591,22 +507,178 @@ export const handleIncomingMessage = async (req, res) => {
       }
       // ─────────────────────────────────────────────────────────────────────
     }
+  } catch (err) {
+    // This used to be caught by the outer handler's try/catch, which then
+    // returned res.sendStatus(500) — but by the time this runs now, the
+    // response has ALREADY been sent (200), so there's no response left to
+    // send an error on. Logging is the correct behavior here: Meta/Samvaadik
+    // already got their ack, a 500 at this point wouldn't reach anyone
+    // meaningfully anyway, and the whole point of moving this to the
+    // background was to stop tying processing failures to the webhook
+    // response in the first place.
+    console.error("❌ Background message processing error:", err);
+  }
+}
 
-    // // MESSAGE SAVING — use real userText + media_path
-    // await chatCtrl.saveMessage({
-    //   chat_id: chatRow.chat_id,
-    //   sender_type: "user",
-    //   message:
-    //     userText || (storedMediaPath ? `[${message.type.toUpperCase()}]` : ""),
-    //   message_type: message.type || "text",
-    //   media_path: storedMediaPath,
-    // });
+/* ---------------------------
+   🔹 MAIN WEBHOOK HANDLER
+   --------------------------- */
+export const handleIncomingMessage = async (req, res) => {
+  console.log("🔹 FULL WHATSAPP PAYLOAD:", JSON.stringify(req.body, null, 2));
+
+  const change = req.body.entry?.[0]?.changes?.[0];
+  const value = change?.value;
+
+  const wabaId = req.body.entry?.[0]?.id;
+  const phoneNumberId = value?.metadata?.phone_number_id;
+
+  // Template status updates and message status updates (sent/delivered/read)
+  // are UNCHANGED below — they were not the reported problem, and touching
+  // paths that aren't broken just to be "consistent" adds risk for no
+  // benefit. Only the actual incoming-user-message path (below) is
+  // restructured.
+
+  if (change?.field === "message_template_status_update") {
+    try {
+      await handleTemplateStatusUpdate(wabaId, value);
+    } catch (err) {
+      console.error("Template status webhook handler error:", err);
+    }
+    return res.sendStatus(200);
+  }
+
+  if (!wabaId || !phoneNumberId) {
+    console.error("❌ Missing WABA ID or phone_number_id");
+    return res.sendStatus(200);
+  }
+
+  // if (value?.statuses) {
+  //   console.log("ℹ️ Status notification received:", value.statuses[0]?.status);
+  //   return res.sendStatus(200);
+  // }
+
+  if (value?.statuses) {
+    for (const statusObj of value.statuses) {
+      const waMessageId = statusObj.id;
+      const status = statusObj.status; // sent | delivered | read
+      const timestamp = new Date(Number(statusObj.timestamp) * 1000);
+
+      console.log("📌 WA Status Update:", waMessageId, status);
+
+      const updateData = {
+        status,
+      };
+
+      if (status === "sent") updateData.sent_at = timestamp;
+      if (status === "delivered") updateData.delivered_at = timestamp;
+      if (status === "read") updateData.read_at = timestamp;
+      if (status === "failed") updateData.failed_at = timestamp;
+
+      if (statusObj.errors && statusObj.errors.length > 0) {
+        const err = statusObj.errors[0];
+
+        updateData.error_code = err.code || "unknown_error";
+
+        updateData.error_message =
+          err.message ||
+          err?.error_data?.details ||
+          err?.title ||
+          "Unknown error";
+      }
+
+      // new logic to also update campaign_messages when whatsapp_messages is updated
+      const { data: updatedMsg, error } = await supabase
+        .from("whatsapp_messages")
+        .update(updateData)
+        .eq("wa_message_id", waMessageId)
+        .select("wm_id")
+        .maybeSingle();
+
+      if (error) {
+        console.error("❌ Failed to update message status:", error);
+      }
+
+      console.log({ updatedMsg });
+
+      // 🔹 NEW: log this status event into whatsapp_status_events so the
+      // sync scheduler/cron can pick it up and propagate it to whichever
+      // tables need it (campaign_messages, scheduled_messages, etc.)
+      // instead of us having to hardcode every table update right here.
+      const { error: eventError } = await supabase
+        .from("whatsapp_status_events")
+        .insert({
+          wm_id: updatedMsg?.wm_id || null,
+          wa_message_id: waMessageId,
+          status,
+          event_at: timestamp,
+          error_code: updateData.error_code || null,
+          error_message: updateData.error_message || null,
+        });
+
+      if (eventError) {
+        console.error(
+          "❌ Failed to insert whatsapp_status_events:",
+          eventError,
+        );
+      }
+
+      // if (updatedMsg?.wm_id) {
+      //   // 🔹 ALSO UPDATE CAMPAIGN MESSAGE
+      //   const { data: campaignMsg, error: cmError } = await supabase
+      //     .from("campaign_messages")
+      //     .update({
+      //       status: status,
+      //       delivered_at: updateData.delivered_at || undefined,
+      //       read_at: updateData.read_at || undefined,
+      //       sent_at: updateData.sent_at || undefined,
+      //       failed_at: updateData.failed_at || undefined,
+      //       error_code: updateData.error_code || undefined,
+      //       error_message: updateData.error_message || undefined,
+      //       updated_at: new Date().toISOString(),
+      //     })
+      //     .eq("wm_id", updatedMsg.wm_id);
+
+      //   if (cmError) {
+      //     console.error("❌ Failed to update campaign message:", cmError);
+      //   }
+
+      //   console.log(
+      //     campaignMsg
+      //       ? { campaignMsg }
+      //       : `No campaign message linked to this WhatsApp message`,
+      //   );
+      // }
+    }
 
     return res.sendStatus(200);
-  } catch (err) {
-    console.error("❌ Webhook Handler Error:", err);
-    return res.sendStatus(500);
   }
+
+  if (!value?.messages) {
+    console.log("⚠️ No messages field in webhook (not a user message)");
+    return res.sendStatus(200);
+  }
+
+  // ── THE ACTUAL FIX ──────────────────────────────────────────────────────
+  // Everything needed to validate this is a real, processable message has
+  // already happened above (entry/changes/value/wabaId/phoneNumberId/
+  // messages all confirmed present). From here on, nothing that follows
+  // needs to complete before Meta/Samvaadik gets its 200 — so send it now,
+  // then hand the real work to waitUntil().
+  //
+  // Why waitUntil() specifically, and not just "call the function without
+  // awaiting it": this handler runs on Vercel serverless
+  // (whatsapp-marketing-backend.vercel.app). Vercel can freeze or tear down
+  // a serverless function's execution shortly after its response is sent,
+  // UNLESS the platform is explicitly told there's still pending work.
+  // waitUntil() is exactly that signal — it keeps the function instance
+  // alive until the passed promise settles, without holding up the HTTP
+  // response itself. Without it, processIncomingUserMessage below could be
+  // silently killed mid-execution (mid DB-write, mid bot-engine call) on
+  // some fraction of invocations, which would be a strictly worse failure
+  // mode than the current delay — messages would sometimes just never
+  // finish processing, with nothing obviously erroring.
+  res.sendStatus(200);
+  waitUntil(processIncomingUserMessage(req.body, value, wabaId, phoneNumberId));
 };
 
 /* ---------------------------
