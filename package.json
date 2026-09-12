@@ -18,6 +18,7 @@
     "@kinde-oss/kinde-node-express": "^1.6.0",
     "@kinde-oss/kinde-nodejs-sdk": "^1.2.4",
     "@supabase/supabase-js": "^2.79.0",
+    "@vercel/functions": "^3.9.7",
     "axios": "^1.12.2",
     "canvas": "^3.2.0",
     "cors": "^2.8.5",
