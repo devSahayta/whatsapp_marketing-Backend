@@ -11,6 +11,7 @@
 //   POST  /v1/messages/template
 //   POST  /v1/messages/text
 //   POST  /v1/messages/interactive
+//   POST  /v1/messages/typing-indicator
 //   POST  /v1/messages/schedule
 //   GET   /v1/messages/schedule              — list scheduled messages (status/phone filter)
 //   GET   /v1/messages/schedule/:sm_id       — get a scheduled message's status
@@ -29,6 +30,7 @@ import {
   sendTemplateMessage,
   sendTextMessage,
   sendInteractiveMessage,
+  sendTypingIndicator,
   scheduleTemplateMessage,
   getScheduledMessageStatus,
   listScheduledMessages,
@@ -224,6 +226,13 @@ router.post(
   "/messages/interactive",
   scopeGuard("send_message"),
   sendInteractiveMessage,
+);
+
+// POST /v1/messages/typing-indicator
+router.post(
+  "/messages/typing-indicator",
+  scopeGuard("send_message"),
+  sendTypingIndicator,
 );
 
 // POST /v1/messages/schedule  — schedule a template for a future datetime

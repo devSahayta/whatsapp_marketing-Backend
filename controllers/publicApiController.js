@@ -41,6 +41,77 @@ function graphHeaders(token) {
   };
 }
 
+/**
+ * Mirror an outbound API message into the chats/messages tables so it shows
+ * up in the Samvaadik inbox, same as messages sent from the dashboard
+ * (see adminChatController.js). Finds the chat for (phone, user_id), creates
+ * it if missing, refreshes the chat preview, then logs the message row.
+ * Best-effort — a failure here must not fail the send API response.
+ */
+async function logOutboundMessage({
+  user_id,
+  phone,
+  message_text,
+  message_type,
+  wm_id,
+  media_path = null,
+  buttons = null,
+  sender_type = "admin",
+}) {
+  try {
+    const { data: existingChat } = await supabase
+      .from("chats")
+      .select("chat_id")
+      .eq("phone_number", phone)
+      .eq("user_id", user_id)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    let chat_id = existingChat?.chat_id;
+
+    if (!chat_id) {
+      const { data: newChat, error: chatErr } = await supabase
+        .from("chats")
+        .insert({
+          user_id,
+          phone_number: phone,
+          person_name: phone,
+          last_message: message_text,
+          last_message_at: new Date().toISOString(),
+          last_sender_type: sender_type,
+          status: "active",
+        })
+        .select("chat_id")
+        .single();
+
+      if (chatErr) throw chatErr;
+      chat_id = newChat.chat_id;
+    } else {
+      await supabase
+        .from("chats")
+        .update({
+          last_message: message_text,
+          last_message_at: new Date().toISOString(),
+          last_sender_type: sender_type,
+        })
+        .eq("chat_id", chat_id);
+    }
+
+    await supabase.from("messages").insert({
+      chat_id,
+      sender_type,
+      message: message_text,
+      message_type,
+      wm_id: wm_id || null,
+      media_path,
+      buttons,
+    });
+  } catch (err) {
+    console.error("logOutboundMessage error:", err.message || err);
+  }
+}
+
 /* ─── GET /v1/account ────────────────────────────────────────────────────── */
 
 export const getAccount = async (req, res) => {
@@ -98,6 +169,7 @@ export const getTemplates = async (req, res) => {
     "language": "en_US",           // optional, default en_US
     "parameters": ["John", "7 days"], // body text parameters in order
     "header_media_id": "abc123"    // optional — if template has media header
+    "sender_type": "admin"         // optional, default "admin"
   }
 */
 
@@ -110,6 +182,7 @@ export const sendTemplateMessage = async (req, res) => {
       language = "en_US",
       parameters = [],
       header_media_id,
+      sender_type = "admin",
     } = req.body;
 
     if (!phone || !template_name) {
@@ -122,7 +195,7 @@ export const sendTemplateMessage = async (req, res) => {
     // Fetch template from DB to get header_format
     const { data: template } = await supabase
       .from("whatsapp_templates")
-      .select("name, language, header_format, media_id")
+      .select("name, language, header_format, media_id, components, buttons")
       .eq("account_id", wa_id)
       .eq("name", template_name)
       .maybeSingle();
@@ -132,6 +205,16 @@ export const sendTemplateMessage = async (req, res) => {
     // Build header component if template has media
     const mediaId = header_media_id || template?.media_id;
     const headerFormat = template?.header_format?.toUpperCase();
+
+    // Validate that if the template requires a media header, we have a media_id
+    if (headerFormat && ["IMAGE", "VIDEO", "DOCUMENT"].includes(headerFormat)) {
+      if (!mediaId) {
+        console.log("Template requires media header but no media_id provided");
+        return res.status(400).json({
+          error: "Template requires media header but no media id provided",
+        });
+      }
+    }
 
     if (mediaId && ["IMAGE", "VIDEO", "DOCUMENT"].includes(headerFormat)) {
       const mediaType = headerFormat.toLowerCase();
@@ -183,6 +266,29 @@ export const sendTemplateMessage = async (req, res) => {
       .select("wm_id")
       .single();
 
+    // Build a readable preview of the sent template for the chat log
+    let messagePreview = `[Template: ${template_name}]`;
+    const bodyComponent = template?.components?.find(
+      (c) => c.type === "BODY" || c.type === "body",
+    );
+    if (bodyComponent?.text) {
+      messagePreview = bodyComponent.text;
+      parameters.forEach((p, i) => {
+        messagePreview = messagePreview.replace(`{{${i + 1}}}`, String(p));
+      });
+    }
+
+    await logOutboundMessage({
+      user_id: req.apiKey.user_id,
+      phone,
+      message_text: messagePreview,
+      message_type: "template",
+      wm_id: wmRecord?.wm_id,
+      media_path: mediaId || null,
+      buttons: template?.buttons?.length ? template.buttons : null,
+      sender_type,
+    });
+
     logUsage(req, 200);
     return res.status(200).json({
       success: true,
@@ -205,7 +311,8 @@ export const sendTemplateMessage = async (req, res) => {
   Body:
   {
     "phone": "919876543210",
-    "message": "Hello! Your report is ready."
+    "message": "Hello! Your report is ready.",
+    "sender_type": "admin"         // optional, default "admin"
   }
   WhatsApp rule: text messages are only allowed within the 24-hour window
   after the contact last replied. Use /v1/messages/template outside that window.
@@ -288,7 +395,7 @@ async function check24hWindow(phone, user_id) {
 export const sendTextMessage = async (req, res) => {
   try {
     const { phone_number_id, system_user_access_token, wa_id } = req.account;
-    const { phone, message } = req.body;
+    const { phone, message, sender_type = "admin" } = req.body;
 
     if (!phone || !message) {
       logUsage(req, 400, "Missing phone or message");
@@ -356,6 +463,15 @@ export const sendTextMessage = async (req, res) => {
       .select("wm_id")
       .single();
 
+    await logOutboundMessage({
+      user_id: req.apiKey.user_id,
+      phone,
+      message_text: message,
+      message_type: "text",
+      wm_id: wmRecord?.wm_id,
+      sender_type,
+    });
+
     logUsage(req, 200);
     return res.status(200).json({
       success: true,
@@ -370,6 +486,55 @@ export const sendTextMessage = async (req, res) => {
     return res
       .status(500)
       .json({ error: "Failed to send text message", details: apiError });
+  }
+};
+
+/* ─── POST /v1/messages/typing-indicator ────────────────────────────────── */
+/*
+  Mark an inbound message as read and show the WhatsApp "typing…" indicator,
+  so the user knows a reply is coming. Only send this if you're actually
+  about to respond — it auto-dismisses after 25 seconds or on your reply,
+  whichever comes first.
+
+  Body:
+  {
+    "message_id": "wamid.HBgL..."   // the id of the inbound message (from the messages webhook)
+  }
+*/
+
+export const sendTypingIndicator = async (req, res) => {
+  try {
+    const { phone_number_id, system_user_access_token } = req.account;
+    const { message_id } = req.body;
+
+    if (!message_id) {
+      logUsage(req, 400, "Missing message_id");
+      return res.status(400).json({ error: "message_id is required" });
+    }
+
+    const payload = {
+      messaging_product: "whatsapp",
+      status: "read",
+      message_id,
+      typing_indicator: { type: "text" },
+    };
+
+    await axios.post(`${GRAPH_BASE}/${phone_number_id}/messages`, payload, {
+      headers: graphHeaders(system_user_access_token),
+    });
+
+    logUsage(req, 200);
+    return res.status(200).json({
+      success: true,
+      message: "Message marked as read and typing indicator shown.",
+    });
+  } catch (err) {
+    const apiError = err.response?.data || err.message;
+    console.error("sendTypingIndicator error:", apiError);
+    logUsage(req, 500, JSON.stringify(apiError));
+    return res
+      .status(500)
+      .json({ error: "Failed to send typing indicator", details: apiError });
   }
 };
 
@@ -778,8 +943,7 @@ export const uploadMediaFromUrl = async (req, res) => {
       system_user_access_token,
     );
     const header_handle = binaryResp.h;
-    if (!header_handle)
-      throw new Error("Meta did not return a header handle");
+    if (!header_handle) throw new Error("Meta did not return a header handle");
 
     // Step 4: Upload to media API → media_id (used when sending template messages)
     const blob = new Blob([buffer], { type: mimeType });
@@ -967,8 +1131,7 @@ export const processUploadedMedia = async (req, res) => {
       system_user_access_token,
     );
     const header_handle = binaryResp.h;
-    if (!header_handle)
-      throw new Error("Meta did not return a header handle");
+    if (!header_handle) throw new Error("Meta did not return a header handle");
 
     // Upload to media API → media_id
     const blob = new Blob([buffer], { type: mimeType });
@@ -1190,16 +1353,15 @@ export const createTemplate = async (req, res) => {
         break;
       } catch (retryErr) {
         if (attempts >= 3) {
-          const apiError =
-            retryErr.response?.data || { error: retryErr.message };
+          const apiError = retryErr.response?.data || {
+            error: retryErr.message,
+          };
           logUsage(
             req,
             retryErr.response?.status || 400,
             JSON.stringify(apiError),
           );
-          return res
-            .status(retryErr.response?.status || 400)
-            .json(apiError);
+          return res.status(retryErr.response?.status || 400).json(apiError);
         }
         await new Promise((r) => setTimeout(r, 2000 * attempts));
       }
