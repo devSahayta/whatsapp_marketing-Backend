@@ -70,20 +70,22 @@ async function forwardToApiWebhooks(account_id, payload) {
 
     if (!apiKeys?.length) return;
 
-    for (const key of apiKeys) {
-      postWithRetry(key.webhook_url, payload)
-        .then(() => {
-          console.log(
-            `✅ Webhook forwarded to [${key.key_name}]: ${key.webhook_url}`,
-          );
-        })
-        .catch((err) => {
-          console.error(
-            `❌ Webhook forward failed for [${key.key_name}] after retries:`,
-            err.message,
-          );
-        });
-    }
+    await Promise.allSettled(
+      apiKeys.map((key) =>
+        postWithRetry(key.webhook_url, payload)
+          .then(() => {
+            console.log(
+              `✅ Webhook forwarded to [${key.key_name}]: ${key.webhook_url}`,
+            );
+          })
+          .catch((err) => {
+            console.error(
+              `❌ Webhook forward failed for [${key.key_name}] after retries:`,
+              err.message,
+            );
+          }),
+      ),
+    );
   } catch (err) {
     console.error("forwardToApiWebhooks error:", err.message);
   }
@@ -241,7 +243,12 @@ export const verifyWebhook = (req, res) => {
    delays. Now the 200 is sent before any of this runs, so the forwarder
    is never waiting on it.
    ───────────────────────────────────────────────────────────────────────── */
-async function processIncomingUserMessage(reqBody, value, wabaId, phoneNumberId) {
+async function processIncomingUserMessage(
+  reqBody,
+  value,
+  wabaId,
+  phoneNumberId,
+) {
   try {
     const message = value?.messages?.[0];
     if (!message) return;
@@ -434,7 +441,7 @@ async function processIncomingUserMessage(reqBody, value, wabaId, phoneNumberId)
       }
 
       // ── Forward to external API webhooks (fire-and-forget) ───────────────
-      forwardToApiWebhooks(account_id, {
+      await forwardToApiWebhooks(account_id, {
         event: "message.received",
         account_id,
         from: from,
