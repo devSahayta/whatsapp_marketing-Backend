@@ -7,12 +7,11 @@ import { supabase } from "../config/supabase.js";
 import { hashApiKey } from "../middleware/apiKeyAuth.js";
 
 const VALID_SCOPES = [
-  "send_template",
   "send_message",
-  "get_templates",
   "upload_media",
   "get_account",
   "get_scheduled_messages",
+  "manage_templates",
 ];
 
 /**
@@ -176,7 +175,9 @@ export const updateApiKey = async (req, res) => {
     if (!Object.keys(patch).length) {
       return res
         .status(400)
-        .json({ error: "Nothing to update. Provide key_name, webhook_url, or scopes." });
+        .json({
+          error: "Nothing to update. Provide key_name, webhook_url, or scopes.",
+        });
     }
 
     const { data, error } = await supabase

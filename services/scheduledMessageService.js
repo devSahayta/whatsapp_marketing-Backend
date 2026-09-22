@@ -51,6 +51,8 @@ function countRequiredVariables(components) {
  * @param {string}  [params.media_id]        — Meta media ID (overrides template's stored one)
  * @param {string}  params.scheduled_at      — ISO 8601 datetime string (future)
  * @param {string}  [params.timezone]        — e.g. "Asia/Kolkata" (default UTC)
+ * @param {string}  [params.batch_id]        — caller-defined label to group scheduled messages
+ *                                             (filterable via GET /v1/messages/schedule?batch_id=)
  *
  * @returns {{ success: boolean, data?: object, error?: string, code?: string }}
  */
@@ -64,6 +66,7 @@ export async function createScheduledMessage({
   media_id = null,
   scheduled_at,
   timezone = "UTC",
+  batch_id = null,
 }) {
   // // checking whaatapp account existence and status is handled in the API route before calling this service.
   // const account = await getWhatsappAccount(user_id);
@@ -175,6 +178,7 @@ export async function createScheduledMessage({
       scheduled_at: scheduledDate.toISOString(),
       timezone,
       status: "scheduled",
+      batch_id,
     })
     .select()
     .single();

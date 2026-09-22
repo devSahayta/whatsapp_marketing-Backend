@@ -8,12 +8,14 @@
 //   GET   /v1/templates/:wt_id
 //   GET   /v1/templates/:wt_id/media-stream
 //   POST  /v1/templates                     — create a new template (scope: manage_templates)
+//   DELETE /v1/templates/:wt_id             — delete a template (scope: manage_templates)
 //   POST  /v1/messages/template
 //   POST  /v1/messages/text
 //   POST  /v1/messages/interactive
 //   POST  /v1/messages/typing-indicator
-//   POST  /v1/messages/schedule
-//   GET   /v1/messages/schedule              — list scheduled messages (status/phone filter)
+//   GET   /v1/messages/session-window        — is the 24h customer window open? (?phone=)
+//   POST  /v1/messages/schedule              — optional batch_id groups messages
+//   GET   /v1/messages/schedule              — list scheduled messages (status/phone/batch_id filter)
 //   GET   /v1/messages/schedule/:sm_id       — get a scheduled message's status
 //   POST  /v1/media/upload                  — multipart upload (≤4.5 MB, Vercel limit)
 //   POST  /v1/media/upload-from-url         — upload via public URL (no size limit)
@@ -39,6 +41,8 @@ import {
   getMediaUploadUrl,
   processUploadedMedia,
   createTemplate,
+  deleteTemplate,
+  getSessionWindow,
 } from "../controllers/publicApiController.js";
 
 import { supabase } from "../config/supabase.js";
@@ -61,11 +65,11 @@ router.get("/account", scopeGuard("get_account"), getAccount);
 
 // ── Templates ─────────────────────────────────────────────────────────────────
 // GET /v1/templates
-router.get("/templates", scopeGuard("get_templates"), getTemplates);
+router.get("/templates", scopeGuard("manage_templates"), getTemplates);
 
 router.get(
   "/templates/:wt_id",
-  scopeGuard("get_templates"),
+  scopeGuard("manage_templates"),
   async (req, res) => {
     try {
       const { wt_id } = req.params;
@@ -115,7 +119,7 @@ router.get(
 
 router.get(
   "/templates/:wt_id/media-stream",
-  scopeGuard("get_templates"),
+  scopeGuard("manage_templates"),
   async (req, res) => {
     try {
       const { wt_id } = req.params;
@@ -214,7 +218,7 @@ router.get(
 // POST /v1/messages/template
 router.post(
   "/messages/template",
-  scopeGuard("send_template"),
+  scopeGuard("manage_templates"),
   sendTemplateMessage,
 );
 
@@ -235,14 +239,22 @@ router.post(
   sendTypingIndicator,
 );
 
+// GET /v1/messages/session-window?phone=  — is the contact's 24h window open?
+router.get(
+  "/messages/session-window",
+  scopeGuard("send_message"),
+  getSessionWindow,
+);
+
 // POST /v1/messages/schedule  — schedule a template for a future datetime
+// (optional body.batch_id groups several scheduled messages together)
 router.post(
   "/messages/schedule",
-  scopeGuard("send_template"),
+  scopeGuard("manage_templates"),
   scheduleTemplateMessage,
 );
 
-// GET /v1/messages/schedule  — list scheduled messages (filter by status/phone)
+// GET /v1/messages/schedule  — list scheduled messages (filter by status/phone/batch_id)
 router.get(
   "/messages/schedule",
   scopeGuard("get_scheduled_messages"),
@@ -259,6 +271,13 @@ router.get(
 // ── Templates (write) ─────────────────────────────────────────────────────────
 // POST /v1/templates
 router.post("/templates", scopeGuard("manage_templates"), createTemplate);
+
+// DELETE /v1/templates/:wt_id
+router.delete(
+  "/templates/:wt_id",
+  scopeGuard("manage_templates"),
+  deleteTemplate,
+);
 
 // ── Media ─────────────────────────────────────────────────────────────────────
 // POST /v1/media/upload  (multipart/form-data, ≤4.5 MB — Vercel hard limit)

@@ -34,6 +34,24 @@ function logUsage(req, status_code, error = null) {
     .catch(() => {});
 }
 
+const BATCH_ID_MAX_LENGTH = 100;
+
+// Columns returned by the scheduled-message read endpoints.
+const SCHEDULED_MESSAGE_COLUMNS =
+  "sm_id, batch_id, phone_number, contact_name, wt_id, scheduled_at, timezone, status, wa_message_id, wm_id, sent_at, failed_at, error_message, error_code, created_at, updated_at";
+
+/**
+ * Validate an optional batch_id. Returns the trimmed string, null when the
+ * value is absent, or false when it is present but invalid.
+ */
+function normalizeBatchId(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") return false;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > BATCH_ID_MAX_LENGTH) return false;
+  return trimmed;
+}
+
 function graphHeaders(token) {
   return {
     Authorization: `Bearer ${token}`,
@@ -703,7 +721,10 @@ export const sendInteractiveMessage = async (req, res) => {
     "media_id":            "<meta media id>",   // only if template has media header AND
                                                 // the template doesn't already have one stored
     "scheduled_at":        "2026-04-25T18:30:00+05:30",
-    "timezone":            "Asia/Kolkata"        // optional, informational
+    "timezone":            "Asia/Kolkata",       // optional, informational
+    "batch_id":            "diwali-offer-2026"   // optional, ≤100 chars — same value on many
+                                                 // calls groups them; filter with
+                                                 // GET /v1/messages/schedule?batch_id=...
   }
 
   Validation (done inside scheduledMessageService):
@@ -732,6 +753,14 @@ export const scheduleTemplateMessage = async (req, res) => {
       });
     }
 
+    const batch_id = normalizeBatchId(req.body.batch_id);
+    if (batch_id === false) {
+      logUsage(req, 400, "Invalid batch_id");
+      return res.status(400).json({
+        error: `batch_id must be a non-empty string of at most ${BATCH_ID_MAX_LENGTH} characters`,
+      });
+    }
+
     const result = await createScheduledMessage({
       user_id: req.apiKey.user_id,
       account_id: wa_id,
@@ -742,6 +771,7 @@ export const scheduleTemplateMessage = async (req, res) => {
       media_id,
       scheduled_at,
       timezone,
+      batch_id,
     });
 
     if (!result.success) {
@@ -788,9 +818,7 @@ export const getScheduledMessageStatus = async (req, res) => {
 
     const { data, error } = await supabase
       .from("scheduled_messages")
-      .select(
-        "sm_id, phone_number, contact_name, wt_id, scheduled_at, timezone, status, wa_message_id, wm_id, sent_at, failed_at, error_message, error_code, created_at, updated_at",
-      )
+      .select(SCHEDULED_MESSAGE_COLUMNS)
       .eq("sm_id", sm_id)
       .eq("account_id", wa_id)
       .maybeSingle();
@@ -821,29 +849,28 @@ export const getScheduledMessageStatus = async (req, res) => {
   Query params (all optional):
     status  — filter by status: scheduled | sent | failed | cancelled
     phone   — filter by recipient phone number
+    batch_id — return only the rows scheduled with this batch_id
     limit   — max rows to return (default 50, max 200)
     offset  — pagination offset (default 0)
 */
 export const listScheduledMessages = async (req, res) => {
   try {
     const { wa_id } = req.account;
-    const { status, phone } = req.query;
+    const { status, phone, batch_id } = req.query;
 
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
 
     let query = supabase
       .from("scheduled_messages")
-      .select(
-        "sm_id, phone_number, contact_name, wt_id, scheduled_at, timezone, status, wa_message_id, wm_id, sent_at, failed_at, error_message, error_code, created_at, updated_at",
-        { count: "exact" },
-      )
+      .select(SCHEDULED_MESSAGE_COLUMNS, { count: "exact" })
       .eq("account_id", wa_id)
       .order("created_at", { ascending: false })
       .range(offset, offset + limit - 1);
 
     if (status) query = query.eq("status", status);
     if (phone) query = query.eq("phone_number", phone);
+    if (batch_id) query = query.eq("batch_id", batch_id);
 
     const { data, error, count } = await query;
 
@@ -1437,5 +1464,223 @@ export const createTemplate = async (req, res) => {
     return res
       .status(500)
       .json({ error: "Failed to create template", details: apiError });
+  }
+};
+
+/* ─── DELETE /v1/templates/:wt_id ───────────────────────────────────────── */
+/*
+  Delete a template from Meta and from Samvaadik.
+
+  - 404 if the template doesn't belong to this account.
+  - 409 (TEMPLATE_IN_USE) if it is still referenced by pending scheduled
+    messages or scheduled campaigns — cancel those first, otherwise they would
+    fail at send time.
+  - The template is deleted on Meta first; if Meta rejects, nothing is removed
+    locally so the two sides stay in sync.
+  - If historical rows (sent scheduled messages, past campaigns) still point at
+    the template, the row can't be hard-deleted (foreign keys), so it is kept
+    with status "DELETED" and `local_record_retained: true` is returned.
+  - Uploaded media is NOT deleted — the same media_id may be shared with other
+    templates or scheduled messages.
+*/
+export const deleteTemplate = async (req, res) => {
+  try {
+    const { wa_id, waba_id, system_user_access_token } = req.account;
+    const { wt_id } = req.params;
+
+    const { data: template, error: tplErr } = await supabase
+      .from("whatsapp_templates")
+      .select("wt_id, template_id, name")
+      .eq("wt_id", wt_id)
+      .eq("account_id", wa_id)
+      .maybeSingle();
+
+    if (tplErr) throw tplErr;
+    if (!template) {
+      logUsage(req, 404, "Template not found");
+      return res
+        .status(404)
+        .json({ success: false, error: "Template not found" });
+    }
+
+    // Refuse while pending work still depends on this template.
+    const [pendingScheduled, pendingCampaigns] = await Promise.all([
+      supabase
+        .from("scheduled_messages")
+        .select("sm_id", { count: "exact", head: true })
+        .eq("wt_id", wt_id)
+        .eq("status", "scheduled"),
+      supabase
+        .from("campaigns")
+        .select("campaign_id", { count: "exact", head: true })
+        .eq("wt_id", wt_id)
+        .eq("status", "scheduled"),
+    ]);
+
+    if (pendingScheduled.error) throw pendingScheduled.error;
+    if (pendingCampaigns.error) throw pendingCampaigns.error;
+
+    if ((pendingScheduled.count ?? 0) > 0 || (pendingCampaigns.count ?? 0) > 0) {
+      logUsage(req, 409, "TEMPLATE_IN_USE");
+      return res.status(409).json({
+        success: false,
+        error:
+          "Template is used by pending scheduled messages or campaigns. Cancel or wait for them before deleting it.",
+        code: "TEMPLATE_IN_USE",
+        pending_scheduled_messages: pendingScheduled.count ?? 0,
+        pending_campaigns: pendingCampaigns.count ?? 0,
+      });
+    }
+
+    // Delete on Meta. Without a stored Meta id we skip this: deleting by name
+    // alone would remove every language variant of the template.
+    let metaDeleted = false;
+    if (template.template_id) {
+      try {
+        await wsService.deleteMetaTemplate(
+          waba_id,
+          system_user_access_token,
+          template.template_id,
+          template.name,
+        );
+        metaDeleted = true;
+      } catch (metaErr) {
+        const apiError = metaErr.response?.data || metaErr.message;
+        console.error("deleteTemplate Meta error:", apiError);
+        logUsage(
+          req,
+          metaErr.response?.status || 502,
+          JSON.stringify(apiError),
+        );
+        return res.status(metaErr.response?.status || 502).json({
+          success: false,
+          error: "Meta rejected the template deletion",
+          details: apiError,
+        });
+      }
+    }
+
+    const { error: delErr } = await supabase
+      .from("whatsapp_templates")
+      .delete()
+      .eq("wt_id", wt_id)
+      .eq("account_id", wa_id);
+
+    let localRecordRetained = false;
+    if (delErr) {
+      // 23503 = foreign key violation: historical rows still reference it.
+      if (delErr.code !== "23503") throw delErr;
+
+      const { error: markErr } = await supabase
+        .from("whatsapp_templates")
+        .update({ status: "DELETED" })
+        .eq("wt_id", wt_id)
+        .eq("account_id", wa_id);
+      if (markErr) throw markErr;
+      localRecordRetained = true;
+    }
+
+    logUsage(req, 200);
+    return res.status(200).json({
+      success: true,
+      message: "Template deleted successfully",
+      data: {
+        wt_id,
+        name: template.name,
+        meta_deleted: metaDeleted,
+        local_record_retained: localRecordRetained,
+      },
+    });
+  } catch (err) {
+    console.error("deleteTemplate error:", err.message || err);
+    logUsage(req, 500, err.message);
+    return res.status(500).json({ error: "Failed to delete template" });
+  }
+};
+
+/* ─── GET /v1/messages/session-window ───────────────────────────────────── */
+/*
+  Is the 24-hour customer-service window open for this contact?
+  The window is open when the customer's last inbound message is less than
+  24 hours old; while it's open, free-form messages (text/interactive) can be
+  sent without a template.
+
+  Query: ?phone=919876543210   (digits only or with +/spaces — normalised)
+
+  Response data:
+  {
+    "phone": "919876543210",
+    "session_open": true,
+    "last_customer_message_at": "2026-09-21T08:12:00.000Z",  // null if never messaged
+    "window_expires_at":        "2026-09-22T08:12:00.000Z",  // null if never messaged
+    "seconds_remaining":        41230                        // 0 when closed
+  }
+*/
+const SESSION_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+export const getSessionWindow = async (req, res) => {
+  try {
+    const phone = String(req.query.phone ?? "").replace(/\D/g, "");
+    if (!phone) {
+      logUsage(req, 400, "Missing phone");
+      return res.status(400).json({ error: "phone query param is required" });
+    }
+
+    // A contact can have more than one chat row for the same user — look at all.
+    const { data: chats, error: chatErr } = await supabase
+      .from("chats")
+      .select("chat_id")
+      .eq("user_id", req.apiKey.user_id)
+      .eq("phone_number", phone);
+
+    if (chatErr) throw chatErr;
+
+    let lastCustomerMessageAt = null;
+    if (chats?.length) {
+      const { data: lastMsg, error: msgErr } = await supabase
+        .from("messages")
+        .select("created_at")
+        .in(
+          "chat_id",
+          chats.map((c) => c.chat_id),
+        )
+        .eq("sender_type", "user")
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (msgErr) throw msgErr;
+      lastCustomerMessageAt = lastMsg?.created_at ?? null;
+    }
+
+    let expiresAtMs = null;
+    let secondsRemaining = 0;
+    if (lastCustomerMessageAt) {
+      expiresAtMs = new Date(lastCustomerMessageAt).getTime() + SESSION_WINDOW_MS;
+      secondsRemaining = Math.max(
+        0,
+        Math.floor((expiresAtMs - Date.now()) / 1000),
+      );
+    }
+
+    logUsage(req, 200);
+    return res.status(200).json({
+      success: true,
+      data: {
+        phone,
+        session_open: secondsRemaining > 0,
+        last_customer_message_at: lastCustomerMessageAt
+          ? new Date(lastCustomerMessageAt).toISOString()
+          : null,
+        window_expires_at: expiresAtMs
+          ? new Date(expiresAtMs).toISOString()
+          : null,
+        seconds_remaining: secondsRemaining,
+      },
+    });
+  } catch (err) {
+    console.error("getSessionWindow error:", err.message || err);
+    logUsage(req, 500, err.message);
+    return res.status(500).json({ error: "Failed to check session window" });
   }
 };
