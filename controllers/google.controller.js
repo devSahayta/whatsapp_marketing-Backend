@@ -1,3 +1,5 @@
+// controllers/google.controller.js
+
 import { createOAuthClient } from "../config/google.js";
 import { supabase } from "../config/supabase.js";
 import { google } from "googleapis";
@@ -94,6 +96,14 @@ export const getGoogleSheets = async (req, res) => {
   }
 };
 
+// google.controller.js — patched importContactsFromSheet (and syncContactsFromSheet
+// has the identical fix — see the bottom of this file).
+//
+// Change from the original: every `return` inside the row loop that used to
+// silently drop a row now pushes a reason into `invalidRows` first.
+// Nothing else about the endpoint's shape changes — `skippedRows` in the
+// response now finally reflects the true drop count.
+
 export const importContactsFromSheet = async (req, res) => {
   let createdGroupId = null;
 
@@ -123,7 +133,6 @@ export const importContactsFromSheet = async (req, res) => {
       return res.status(400).json({ error: "No data found in the sheet" });
     }
 
-    // Validate headers
     const headers = rows[0].map((h) => h?.toString().trim().toLowerCase());
     if (headers[0] !== "name") {
       return res.status(400).json({
@@ -142,7 +151,7 @@ export const importContactsFromSheet = async (req, res) => {
     }
 
     const invalidRows = [];
-    const seenPhones = new Set();
+    const seenPhones = new Map(); // rawPhone -> first row number it appeared on
     const validRows = [];
 
     rows.slice(1).forEach((row, index) => {
@@ -151,22 +160,58 @@ export const importContactsFromSheet = async (req, res) => {
       const rawPhone = row[1]?.toString().trim();
       const email = row[2]?.toString().trim() || null;
 
-      if (!name || !rawPhone) return; // skip empty rows
+      // Was: `if (!name || !rawPhone) return;` — silent. Now reported.
+      if (!name && !rawPhone) {
+        invalidRows.push({
+          row: rowNumber,
+          name,
+          phone: rawPhone,
+          reason: "Empty row",
+        });
+        return;
+      }
+      if (!name) {
+        invalidRows.push({
+          row: rowNumber,
+          name,
+          phone: rawPhone,
+          reason: "Missing name",
+        });
+        return;
+      }
+      if (!rawPhone) {
+        invalidRows.push({
+          row: rowNumber,
+          name,
+          phone: rawPhone,
+          reason: "Missing phone number",
+        });
+        return;
+      }
 
       // Validate phone number: must contain only digits (optionally leading +)
       const phoneDigits = rawPhone.replace(/^\+/, "");
       if (!/^\d+$/.test(phoneDigits)) {
         invalidRows.push({
           row: rowNumber,
+          name,
           phone: rawPhone,
-          reason: "Invalid phone number",
+          reason: `Invalid phone number format ("${rawPhone}")`,
         });
         return;
       }
 
-      // Deduplicate by phone number
-      if (seenPhones.has(rawPhone)) return;
-      seenPhones.add(rawPhone);
+      // Was: `if (seenPhones.has(rawPhone)) return;` — silent. Now reported.
+      if (seenPhones.has(rawPhone)) {
+        invalidRows.push({
+          row: rowNumber,
+          name,
+          phone: rawPhone,
+          reason: `Duplicate of row ${seenPhones.get(rawPhone)} (same phone number)`,
+        });
+        return;
+      }
+      seenPhones.set(rawPhone, rowNumber);
 
       validRows.push({ name, phone: rawPhone, email });
     });
@@ -174,11 +219,10 @@ export const importContactsFromSheet = async (req, res) => {
     if (validRows.length === 0) {
       return res.status(400).json({
         error: "No valid contacts found",
-        ...(invalidRows.length > 0 && { invalidRows }),
+        ...(invalidRows.length > 0 && { skippedRows: invalidRows }),
       });
     }
 
-    // Create a new group
     const group = await createGroup({
       user_id: userId,
       group_name,
@@ -188,7 +232,6 @@ export const importContactsFromSheet = async (req, res) => {
     });
     createdGroupId = group.group_id;
 
-    // Build contacts with the new group_id
     const contacts = validRows.map(({ name, phone, email }) => ({
       group_id: createdGroupId,
       user_id: userId,
@@ -210,7 +253,6 @@ export const importContactsFromSheet = async (req, res) => {
   } catch (err) {
     console.error("importContacts error:", err);
 
-    // Rollback: delete the group if it was created but contacts insert failed
     if (createdGroupId) {
       await supabase
         .from("groups")
@@ -409,7 +451,7 @@ export const syncContactsFromSheet = async (req, res) => {
     const existingPhones = new Set(existingContacts.map((c) => c.phone_number));
 
     const invalidRows = [];
-    const seenPhones = new Set();
+    const seenPhones = new Map();
     const newContacts = [];
 
     rows.slice(1).forEach((row, index) => {
@@ -418,21 +460,66 @@ export const syncContactsFromSheet = async (req, res) => {
       const rawPhone = row[1]?.toString().trim();
       const email = row[2]?.toString().trim() || null;
 
-      if (!name || !rawPhone) return; // skip empty rows
+      // Was: `if (!name || !rawPhone) return;` — silent. Now reported.
+      if (!name && !rawPhone) {
+        invalidRows.push({
+          row: rowNumber,
+          name,
+          phone: rawPhone,
+          reason: "Empty row",
+        });
+        return;
+      }
+      if (!name) {
+        invalidRows.push({
+          row: rowNumber,
+          name,
+          phone: rawPhone,
+          reason: "Missing name",
+        });
+        return;
+      }
+      if (!rawPhone) {
+        invalidRows.push({
+          row: rowNumber,
+          name,
+          phone: rawPhone,
+          reason: "Missing phone number",
+        });
+        return;
+      }
 
       const phoneDigits = rawPhone.replace(/^\+/, "");
       if (!/^\d+$/.test(phoneDigits)) {
         invalidRows.push({
           row: rowNumber,
+          name,
           phone: rawPhone,
-          reason: "Invalid phone number",
+          reason: `Invalid phone number format ("${rawPhone}")`,
         });
         return;
       }
 
-      // Skip if already in the group or seen twice in this sheet
-      if (existingPhones.has(rawPhone) || seenPhones.has(rawPhone)) return;
-      seenPhones.add(rawPhone);
+      // Was: `if (existingPhones.has(rawPhone) || seenPhones.has(rawPhone)) return;` — silent. Now reported.
+      if (existingPhones.has(rawPhone)) {
+        invalidRows.push({
+          row: rowNumber,
+          name,
+          phone: rawPhone,
+          reason: "Already in this group",
+        });
+        return;
+      }
+      if (seenPhones.has(rawPhone)) {
+        invalidRows.push({
+          row: rowNumber,
+          name,
+          phone: rawPhone,
+          reason: `Duplicate of row ${seenPhones.get(rawPhone)} (same phone number)`,
+        });
+        return;
+      }
+      seenPhones.set(rawPhone, rowNumber);
 
       newContacts.push({ name, phone: rawPhone, email });
     });
