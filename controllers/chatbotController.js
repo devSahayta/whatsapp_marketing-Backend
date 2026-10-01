@@ -173,6 +173,7 @@ export const createNode = async (req, res) => {
 
     const VALID_TYPES = [
       "keyword_trigger",
+      "image_trigger",
       "api_trigger",
       "send_message",
       "send_template",
@@ -546,6 +547,55 @@ export const checkKeywordConflicts = async (req, res) => {
               type: "flow_keyword_overlap",
               flow_id: t.flow_id,
               flow_name: flowName,
+              shared_keywords: shared,
+            });
+          }
+        }
+      }
+    }
+
+    // (a2) other active flows with an overlapping image_trigger.
+    // Two catch-all image triggers (no caption keywords) always collide;
+    // two caption-filtered ones collide only on shared caption keywords.
+    const myImageTrigger = myNodes?.find((n) => n.node_type === "image_trigger");
+    if (myImageTrigger) {
+      const myCaptionKeywords = (
+        myImageTrigger.config?.caption_keywords || []
+      ).map((k) => k.toUpperCase());
+
+      const { data: otherFlows } = await supabase
+        .from("chatbot_flows")
+        .select("flow_id, name")
+        .eq("account_id", thisFlow.account_id)
+        .eq("status", "active")
+        .neq("flow_id", flow_id);
+
+      if (otherFlows?.length) {
+        const { data: otherImageTriggers } = await supabase
+          .from("chatbot_nodes")
+          .select("flow_id, config")
+          .in(
+            "flow_id",
+            otherFlows.map((f) => f.flow_id),
+          )
+          .eq("node_type", "image_trigger");
+
+        for (const t of otherImageTriggers || []) {
+          const theirCaptionKeywords = (t.config?.caption_keywords || []).map(
+            (k) => k.toUpperCase(),
+          );
+          const bothCatchAll =
+            myCaptionKeywords.length === 0 &&
+            theirCaptionKeywords.length === 0;
+          const shared = myCaptionKeywords.filter((k) =>
+            theirCaptionKeywords.includes(k),
+          );
+
+          if (bothCatchAll || shared.length) {
+            conflicts.push({
+              type: "flow_image_trigger_overlap",
+              flow_id: t.flow_id,
+              flow_name: otherFlows.find((f) => f.flow_id === t.flow_id)?.name,
               shared_keywords: shared,
             });
           }

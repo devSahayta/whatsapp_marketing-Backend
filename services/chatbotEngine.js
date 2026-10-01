@@ -1818,6 +1818,7 @@ async function executeNode({
 
   switch (type) {
     case "keyword_trigger":
+    case "image_trigger":
       // Trigger nodes have no action — just advance
       return { advance: true, conditionLabel: null, variables };
 
@@ -1999,6 +2000,50 @@ async function runFlow({
 // SECTION 9 — Public API (called from whatsappController.js)
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Sentinel the controller passes as engine text for incoming image/document/video
+export const MEDIA_SENTINEL = "__CUSTOMER_SENT_IMAGE__";
+
+// Load trigger nodes of the given type across all active flows of this account
+async function getActiveTriggerNodes(account_id, node_type) {
+  const { data: flows, error: flowErr } = await supabase
+    .from("chatbot_flows")
+    .select("flow_id")
+    .eq("account_id", account_id)
+    .eq("status", "active");
+
+  if (flowErr || !flows?.length) return [];
+
+  const flowIds = flows.map((f) => f.flow_id);
+
+  const { data: triggerNodes, error: nodeErr } = await supabase
+    .from("chatbot_nodes")
+    .select("*")
+    .in("flow_id", flowIds)
+    .eq("node_type", node_type);
+
+  if (nodeErr) return [];
+  return triggerNodes || [];
+}
+
+// Case-insensitive keyword match using the trigger's match_type
+function matchesKeywords(text, keywords, matchType = "contains") {
+  const normalizedText = (text || "").trim().toLowerCase();
+  if (!normalizedText) return false;
+
+  return keywords.some((k) => {
+    const kw = String(k).toLowerCase();
+    switch (matchType) {
+      case "exact":
+        return normalizedText === kw;
+      case "starts_with":
+        return normalizedText.startsWith(kw);
+      case "contains":
+      default:
+        return normalizedText.includes(kw);
+    }
+  });
+}
+
 /**
  * matchKeywordTrigger
  * Scans all active flows for this account and checks if userText matches
@@ -2006,49 +2051,20 @@ async function runFlow({
  */
 export async function matchKeywordTrigger(userText, account_id) {
   try {
-    if (!userText) return null;
+    // Media messages arrive as a sentinel string — never keyword-match them,
+    // otherwise keywords like "image" or "sent" would fire on every photo
+    if (!userText || userText === MEDIA_SENTINEL) return null;
 
-    // Get all active flows for this account
-    const { data: flows, error: flowErr } = await supabase
-      .from("chatbot_flows")
-      .select("flow_id")
-      .eq("account_id", account_id)
-      .eq("status", "active");
-
-    if (flowErr || !flows?.length) return null;
-
-    const flowIds = flows.map((f) => f.flow_id);
-
-    // Get all keyword_trigger nodes across those flows
-    const { data: triggerNodes, error: nodeErr } = await supabase
-      .from("chatbot_nodes")
-      .select("*")
-      .in("flow_id", flowIds)
-      .eq("node_type", "keyword_trigger");
-
-    if (nodeErr || !triggerNodes?.length) return null;
-
-    const normalizedText = userText.trim().toLowerCase();
+    const triggerNodes = await getActiveTriggerNodes(
+      account_id,
+      "keyword_trigger",
+    );
 
     for (const node of triggerNodes) {
-      const keywords = (node.config?.keywords || []).map((k) =>
-        k.toLowerCase(),
-      );
+      const keywords = node.config?.keywords || [];
       const matchType = node.config?.match_type || "contains";
 
-      const matched = keywords.some((kw) => {
-        switch (matchType) {
-          case "exact":
-            return normalizedText === kw;
-          case "starts_with":
-            return normalizedText.startsWith(kw);
-          case "contains":
-          default:
-            return normalizedText.includes(kw);
-        }
-      });
-
-      if (matched) {
+      if (matchesKeywords(userText, keywords, matchType)) {
         console.log(`✅ [Engine] Keyword matched in flow: ${node.flow_id}`);
         return node.flow_id;
       }
@@ -2062,9 +2078,55 @@ export async function matchKeywordTrigger(userText, account_id) {
 }
 
 /**
+ * matchImageTrigger
+ * Called when the customer sends an image. Scans active flows for an
+ * image_trigger node. A trigger with caption_keywords only fires when the
+ * image caption matches; a trigger without caption_keywords fires on any image.
+ * Caption-specific matches win over catch-all triggers.
+ * Returns the flow_id if matched, null otherwise.
+ */
+export async function matchImageTrigger(caption, account_id) {
+  try {
+    const triggerNodes = await getActiveTriggerNodes(
+      account_id,
+      "image_trigger",
+    );
+
+    let catchAllFlowId = null;
+
+    for (const node of triggerNodes) {
+      const keywords = node.config?.caption_keywords || [];
+
+      if (keywords.length === 0) {
+        if (!catchAllFlowId) catchAllFlowId = node.flow_id;
+        continue;
+      }
+
+      const matchType = node.config?.match_type || "contains";
+      if (matchesKeywords(caption, keywords, matchType)) {
+        console.log(
+          `✅ [Engine] Image trigger (caption) matched in flow: ${node.flow_id}`,
+        );
+        return node.flow_id;
+      }
+    }
+
+    if (catchAllFlowId) {
+      console.log(`✅ [Engine] Image trigger matched in flow: ${catchAllFlowId}`);
+    }
+    return catchAllFlowId;
+  } catch (err) {
+    console.error("❌ [Engine] matchImageTrigger error:", err.message);
+    return null;
+  }
+}
+
+/**
  * startBotSession
  * Creates a new session for this chat, sets chat mode to BOT,
  * and begins executing the flow from the trigger node.
+ * trigger_type: "keyword_trigger" | "image_trigger" — which node to start from
+ * initial_variables: seeded into the session (e.g. image_url for image triggers)
  */
 export async function startBotSession({
   chat_id,
@@ -2072,6 +2134,8 @@ export async function startBotSession({
   flow_id,
   account_id,
   user_text,
+  trigger_type = "keyword_trigger",
+  initial_variables = {},
 }) {
   // FIX 3: Acquire lock — block duplicate webhook calls for the same chat
   if (!acquireLock(chat_id)) {
@@ -2088,10 +2152,10 @@ export async function startBotSession({
     const { nodes, edges, nodeMap } = await loadFlowGraph(flow_id);
 
     // Find the trigger node (starting point)
-    const triggerNode = nodes.find((n) => n.node_type === "keyword_trigger");
+    const triggerNode = nodes.find((n) => n.node_type === trigger_type);
     if (!triggerNode) {
       console.error(
-        "❌ [Engine] No keyword_trigger node found in flow:",
+        `❌ [Engine] No ${trigger_type} node found in flow:`,
         flow_id,
       );
       return;
@@ -2104,7 +2168,7 @@ export async function startBotSession({
         flow_id,
         chat_id,
         current_node_id: triggerNode.node_id,
-        variables: {},
+        variables: initial_variables,
         status: "active",
       })
       .select()

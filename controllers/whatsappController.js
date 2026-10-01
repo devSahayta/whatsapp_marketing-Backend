@@ -15,6 +15,7 @@ import {
   handleBotMessage,
   startBotSession,
   matchKeywordTrigger,
+  matchImageTrigger,
 } from "../services/chatbotEngine.js";
 import { createNotification } from "../controllers/notificationController.js";
 import { markCodOrderConfirmed } from "./woocommerceController.js";
@@ -500,6 +501,24 @@ async function processIncomingUserMessage(
           user_text: engineText,
           account_id,
         });
+      } else if (message.type === "image") {
+        // Image → only image_trigger flows can start (optionally filtered by caption)
+        const caption = message.image?.caption?.trim() || "";
+        const matchedFlowId = await matchImageTrigger(caption, account_id);
+        if (matchedFlowId) {
+          await startBotSession({
+            chat_id: chatRow.chat_id,
+            phone_number: from,
+            flow_id: matchedFlowId,
+            account_id,
+            user_text: engineText,
+            trigger_type: "image_trigger",
+            initial_variables: {
+              image_url: storedMediaPath || "",
+              image_caption: caption,
+            },
+          });
+        }
       } else {
         const matchedFlowId = await matchKeywordTrigger(engineText, account_id);
         if (matchedFlowId) {
