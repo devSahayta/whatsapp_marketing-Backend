@@ -1076,6 +1076,7 @@ export const getUserTemplates = async (req, res) => {
         category,
         components,
         header_format,
+        header_filename, 
         variables,
         buttons,
         preview,

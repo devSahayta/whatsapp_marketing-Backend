@@ -94,6 +94,12 @@ const bulkProgress = new Map();
 export async function createTemplate(req, res) {
   try {
     const payload = req.body;
+    console.log("📋 CREATE TEMPLATE PAYLOAD:", {
+      name: payload.name,
+      header_format: payload.header_format,
+      header_filename: payload.header_filename, // ← check this
+      media_id: payload.media_id,
+    });
     const wt_id = uuidv4();
 
     // fetch account row (reads system_user_access_token, waba_id, phone_number_id)
@@ -264,6 +270,7 @@ export async function createTemplate(req, res) {
         is_carousel: isCarousel,
         card_count: cardCount,
         carousel_media: payload.carousel_media || [],
+        header_filename: payload.header_filename || null, // ← must be here
       };
 
       const { error: insertErr } = await supabase
@@ -1002,13 +1009,8 @@ export async function sendTemplate(req, res) {
       return res.status(400).json({ error: "Missing phone_number_id" });
 
     // -------------------------------------------------------------
-    // 2. Get Template Data from Meta
+    // 2. Get Template Data from DB
     // -------------------------------------------------------------
-    // const metaTemplates = await wsService.listTemplatesFromMeta(
-    //   account.waba_id,
-    //   account.system_user_access_token
-    // );
-
     const metaTemplates = await wsService.listTemplatesFromDb(
       account.wa_id,
       account.waba_id,
@@ -1046,7 +1048,19 @@ export async function sendTemplate(req, res) {
     }
     // CASE C → Template has NO variables (simple, static template)
     else {
-      finalComponents = []; // No components needed
+      finalComponents = [];
+    }
+
+    // ✅ Auto-inject header component for DOCUMENT/IMAGE/VIDEO templates
+    // when the caller hasn't already supplied one.
+    // This ensures the correct media_id and filename are always sent to Meta,
+    // so customers see the real document name instead of "Untitled".
+    if (template.header_format && template.media_id) {
+      const existingHeader = finalComponents.find((c) => c.type === "header");
+      if (!existingHeader) {
+        const headerComp = buildHeaderComponent(template);
+        if (headerComp) finalComponents.unshift(headerComp);
+      }
     }
 
     // -------------------------------------------------------------
@@ -1062,8 +1076,6 @@ export async function sendTemplate(req, res) {
         components: finalComponents,
       },
     };
-
-    // console.log("FINAL PAYLOAD:", JSON.stringify(messagePayload, null, 2));
 
     // -------------------------------------------------------------
     // 5. Send to Meta
@@ -1090,7 +1102,6 @@ export async function sendTemplate(req, res) {
     await supabase.from("whatsapp_messages").insert(log);
 
     // ── Save to messages table for chat dashboard ─────────────────────────────
-    // ── Save to messages table ─────────────────────────────
     try {
       const { fullMessage, mediaPath, msgType } = extractTemplateDisplayData(
         template,
@@ -1161,13 +1172,8 @@ export async function sendTemplateBulk(req, res) {
       return res.status(400).json({ error: "Missing WhatsApp configuration" });
 
     // --------------------------------------------
-    // Fetch template from Meta
+    // Fetch template from DB
     // --------------------------------------------
-    // const metaTemplates = await wsService.listTemplatesFromMeta(
-    //   account.waba_id,
-    //   token
-    // );
-
     const metaTemplates = await wsService.listTemplatesFromDb(
       account.wa_id,
       account.waba_id,
@@ -1196,6 +1202,18 @@ export async function sendTemplateBulk(req, res) {
       ];
     }
 
+    // ✅ Auto-inject header component for DOCUMENT/IMAGE/VIDEO templates
+    // when the caller hasn't already supplied one.
+    // This ensures the correct media_id and filename are always sent to Meta,
+    // so customers see the real document name instead of "Untitled".
+    if (template.header_format && template.media_id) {
+      const existingHeader = finalComponents.find((c) => c.type === "header");
+      if (!existingHeader) {
+        const headerComp = buildHeaderComponent(template);
+        if (headerComp) finalComponents.unshift(headerComp);
+      }
+    }
+
     // --------------------------------------------
     // Prepare result container
     // --------------------------------------------
@@ -1215,114 +1233,8 @@ export async function sendTemplateBulk(req, res) {
     });
 
     // --------------------------------------------
-    // Loop each recipient with throttling
+    // Send in batches of 40 with throttling
     // --------------------------------------------
-    // for (const to of recipients) {
-    //   const payload = {
-    //     messaging_product: "whatsapp",
-    //     to: to,
-    //     type: "template",
-    //     template: {
-    //       name: template.name,
-    //       language: { code: template.language || "en_US" },
-    //       components: finalComponents,
-    //     },
-    //   };
-
-    //   try {
-    //     const sendResp = await wsService.sendTemplateMessage(
-    //       phoneNumberId,
-    //       token,
-    //       payload,
-    //     );
-
-    //     // Log success
-    //     const log = {
-    //       wm_id: uuidv4(),
-    //       account_id: account.wa_id,
-    //       to_number: to,
-    //       template_name: template.name,
-    //       message_body: payload,
-    //       wa_message_id: sendResp?.messages?.[0]?.id || null,
-    //       status: sendResp.error ? "FAILED" : "SENT",
-    //     };
-
-    //     if (!sendResp.error) {
-    //       await supabase.from("whatsapp_messages").insert(log);
-
-    //       results.success.push({ to, id: log.wm_id });
-    //       // --------------------------------------------
-    //       // Render message text for DB
-    //       // --------------------------------------------
-    //       const renderedText = renderTemplateBody(template, finalComponents);
-
-    //       // --------------------------------------------
-    //       // Detect media (optional)
-    //       // --------------------------------------------
-    //       const headerComp = finalComponents.find((c) => c.type === "header");
-
-    //       const mediaPath =
-    //         headerComp?.parameters?.[0]?.image?.id ||
-    //         headerComp?.parameters?.[0]?.video?.id ||
-    //         headerComp?.parameters?.[0]?.document?.id ||
-    //         null;
-
-    //       // --------------------------------------------
-    //       // Create / Update Chat
-    //       // --------------------------------------------
-    //       const chat = await getOrCreateChat({
-    //         phone_number: to,
-    //         user_id: user_id,
-    //       });
-
-    //       // --------------------------------------------
-    //       // Insert message
-    //       // --------------------------------------------
-
-    //       //checking if any button available in template
-    //       const buttons = extractTemplateButtons(template);
-
-    //       //write message
-    //       await supabase.from("messages").insert({
-    //         chat_id: chat.chat_id,
-    //         sender_type: "admin",
-    //         message: renderedText,
-    //         message_type: "template",
-    //         media_path: mediaPath,
-    //         buttons,
-    //         created_at: new Date(),
-    //       });
-
-    //       // --------------------------------------------
-    //       // Update chat last message
-    //       // --------------------------------------------
-    //       await supabase
-    //         .from("chats")
-    //         .update({
-    //           last_message: renderedText,
-    //           last_message_at: new Date(),
-    //         })
-    //         .eq("chat_id", chat.chat_id);
-    //     }
-    //   } catch (err) {
-    //     console.error("Send failed for:", to, err.message);
-
-    //     results.failed.push({
-    //       to,
-    //       error: err.response?.data || err.message,
-    //     });
-    //   } finally {
-    //     const prog = bulkProgress.get(progressKey);
-    //     if (prog) {
-    //       prog.completed += 1;
-    //       bulkProgress.set(progressKey, prog);
-    //     }
-    //   }
-
-    //   // Throttle to stay safe from Meta
-    //   await wait(350); // 300–400ms is ideal
-    // }
-
     const BATCH_SIZE = 40;
 
     for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
@@ -1363,9 +1275,7 @@ export async function sendTemplateBulk(req, res) {
               await supabase.from("whatsapp_messages").insert(log);
 
               results.success.push({ to, id: log.wm_id });
-              // --------------------------------------------
-              // Render message text for DB
-              // --------------------------------------------
+
               const { fullMessage, mediaPath, msgType } =
                 extractTemplateDisplayData(template, finalComponents);
 
@@ -1781,7 +1691,8 @@ export async function updateCarouselCardMedia(req, res) {
     if (!wt_id) return res.status(400).json({ error: "wt_id is required" });
     if (card_index === undefined || card_index === null)
       return res.status(400).json({ error: "card_index is required" });
-    if (!media_id) return res.status(400).json({ error: "media_id is required" });
+    if (!media_id)
+      return res.status(400).json({ error: "media_id is required" });
     if (!user_id) return res.status(400).json({ error: "user_id is required" });
 
     const account = await getWhatsappAccount(user_id);
@@ -1798,7 +1709,9 @@ export async function updateCarouselCardMedia(req, res) {
     if (tplErr || !tpl)
       return res.status(404).json({ error: "Template not found" });
 
-    const existing = Array.isArray(tpl.carousel_media) ? tpl.carousel_media : [];
+    const existing = Array.isArray(tpl.carousel_media)
+      ? tpl.carousel_media
+      : [];
     const previousEntry = existing.find((c) => c.card_index === card_index);
 
     const nextCarouselMedia = [
