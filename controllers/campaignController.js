@@ -1318,6 +1318,7 @@ export const retryCampaign = async (req, res) => {
         started_at: null, // ⭐ VERY IMPORTANT
         completed_at: null, // optional but recommended
         messages_failed: 0,
+        retry_notified_at: null, // ← NEW: allow the retry-ready email to fire again
         updated_at: new Date().toISOString(),
       })
       .eq("campaign_id", campaign_id);
