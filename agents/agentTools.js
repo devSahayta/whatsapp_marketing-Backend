@@ -348,7 +348,7 @@ export const CAMPAIGN_TOOLS = [
   {
     name: "list_google_sheets",
     description:
-      "List the user's Google Sheets spreadsheets so they can pick one to import contacts from. Returns each sheet's id and name. If Google is not connected, returns an error asking the user to connect first.",
+      "List the Google Sheets Samvaadik can access: sheets the user has selected from Google Drive via the picker, and sheets Samvaadik created. Samvaadik cannot see the rest of the user's Drive. Returns each sheet's id and name. If Google is not connected, returns an error asking the user to connect first.",
     input_schema: {
       type: "object",
       properties: {},
@@ -897,7 +897,8 @@ async function listGoogleSheets(userId) {
     if (sheets.length === 0) {
       return {
         sheets: [],
-        message: "No Google Sheets found in your Drive.",
+        message:
+          "No Google Sheets selected yet. The user must choose a sheet from Google Drive first.",
       };
     }
 
@@ -952,6 +953,14 @@ async function createGroupFromSheet(userId, input) {
         `[createGroupFromSheet] Error reading spreadsheet ${spreadsheet_id}:`,
         err,
       );
+      const status = err?.code ?? err?.response?.status;
+      if (status === 403 || status === 404) {
+        return {
+          error_type: "SHEET_ACCESS_REQUIRED",
+          error:
+            "Samvaadik does not have access to this sheet. The user must select it from Google Drive first.",
+        };
+      }
       return {
         error: `Could not read the spreadsheet. Make sure it exists and you have access to it. (${err.message})`,
       };

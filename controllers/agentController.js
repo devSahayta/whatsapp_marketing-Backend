@@ -328,10 +328,11 @@ Option A — CSV file upload:
 - Once the user uploads a file, the system handles it automatically outside the tool loop. You will receive a confirmation message. Just relay that confirmation to the user naturally.
 
 Option B — Google Sheets import:
-- Step 1: Call list_google_sheets to fetch the user's available spreadsheets.
+- Step 1: Call list_google_sheets to fetch the spreadsheets Samvaadik can access. Samvaadik only sees sheets the user has selected from Google Drive (plus sheets it created), not their whole Drive.
   - If it returns requires_google_connection: true — output your response starting with exactly "GOOGLE_NOT_CONNECTED: " (including the colon and space), then explain they need to connect their Google account from the Integrations page first.
-  - If it returns an empty list: tell the user no sheets were found in their Drive.
-  - If it returns sheets: show a numbered list of sheet names so the user can pick one.
+  - If it returns an empty list: output your response starting with exactly "GOOGLE_PICK_SHEET: " (including the colon and space), then tell the user to choose their sheet from Google Drive using the button below.
+  - If it returns sheets: show a numbered list of sheet names so the user can pick one. Then output, on its own line at the very start of your response, exactly "GOOGLE_PICK_SHEET: " and mention that if their sheet is not listed they can choose it from Google Drive using the button below.
+  - When the user says they selected a sheet from Google Drive, call list_google_sheets again and use the sheet they named.
 - Step 2: Ask for the group name (if not already given) and optionally a description.
 - Step 3: Show a summary before creating:
   ───────────────────────
@@ -342,6 +343,7 @@ Option B — Google Sheets import:
   The sheet must have columns: name (A), phoneno (B), email optional (C). Ready to import?
 - Step 4: On confirmation, call create_group_from_sheet with the exact spreadsheet id from the list_google_sheets result. CRITICAL: You MUST call list_google_sheets in the current conversation turn to get a fresh spreadsheet id. Never use a spreadsheet_id recalled from conversation history or a previous session — always get it fresh.
 - After success, reply in one plain sentence: group name and contact count. Never show raw IDs.
+- If create_group_from_sheet returns error_type "SHEET_ACCESS_REQUIRED": output your response starting with exactly "GOOGLE_PICK_SHEET: " and ask the user to select that sheet from Google Drive using the button below.
 - If create_group_from_sheet returns error_type "INVALID_COLUMNS": tell the user the exact column format required — column A must be "name", column B must be "phoneno", column C (optional) must be "email" — and quote what was actually found. Ask them to fix the headers in their sheet and try again. Do NOT say the sheet was deleted or access was revoked.
 
 Never create an empty group. Never call any tool for Option A (CSV) group creation.

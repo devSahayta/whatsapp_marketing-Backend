@@ -1,28 +1,52 @@
 // controllers/google.controller.js
 
+import jwt from "jsonwebtoken";
 import { createOAuthClient } from "../config/google.js";
 import { supabase } from "../config/supabase.js";
 import { google } from "googleapis";
-import { getSheetsClient, getDriveClient } from "../services/google.service.js";
+import {
+  getSheetsClient,
+  getPickerAccessToken,
+  isGoogleFileAccessError,
+} from "../services/google.service.js";
 import { createGroup } from "../models/groupModel.js";
+
+// Only non-sensitive scopes, so Google shows no "unverified app" warning.
+// drive.file grants access to sheets the user picks in the Google Picker and
+// to sheets Samvaadik creates (campaign exports) — nothing else in their Drive.
+const GOOGLE_SCOPES = [
+  "openid",
+  "https://www.googleapis.com/auth/userinfo.email",
+  "https://www.googleapis.com/auth/drive.file",
+];
+
+const STATE_PURPOSE = "google_oauth";
+const getStateSecret = () =>
+  process.env.GOOGLE_STATE_SECRET || process.env.GOOGLE_CLIENT_SECRET;
+
+const SHEET_ACCESS_REQUIRED_ERROR =
+  "Samvaadik doesn't have access to this Google Sheet. Please select it again from Google Drive.";
 
 // ✅ Step 1: Generate Auth URL
 export const connectGoogle = async (req, res) => {
   try {
-    // console.log({ user: req.user }); // Debugging line to check req.user
     const userId = req.user.user_id; // based on your auth middleware
 
     const oauth2Client = createOAuthClient();
 
+    // Signed, short-lived state so a crafted callback URL can't link a Google
+    // account to someone else's user.
+    const state = jwt.sign(
+      { uid: userId, purpose: STATE_PURPOSE },
+      getStateSecret(),
+      { expiresIn: "10m" },
+    );
+
     const url = oauth2Client.generateAuthUrl({
       access_type: "offline",
       prompt: "consent",
-      scope: [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive.readonly",
-        "https://www.googleapis.com/auth/userinfo.email",
-      ],
-      state: userId, // VERY IMPORTANT
+      scope: GOOGLE_SCOPES,
+      state,
     });
 
     return res.json({ url });
@@ -35,9 +59,17 @@ export const connectGoogle = async (req, res) => {
 // ✅ Step 2: Callback
 export const googleCallback = async (req, res) => {
   try {
-    const { code, state } = req.query;
+    const { code, state, error: oauthError } = req.query;
 
-    const userId = state;
+    if (oauthError || !code || !state) {
+      throw new Error(`Google OAuth aborted: ${oauthError || "missing code"}`);
+    }
+
+    const payload = jwt.verify(state, getStateSecret());
+    if (payload?.purpose !== STATE_PURPOSE || !payload.uid) {
+      throw new Error("Invalid OAuth state");
+    }
+    const userId = payload.uid;
 
     const oauth2Client = createOAuthClient();
 
@@ -54,15 +86,19 @@ export const googleCallback = async (req, res) => {
     const userInfo = await oauth2.userinfo.get();
     const email = userInfo.data.email;
 
-    // 👉 Save in Supabase (UPSERT)
-    const { error } = await supabase.from("user_google_accounts").upsert({
-      user_id: userId,
-      access_token: tokens.access_token,
-      refresh_token: tokens.refresh_token,
-      expiry_date: tokens.expiry_date,
-      email,
-      updated_at: new Date(),
-    });
+    // 👉 Save in Supabase (one row per user — requires UNIQUE (user_id))
+    const { error } = await supabase.from("user_google_accounts").upsert(
+      {
+        user_id: userId,
+        access_token: tokens.access_token,
+        // Google only returns a refresh token on consent; never wipe a stored one
+        ...(tokens.refresh_token && { refresh_token: tokens.refresh_token }),
+        expiry_date: tokens.expiry_date,
+        email,
+        updated_at: new Date(),
+      },
+      { onConflict: "user_id" },
+    );
 
     if (error) throw error;
 
@@ -78,21 +114,85 @@ export const googleCallback = async (req, res) => {
   }
 };
 
-export const getGoogleSheets = async (req, res) => {
+// Revokes Samvaadik's access at Google and removes the stored tokens.
+// Groups keep their google_sheet_id, so sync works again after reconnecting.
+export const disconnectGoogle = async (req, res) => {
   try {
-    const user_id = req.user.user_id;
+    const userId = req.user.user_id;
 
-    const drive = await getDriveClient(user_id);
+    const { data: account, error: fetchError } = await supabase
+      .from("user_google_accounts")
+      .select("access_token, refresh_token")
+      .eq("user_id", userId)
+      .maybeSingle();
 
-    const response = await drive.files.list({
-      q: "mimeType='application/vnd.google-apps.spreadsheet'",
-      fields: "files(id, name)",
-    });
+    if (fetchError) throw fetchError;
+    if (!account) {
+      return res.status(404).json({ error: "Google account is not connected" });
+    }
 
-    res.json({ sheets: response.data.files });
+    // Revoking the refresh token also invalidates its access tokens. Best
+    // effort — the token may already be revoked by the user in Google settings.
+    const tokenToRevoke = account.refresh_token || account.access_token;
+    if (tokenToRevoke) {
+      try {
+        await createOAuthClient().revokeToken(tokenToRevoke);
+      } catch (err) {
+        console.warn(
+          "disconnectGoogle: token revoke failed, continuing:",
+          err?.response?.data || err?.message,
+        );
+      }
+    }
+
+    const { error: deleteError } = await supabase
+      .from("user_google_accounts")
+      .delete()
+      .eq("user_id", userId);
+
+    if (deleteError) throw deleteError;
+
+    res.json({ success: true });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to fetch sheets" });
+    console.error("disconnectGoogle error:", err);
+    res.status(500).json({ error: "Failed to disconnect Google account" });
+  }
+};
+
+// Token + config the frontend needs to open the Google Picker.
+export const getPickerToken = async (req, res) => {
+  try {
+    const userId = req.user.user_id;
+
+    if (!process.env.GOOGLE_PICKER_API_KEY || !process.env.GOOGLE_PROJECT_NUMBER) {
+      console.error(
+        "getPickerToken: GOOGLE_PICKER_API_KEY / GOOGLE_PROJECT_NUMBER not set",
+      );
+      return res
+        .status(500)
+        .json({ error: "Google Picker is not configured on the server" });
+    }
+
+    let token;
+    try {
+      token = await getPickerAccessToken(userId);
+    } catch (err) {
+      console.error("getPickerToken token error:", err?.message || err);
+      return res.status(400).json({
+        error:
+          "Google account is not connected or the connection expired. Please reconnect Google from the Integrations page.",
+        code: "GOOGLE_NOT_CONNECTED",
+      });
+    }
+
+    res.json({
+      ...token,
+      apiKey: process.env.GOOGLE_PICKER_API_KEY,
+      appId: process.env.GOOGLE_PROJECT_NUMBER,
+    });
+  } catch (err) {
+    console.error("getPickerToken error:", err);
+    res.status(500).json({ error: "Failed to get Google Picker token" });
   }
 };
 
@@ -122,10 +222,21 @@ export const importContactsFromSheet = async (req, res) => {
 
     const sheets = await getSheetsClient(userId);
 
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId,
-      range: "A1:C1000",
-    });
+    let response;
+    try {
+      response = await sheets.spreadsheets.values.get({
+        spreadsheetId,
+        range: "A1:C1000",
+      });
+    } catch (err) {
+      if (isGoogleFileAccessError(err)) {
+        return res.status(403).json({
+          error: SHEET_ACCESS_REQUIRED_ERROR,
+          code: "SHEET_ACCESS_REQUIRED",
+        });
+      }
+      throw err;
+    }
 
     const rows = response.data.values;
 
@@ -411,10 +522,24 @@ export const syncContactsFromSheet = async (req, res) => {
 
     const sheets = await getSheetsClient(userId);
 
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId,
-      range: "A1:C1000",
-    });
+    let response;
+    try {
+      response = await sheets.spreadsheets.values.get({
+        spreadsheetId,
+        range: "A1:C1000",
+      });
+    } catch (err) {
+      // Groups linked before the drive.file switch lose access once the user
+      // reconnects; the frontend re-opens the Picker on this code.
+      if (isGoogleFileAccessError(err)) {
+        return res.status(403).json({
+          error: SHEET_ACCESS_REQUIRED_ERROR,
+          code: "SHEET_ACCESS_REQUIRED",
+          spreadsheetId,
+        });
+      }
+      throw err;
+    }
 
     const rows = response.data.values;
 

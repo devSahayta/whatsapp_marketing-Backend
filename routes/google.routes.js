@@ -1,10 +1,11 @@
 import express from "express";
 import {
   connectGoogle,
+  disconnectGoogle,
   googleCallback,
   importContactsFromSheet,
   exportCampaignToSheet,
-  getGoogleSheets,
+  getPickerToken,
   syncContactsFromSheet,
 } from "../controllers/google.controller.js";
 import { authenticateUser } from "../middleware/authMiddleware.js";
@@ -16,7 +17,8 @@ router.get("/callback", googleCallback);
 
 // Protected routes
 router.get("/connect", authenticateUser, connectGoogle);
-router.get("/sheets", authenticateUser, getGoogleSheets);
+router.delete("/disconnect", authenticateUser, disconnectGoogle);
+router.get("/picker-token", authenticateUser, getPickerToken);
 router.post("/import-contacts", authenticateUser, importContactsFromSheet);
 router.post("/export-campaign", authenticateUser, exportCampaignToSheet);
 router.post("/sync-contacts", authenticateUser, syncContactsFromSheet);
