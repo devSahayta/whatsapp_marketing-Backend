@@ -38,6 +38,26 @@ function countRequiredVariables(components) {
 }
 
 /**
+ * Find URL buttons whose url has a {{N}} placeholder.
+ * Returns [{ index, text, url }] — index is the position in the full BUTTONS
+ * list, which is what Meta expects in the send payload.
+ */
+function getDynamicUrlButtons(components) {
+  const buttonsComp = components.find(
+    (c) => (c.type || "").toUpperCase() === "BUTTONS",
+  );
+  if (!Array.isArray(buttonsComp?.buttons)) return [];
+
+  return buttonsComp.buttons
+    .map((btn, index) => ({ ...btn, index }))
+    .filter(
+      (btn) =>
+        (btn.type || "").toUpperCase() === "URL" && /\{\{\d+\}\}/.test(btn.url),
+    )
+    .map(({ index, text, url }) => ({ index, text, url }));
+}
+
+/**
  * Validate template requirements against the provided data, then
  * insert a row into scheduled_messages.
  *
@@ -49,6 +69,8 @@ function countRequiredVariables(components) {
  * @param {string}  params.wt_id             — whatsapp_templates primary key
  * @param {object}  [params.template_variables] — { "1": "Rahul", "2": "Order #123" }
  * @param {string}  [params.media_id]        — Meta media ID (overrides template's stored one)
+ * @param {Array|object} [params.button_parameters] — values for dynamic URL buttons:
+ *                                             array in button order, or object keyed by button index
  * @param {string}  params.scheduled_at      — ISO 8601 datetime string (future)
  * @param {string}  [params.timezone]        — e.g. "Asia/Kolkata" (default UTC)
  * @param {string}  [params.batch_id]        — caller-defined label to group scheduled messages
@@ -64,6 +86,7 @@ export async function createScheduledMessage({
   wt_id,
   template_variables = {},
   media_id = null,
+  button_parameters = null,
   scheduled_at,
   timezone = "UTC",
   batch_id = null,
@@ -164,7 +187,41 @@ export async function createScheduledMessage({
     }
   }
 
-  // ── 5. Insert into scheduled_messages ─────────────────────────────────────
+  // ── 5. Validate dynamic URL button values ─────────────────────────────────
+  // Stored as [{ button_index, value }] in scheduled_messages.button_variables;
+  // the scheduler turns these into button components at send time.
+  const dynamicUrlButtons = getDynamicUrlButtons(components);
+  const buttonVariables = [];
+
+  if (dynamicUrlButtons.length > 0) {
+    const missing = [];
+
+    dynamicUrlButtons.forEach((btn, i) => {
+      const value = Array.isArray(button_parameters)
+        ? button_parameters[i]
+        : button_parameters?.[String(btn.index)];
+
+      if (value === undefined || value === null || String(value).trim() === "") {
+        missing.push(btn.index);
+        return;
+      }
+      buttonVariables.push({ button_index: btn.index, value: String(value) });
+    });
+
+    if (missing.length > 0) {
+      return {
+        success: false,
+        error:
+          "Template has dynamic URL button(s) that need a value. Pass button_parameters.",
+        code: "MISSING_BUTTON_PARAMETERS",
+        dynamic_url_buttons: dynamicUrlButtons,
+        missing_button_indices: missing,
+        hint: 'Use an array in button order, e.g. "button_parameters": ["ORD-1234"], or an object keyed by button index, e.g. { "1": "ORD-1234" }. Send only the value that replaces {{1}}, not the full URL.',
+      };
+    }
+  }
+
+  // ── 6. Insert into scheduled_messages ─────────────────────────────────────
   const { data: inserted, error: insertErr } = await supabase
     .from("scheduled_messages")
     .insert({
@@ -175,6 +232,7 @@ export async function createScheduledMessage({
       wt_id,
       template_variables: template_variables ?? {},
       media_id: effectiveMediaId,
+      button_variables: buttonVariables,
       scheduled_at: scheduledDate.toISOString(),
       timezone,
       status: "scheduled",

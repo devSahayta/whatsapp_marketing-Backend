@@ -187,9 +187,37 @@ export const getTemplates = async (req, res) => {
     "language": "en_US",           // optional, default en_US
     "parameters": ["John", "7 days"], // body text parameters in order
     "header_media_id": "abc123"    // optional — if template has media header
+    "button_parameters": ["ORD-1234"], // required if template has dynamic URL buttons
+                                   // (url like https://site.com/track/{{1}}).
+                                   // Array → one value per dynamic URL button, in order.
+                                   // Object → keyed by button index, e.g. { "1": "ORD-1234" }.
+                                   // Send only the {{1}} suffix, not the full URL.
     "sender_type": "admin"         // optional, default "admin"
   }
 */
+
+/**
+ * Find the template's URL buttons whose url contains a {{N}} placeholder.
+ * Returns [{ index, text, url }] where index is the button's position in the
+ * full BUTTONS list — that's the index Meta expects in the send payload.
+ */
+function getDynamicUrlButtons(template) {
+  const components = template?.components?.length
+    ? template.components
+    : template?.preview?.components || [];
+  const buttonsComponent = components.find(
+    (c) => (c.type || "").toUpperCase() === "BUTTONS",
+  );
+  if (!Array.isArray(buttonsComponent?.buttons)) return [];
+
+  return buttonsComponent.buttons
+    .map((btn, index) => ({ ...btn, index }))
+    .filter(
+      (btn) =>
+        (btn.type || "").toUpperCase() === "URL" && /\{\{\d+\}\}/.test(btn.url),
+    )
+    .map(({ index, text, url }) => ({ index, text, url }));
+}
 
 export const sendTemplateMessage = async (req, res) => {
   try {
@@ -200,6 +228,7 @@ export const sendTemplateMessage = async (req, res) => {
       language = "en_US",
       parameters = [],
       header_media_id,
+      button_parameters,
       sender_type = "admin",
     } = req.body;
 
@@ -213,7 +242,9 @@ export const sendTemplateMessage = async (req, res) => {
     // Fetch template from DB to get header_format
     const { data: template } = await supabase
       .from("whatsapp_templates")
-      .select("name, language, header_format, media_id, components, buttons")
+      .select(
+        "name, language, header_format, media_id, components, buttons, preview",
+      )
       .eq("account_id", wa_id)
       .eq("name", template_name)
       .maybeSingle();
@@ -248,6 +279,43 @@ export const sendTemplateMessage = async (req, res) => {
         type: "body",
         parameters: parameters.map((p) => ({ type: "text", text: String(p) })),
       });
+    }
+
+    // Build URL button parameters for dynamic URL buttons ({{1}} in the url).
+    // Static URL and quick-reply buttons need nothing here.
+    const dynamicUrlButtons = getDynamicUrlButtons(template);
+    if (dynamicUrlButtons.length > 0) {
+      const missing = [];
+
+      dynamicUrlButtons.forEach((btn, i) => {
+        const value = Array.isArray(button_parameters)
+          ? button_parameters[i]
+          : button_parameters?.[String(btn.index)];
+
+        if (value === undefined || value === null || String(value).trim() === "") {
+          missing.push(btn);
+          return;
+        }
+
+        components.push({
+          type: "button",
+          sub_type: "url",
+          index: String(btn.index),
+          parameters: [{ type: "text", text: String(value) }],
+        });
+      });
+
+      if (missing.length > 0) {
+        logUsage(req, 400, "Missing button_parameters for dynamic URL button");
+        return res.status(400).json({
+          error:
+            "Template has dynamic URL button(s) that need a value. Pass button_parameters.",
+          code: "MISSING_BUTTON_PARAMETERS",
+          dynamic_url_buttons: dynamicUrlButtons,
+          missing_button_indices: missing.map((b) => b.index),
+          hint: 'Use an array in button order, e.g. "button_parameters": ["ORD-1234"], or an object keyed by button index, e.g. { "1": "ORD-1234" }. Send only the value that replaces {{1}}, not the full URL.',
+        });
+      }
     }
 
     const payload = {
@@ -720,6 +788,8 @@ export const sendInteractiveMessage = async (req, res) => {
     "template_variables":  { "1": "Rahul", "2": "Order #123" },  // if template needs vars
     "media_id":            "<meta media id>",   // only if template has media header AND
                                                 // the template doesn't already have one stored
+    "button_parameters":   ["ORD-1234"],        // if template has dynamic URL buttons — same
+                                                // format as POST /v1/messages/template
     "scheduled_at":        "2026-04-25T18:30:00+05:30",
     "timezone":            "Asia/Kolkata",       // optional, informational
     "batch_id":            "diwali-offer-2026"   // optional, ≤100 chars — same value on many
@@ -732,6 +802,7 @@ export const sendInteractiveMessage = async (req, res) => {
   - scheduled_at must be in the future
   - If template HEADER is IMAGE/VIDEO/DOCUMENT → media_id required
   - If template BODY has {{N}} vars → all must be provided in template_variables
+  - If template has URL buttons with {{1}} → a value per button in button_parameters
 */
 export const scheduleTemplateMessage = async (req, res) => {
   try {
@@ -742,6 +813,7 @@ export const scheduleTemplateMessage = async (req, res) => {
       wt_id,
       template_variables = {},
       media_id = null,
+      button_parameters = null,
       scheduled_at,
       timezone = "UTC",
     } = req.body;
@@ -769,6 +841,7 @@ export const scheduleTemplateMessage = async (req, res) => {
       wt_id,
       template_variables,
       media_id,
+      button_parameters,
       scheduled_at,
       timezone,
       batch_id,
@@ -788,6 +861,10 @@ export const scheduleTemplateMessage = async (req, res) => {
         }),
         ...(result.required_media_type && {
           required_media_type: result.required_media_type,
+        }),
+        ...(result.dynamic_url_buttons && {
+          dynamic_url_buttons: result.dynamic_url_buttons,
+          missing_button_indices: result.missing_button_indices,
         }),
       });
     }
