@@ -30,7 +30,7 @@ export const CAMPAIGN_TOOLS = [
   {
     name: "list_templates",
     description:
-      "Fetch all approved WhatsApp message templates. Returns each template's body text, variable count, variable names, header_format (TEXT/IMAGE/VIDEO/DOCUMENT), and media_id. For media templates (IMAGE/VIDEO/DOCUMENT), Claude must check if media_id is present and not expired before creating a campaign.",
+      "Fetch all WhatsApp message templates that are APPROVED or still PENDING Meta's review. Returns each template's status, body text, variable count, variable names, header_format (TEXT/IMAGE/VIDEO/DOCUMENT), and media_id. For media templates (IMAGE/VIDEO/DOCUMENT), Claude must check if media_id is present and not expired before creating a campaign. A campaign can be created against a PENDING template — it will be held and sent automatically once Meta approves it.",
     input_schema: {
       type: "object",
       properties: {
@@ -297,7 +297,7 @@ export const CAMPAIGN_TOOLS = [
   {
     name: "create_campaign",
     description:
-      "Create and schedule a WhatsApp campaign. IMPORTANT: Only call this AFTER (1) collecting all required template variable values from the user if the template has variables, (2) confirming media is available if it is a media template, (3) showing the full summary, and (4) the user has explicitly confirmed. Never call without confirmation.",
+      "Create and schedule a WhatsApp campaign. IMPORTANT: Only call this AFTER (1) collecting all required template variable values from the user if the template has variables, (2) confirming media is available if it is a media template, (3) showing the full summary, and (4) the user has explicitly confirmed. Never call without confirmation. The template may be APPROVED or still PENDING Meta's review — if PENDING, the campaign is created now and the scheduler will send it automatically the moment Meta approves the template; the result's pending_template_approval field tells you which case applies.",
     input_schema: {
       type: "object",
       properties: {
@@ -574,13 +574,16 @@ async function listTemplates(userId, search) {
       return { error: "No active WhatsApp account found." };
     }
 
+    // Includes PENDING templates (not just APPROVED) so the agent can create
+    // a campaign against a template that is still awaiting Meta's review —
+    // the campaign scheduler holds it and sends automatically once approved.
     const { data, error } = await supabase
       .from("whatsapp_templates")
       .select(
         "wt_id, name, category, language, status, components, variables, header_format, media_id, header_handle",
       )
       .eq("account_id", accountId)
-      .eq("status", "APPROVED")
+      .in("status", ["APPROVED", "PENDING"])
       .order("name", { ascending: true });
 
     if (error) return { error: error.message };
@@ -596,8 +599,8 @@ async function listTemplates(userId, search) {
       return {
         templates: [],
         message: search
-          ? `No approved templates found matching "${search}".`
-          : "No approved templates found.",
+          ? `No approved or pending templates found matching "${search}".`
+          : "No approved or pending templates found.",
       };
     }
 
@@ -619,6 +622,8 @@ async function listTemplates(userId, search) {
           name: t.name,
           category: t.category,
           language: t.language,
+          status: t.status,
+          is_pending_approval: t.status === "PENDING",
           header_format: t.header_format || "TEXT",
           is_media_template: isMediaTemplate,
           // For media templates: the stored media_id (may be null or expired)
@@ -672,7 +677,7 @@ async function createCampaign(userId, input) {
       return { error: "Group not found or access denied." };
     }
 
-    // Validate template belongs to this account and is approved
+    // Validate template belongs to this account and is approved or pending
     const { data: template, error: templateErr } = await supabase
       .from("whatsapp_templates")
       .select(
@@ -686,9 +691,15 @@ async function createCampaign(userId, input) {
       return { error: "Template not found or access denied." };
     }
 
-    if (template.status !== "APPROVED") {
+    // A campaign can be created against a template that is still PENDING
+    // Meta's review — the campaign scheduler holds it (does not send) until
+    // whatsapp_templates.status flips to APPROVED, then sends automatically.
+    // Any other non-approved status (REJECTED, DISABLED, PAUSED, etc.) has
+    // nothing to wait for, so it is still blocked here exactly as before.
+    const isPendingApproval = template.status === "PENDING";
+    if (template.status !== "APPROVED" && !isPendingApproval) {
       return {
-        error: `Template "${template.name}" is not approved (status: ${template.status}).`,
+        error: `Template "${template.name}" cannot be used (status: ${template.status}).`,
       };
     }
 
@@ -841,6 +852,8 @@ async function createCampaign(userId, input) {
       campaign_name: campaign.campaign_name,
       group_name: group.group_name,
       template_name: template.name,
+      template_status: template.status,
+      pending_template_approval: isPendingApproval,
       scheduled_at: campaign.scheduled_at,
       total_recipients: contacts.length,
       template_variables,
