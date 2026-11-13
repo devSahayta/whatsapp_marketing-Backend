@@ -6,18 +6,13 @@ import waccountRoutes from "./routes/waccountRoutes.js";
 
 import userRoutes from "./routes/userRoutes.js"; // if you have these
 import groupRoutes from "./routes/groupRoutes.js";
-import uploadRoutes from "./routes/uploadRoutes.js";
-import creditRoutes from "./routes/creditRoutes.js";
 import whatsappRoutes from "./routes/whatsappRoutes.js";
 import { extractKindeUser } from "./middleware/extractKindeUser.js";
 import { authenticateUser } from "./middleware/authMiddleware.js";
 import chatRoutes from "./routes/chatRoutes.js";
-import travelItineraryRoutes from "./routes/travelItineraryRoutes.js";
 import whatsappTemplateRoutes from "./routes/whatsappTemplateRoutes.js";
-import knowledgeBaseRoutes from "./routes/knowledgeBaseRoutes.js";
 import adminChatRoutes from "./routes/adminChatRoutes.js";
 import agentRoutes from "./routes/agentRoutes.js";
-import flightTrackingRoutes from "./routes/flightRoutes.js";
 import analyticsRoutes from "./routes/analyticsRoutes.js";
 import campaignRoutes from "./routes/campaignRoutes.js";
 // import { startCampaignScheduler } from "./scheduler/campaignScheduler.js";
@@ -61,21 +56,16 @@ app.use("/api/groups", groupRoutes);
 // Protect all /api/uploads routes (your choice) — this keeps current behavior
 // app.use("/api/uploads", authenticateUser, uploadRoutes);
 
-app.use("/api/credits", creditRoutes);
-
 //chatdashboard and chatbot routes
 app.use("/", whatsappRoutes);
 app.use("/api", chatRoutes);
 app.use("/admin", adminChatRoutes);
 
-// app.use("/api", travelItineraryRoutes);
 app.use("/api/waccount", waccountRoutes);
 
 //route for whatapp template
 app.use("/api/watemplates", whatsappTemplateRoutes);
 
-//route for knowledge base
-app.use("/api/knowledge-bases", knowledgeBaseRoutes);
 //analytics route
 app.use("/api/analytics", analyticsRoutes);
 app.use("/api/campaigns", campaignRoutes);
@@ -111,9 +101,6 @@ app.use("/api/apikeys", apiKeyRoutes);
 app.use("/v1", publicApiRoutes);
 
 // Start scheduler
-
-//route for flight tracking
-// app.use("/api/flight-tracking", flightTrackingRoutes);
 
 //agent routes
 app.use("/api/agents", agentRoutes);
