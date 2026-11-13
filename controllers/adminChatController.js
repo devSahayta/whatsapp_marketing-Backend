@@ -92,7 +92,7 @@ export const sendAdminMessage = async (req, res) => {
 
       if (permission.reason === "TEMPLATE_ONLY_WAITING_FOR_USER") {
         errorMessage =
-          "Template sent. Please wait for the user to reply before sending messages.";
+          "Please wait for the user to reply before sending messages.";
       }
 
       return res.status(403).json({
