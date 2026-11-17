@@ -378,9 +378,25 @@ export const importContactsFromSheet = async (req, res) => {
   }
 };
 
+// Matches the status labels the dashboard shows, so a search for "processing" finds "sent" rows.
+const getDisplayStatus = (status) => {
+  if (status === "assumed_failed") return "undelivered";
+  if (status === "sent") return "processing";
+  return status;
+};
+
 export const exportCampaignToSheet = async (req, res) => {
   try {
     const { campaign_id } = req.body;
+    // Optional filters. Without them, every message is exported, as before.
+    const statusFilter =
+      typeof req.body.status === "string" && req.body.status.trim()
+        ? req.body.status.trim()
+        : null;
+    const searchFilter =
+      typeof req.body.search === "string" && req.body.search.trim()
+        ? req.body.search.trim().toLowerCase()
+        : null;
     const userId = req.user.user_id;
 
     if (!campaign_id) {
@@ -408,13 +424,21 @@ export const exportCampaignToSheet = async (req, res) => {
     let keepFetching = true;
 
     while (keepFetching) {
-      const { data: batch, error: messagesError } = await supabase
+      let query = supabase
         .from("campaign_messages")
         .select(
           "contact_name, phone_number, status, sent_at, delivered_at, read_at, failed_at, error_message",
         )
-        .eq("campaign_id", campaign_id)
-        .range(from, from + batchSize - 1);
+        .eq("campaign_id", campaign_id);
+
+      if (statusFilter) {
+        query = query.eq("status", statusFilter);
+      }
+
+      const { data: batch, error: messagesError } = await query.range(
+        from,
+        from + batchSize - 1,
+      );
 
       if (messagesError) throw messagesError;
 
@@ -425,6 +449,22 @@ export const exportCampaignToSheet = async (req, res) => {
       } else {
         from += batchSize;
       }
+    }
+
+    if (searchFilter) {
+      messages = messages.filter(
+        (m) =>
+          m.contact_name?.toLowerCase().includes(searchFilter) ||
+          m.phone_number?.includes(searchFilter) ||
+          m.status?.toLowerCase().includes(searchFilter) ||
+          getDisplayStatus(m.status)?.toLowerCase().includes(searchFilter),
+      );
+    }
+
+    if (messages.length === 0) {
+      return res
+        .status(400)
+        .json({ error: "No messages match the selected filters" });
     }
 
     // Check Google connection separately so we can give a clear error
@@ -439,7 +479,9 @@ export const exportCampaignToSheet = async (req, res) => {
     }
 
     // Create a new spreadsheet named after the campaign
-    const sheetTitle = `Campaign Export - ${campaign.campaign_name}`;
+    const sheetTitle = `Campaign Export - ${campaign.campaign_name}${
+      statusFilter ? ` (${getDisplayStatus(statusFilter)})` : ""
+    }`;
     const created = await sheets.spreadsheets.create({
       requestBody: {
         properties: { title: sheetTitle },
