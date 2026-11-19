@@ -446,32 +446,13 @@ async function check24hWindow(phone, user_id) {
     return { allowed: false, reason: "NO_USER_REPLY" };
   }
 
-  // 2. Last outbound template message
-  const { data: lastTemplateMsg } = await supabase
-    .from("messages")
-    .select("created_at")
-    .eq("chat_id", chat_id)
-    .eq("sender_type", "admin")
-    .eq("message_type", "template")
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  // If a template was sent AFTER the last user reply, the window is not yet open —
-  // we are waiting for the user to reply to that template first.
-  if (
-    lastTemplateMsg?.created_at &&
-    new Date(lastTemplateMsg.created_at) > new Date(lastUserMsg.created_at)
-  ) {
-    return { allowed: false, reason: "TEMPLATE_ONLY_WAITING_FOR_USER" };
-  }
-
-  // 3. 24-hour window from last user message
+  // 2. 24-hour window from last user message. A template sent after that
+  // reply does not close an open window (Meta's customer service window rule).
   const diffHours =
     (Date.now() - new Date(lastUserMsg.created_at).getTime()) /
     (1000 * 60 * 60);
 
-  if (diffHours > 24) {
+  if (diffHours >= 24) {
     return { allowed: false, reason: "WINDOW_EXPIRED" };
   }
 
@@ -502,8 +483,6 @@ export const sendTextMessage = async (req, res) => {
             "The contact has never replied to you. Only template messages are allowed to initiate a conversation.",
           WINDOW_EXPIRED:
             "The 24-hour messaging window has expired. Send a template message to re-open the conversation.",
-          TEMPLATE_ONLY_WAITING_FOR_USER:
-            "A template was sent but the contact hasn't replied yet. Wait for their reply before sending free-form text.",
         };
 
         const errorMessage =

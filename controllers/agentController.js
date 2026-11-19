@@ -301,7 +301,7 @@ export const testAgent = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── Static base prompt ────────────────────────────────────────────────────────
-const SAMVAADIK_SYSTEM_PROMPT = `You are Samvaadik AI, an assistant built into the Samvaadik WhatsApp marketing platform. You help users create and schedule campaigns through conversation.
+const SAMVAADIK_SYSTEM_PROMPT = `You are Samvaadik AI, an assistant built into the Samvaadik WhatsApp marketing platform. You help users create and schedule campaigns, and send one-to-one messages and templates to individual contacts, through conversation.
 
 Communicate like a knowledgeable colleague: clear, direct, no filler, no excessive punctuation. Do not use emojis. Write in plain sentences.
 
@@ -527,6 +527,36 @@ tell them in one sentence that this is done in the visual builder, then output o
 Example: "Adding nodes and connecting them is done in the visual builder."
 REDIRECT_TO_FLOWS:
 
+ONE-TO-ONE MESSAGING (send a message or a template to a single person):
+This is different from a campaign (which sends to a whole group). Use it when the user wants to message one person, e.g. "send a message to Rahul", "send a template to 9876543210".
+
+Step 1 - Identify the person
+Call find_contact with the name or phone number the user gave.
+- One clear match: use it.
+- Several matches: show a short numbered list (name and phone) and ask which one. Do not guess.
+- No match: if the user gave a full phone number, you can still send a TEMPLATE to it as a new contact (normal text is not possible because they have never replied). Otherwise ask for their phone number with country code.
+
+Step 2a - Normal text message
+WhatsApp only allows normal text within 24 hours of the person's last reply. Check can_send_text from find_contact:
+- true: ask for the message text if not given. Then show:
+  ───────────────────────
+  Message Preview
+  To: <name> (<phone>)
+  Message: <the exact text>
+  ───────────────────────
+  Ready to send this message?
+  Call send_text_message only after the user confirms, with phone_number copied from the preview's "To:" line and the exact message text. Do not pass a chat_id.
+  Report the tool result truthfully. Only if the result has sent: true, reply in one plain sentence: the message was sent to <name>. If sent is false, say the message was NOT sent and give the reason from the error.
+  If the user explicitly asks to send the same message again, no new preview is needed — call send_text_message again with the same phone_number and text, and report the real result.
+- false with text_block_reason NO_USER_REPLY: explain in one sentence that this person has not replied yet, so WhatsApp only allows a template, and offer to send a template.
+- false with text_block_reason WINDOW_EXPIRED: explain in one sentence that their last reply was more than 24 hours ago, so WhatsApp only allows a template now, and offer to send a template.
+If send_text_message returns WINDOW_EXPIRED or NO_USER_REPLY, explain the same way and offer a template.
+
+Step 2b - Template message
+Templates can be sent any time. Do NOT ask in chat which template to use or for variable values, and do NOT call list_templates for this — the template picker handles choosing, filling values, preview and sending.
+You MUST call open_template_picker in the same turn, every time, with phone_number (always) plus chat_id if find_contact returned one in this turn, and contact_name if known — even if you called it earlier in the conversation. The button only appears when this tool has been called in the current turn. After the tool returns, reply in one short sentence only, for example "Choose the template for Rahul using the button below." Do NOT write any token, placeholder, code or ID yourself.
+If the user later says the template was sent, acknowledge in one sentence. Do not call open_template_picker again unless asked.
+
 OTHER RULES:
 - After create_campaign succeeds: if the result's pending_template_approval is true, reply in one or two plain sentences confirming the campaign was created and will send automatically as soon as Meta approves the "<template_name>" template (usually minutes to a few hours) — include the scheduled IST time too. If pending_template_approval is false, reply in one plain sentence as before: campaign name, group, and IST time (use scheduled_at_ist from the result). No emojis. Then stop.
 - If a tool returns an error containing "Invalid scheduled time", tell the user there was a datetime error and ask them to state the schedule time again clearly in IST (e.g. "tomorrow at 3pm IST").
@@ -563,6 +593,26 @@ function buildSystemPrompt() {
 }
 
 const MAX_TOOL_ITERATIONS = 8;
+
+// The frontend shows the "Choose template" button when the reply contains
+// OPEN_TEMPLATE_PICKER:<chat_id|new>|<phone>|<name>. The server appends it
+// instead of trusting the model to copy it, and removes anything the model
+// wrote in its place (token attempts, placeholders, raw UUIDs).
+function attachPickerToken(text, token) {
+  if (!token) return text;
+  const cleaned = String(text || "")
+    .replace(/`?OPEN_TEMPLATE_PICKER:\S*`?/g, "")
+    .replace(/<[^>\n]*picker[^>\n]*>/gi, "")
+    .replace(
+      /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi,
+      "",
+    )
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  const body = cleaned || "Choose the template using the button below.";
+  return `${body}\n${token}`;
+}
 
 // ── handleSamvaadikChat ───────────────────────────────────────────────────────
 export const handleSamvaadikChat = async (req, res) => {
@@ -617,10 +667,24 @@ export const handleSamvaadikChat = async (req, res) => {
     }
 
     // Trim to last 20 messages to prevent context bloat across multiple campaigns
-    const trimmedMessages =
-      messages.length > 20 ? messages.slice(-20) : messages;
+    // Earlier picker tokens are replaced with a short note so the model
+    // never sees (and imitates) them.
+    const trimmedMessages = (
+      messages.length > 20 ? messages.slice(-20) : messages
+    ).map((m) =>
+      m.role === "assistant" && m.content.includes("OPEN_TEMPLATE_PICKER:")
+        ? {
+            ...m,
+            content: m.content.replace(
+              /OPEN_TEMPLATE_PICKER:\S*/g,
+              "[Choose template button shown]",
+            ),
+          }
+        : m,
+    );
     let currentMessages = [...trimmedMessages];
     let iteration = 0;
+    let pickerToken = null; // set when open_template_picker succeeds this turn
 
     // ── Detect if user just confirmed a campaign or agent summary ─────────────
     // If yes, force Claude to call a tool on the first iteration using tool_choice:any.
@@ -629,7 +693,7 @@ export const handleSamvaadikChat = async (req, res) => {
     const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
     const isConfirmation =
       lastUserMsg &&
-      /^(yes|yeah|yep|confirm|go ahead|sure|ok|okay|proceed|do it|create it|create( the)? (campaign|agent)|correct|crct|looks good|that('s| is) (fine|good|correct)|yep do it)$/i.test(
+      /^(yes|yeah|yep|confirm|go ahead|sure|ok|okay|proceed|do it|create it|create( the)? (campaign|agent)|send( it)?|send (the )?message|correct|crct|looks good|that('s| is) (fine|good|correct)|yep do it)$/i.test(
         lastUserMsg.content.trim(),
       );
 
@@ -648,7 +712,10 @@ export const handleSamvaadikChat = async (req, res) => {
           ))) ||
         // Agent preview pending
         (lastAssistantMsg.content.includes("Agent Preview") &&
-          lastAssistantMsg.content.includes("Ready to create this agent")));
+          lastAssistantMsg.content.includes("Ready to create this agent")) ||
+        // One-to-one text message preview pending
+        (lastAssistantMsg.content.includes("Message Preview") &&
+          lastAssistantMsg.content.includes("Ready to send this message")));
 
     // Force tool use only when user confirmed AND a summary was just shown
     const forceToolUse = isConfirmation && hasSummaryPending;
@@ -659,13 +726,34 @@ export const handleSamvaadikChat = async (req, res) => {
       );
     }
 
+    // Set when the model promises the template button without having called
+    // open_template_picker — the next iteration forces exactly that tool.
+    let forcePickerTool = false;
+    let pickerRetried = false;
+
+    // Outcome of the last send_text_message call this turn (null = not called).
+    // Used so the reply can never claim a message was sent when it was not.
+    let lastTextSend = null;
+    let forceSendTool = false;
+    let sendRetried = false;
+    const confirmedMessagePreview =
+      forceToolUse &&
+      lastAssistantMsg?.content.includes("Message Preview");
+
     while (iteration < MAX_TOOL_ITERATIONS) {
       iteration++;
 
       // First iteration after confirmation: force a tool call so Claude cannot
       // hallucinate a confirmation text. After that, let Claude respond freely.
-      const toolChoice =
-        forceToolUse && iteration === 1 ? { type: "any" } : { type: "auto" };
+      const toolChoice = forcePickerTool
+        ? { type: "tool", name: "open_template_picker" }
+        : forceSendTool
+          ? { type: "tool", name: "send_text_message" }
+          : forceToolUse && iteration === 1
+            ? { type: "any" }
+            : { type: "auto" };
+      forcePickerTool = false;
+      forceSendTool = false;
 
       const response = await anthropic.messages.create({
         model: "claude-haiku-4-5-20251001",
@@ -680,10 +768,72 @@ export const handleSamvaadikChat = async (req, res) => {
 
       if (stop_reason === "end_turn") {
         const textBlock = content.find((b) => b.type === "text");
+
+        // Guard: the reply points to a template button but the picker tool
+        // was never called this turn, so no button would appear. Make the
+        // model call it (once), then let it answer again.
+        const promisesPicker =
+          /template/i.test(textBlock?.text || "") &&
+          /button (below|above)/i.test(textBlock?.text || "") &&
+          !/REDIRECT_TO_TEMPLATES|GOOGLE_/.test(textBlock?.text || "");
+        if (promisesPicker && !pickerToken && !pickerRetried) {
+          console.warn(
+            "[SamvaadikAI] Template button promised without open_template_picker — forcing the tool call",
+          );
+          pickerRetried = true;
+          forcePickerTool = true;
+          currentMessages.push({ role: "assistant", content });
+          currentMessages.push({
+            role: "user",
+            content:
+              "(System note, not from the user) You mentioned the template button but did not call open_template_picker, so no button is shown. Call open_template_picker now with the exact chat_id from find_contact, or the phone_number for a new contact. Then reply again in one short sentence.",
+          });
+          continue;
+        }
+
+        let replyText = textBlock?.text || "";
+        const claimsSent =
+          /\bsent\b/i.test(replyText) &&
+          !/\b(not|n't|unable|fail|failed|couldn|could not|cannot)\b/i.test(
+            replyText,
+          );
+
+        // Guard: user confirmed a Message Preview but the model replied
+        // without calling send_text_message. Force the call once.
+        if (confirmedMessagePreview && !lastTextSend && !sendRetried) {
+          console.warn(
+            "[SamvaadikAI] Message confirmed but send_text_message not called — forcing the tool call",
+          );
+          sendRetried = true;
+          forceSendTool = true;
+          currentMessages.push({ role: "assistant", content });
+          currentMessages.push({
+            role: "user",
+            content:
+              "(System note, not from the user) The user confirmed the Message Preview but send_text_message was not called, so nothing was sent. Call send_text_message now with the phone_number from the preview's 'To:' line and the exact message text. Then report the real result.",
+          });
+          continue;
+        }
+
+        // Guard: never tell the user a text was sent when the tool failed
+        // (or was never called).
+        if (claimsSent && lastTextSend && !lastTextSend.sent) {
+          const reason = String(lastTextSend.error || "")
+            .replace(/^MESSAGE NOT SENT:\s*/i, "")
+            .trim();
+          replyText = `The message was not sent. ${reason || "Please try again."}`;
+          if (["NO_USER_REPLY", "WINDOW_EXPIRED"].includes(lastTextSend.code)) {
+            replyText += " Would you like to send a template instead?";
+          }
+        } else if (claimsSent && !lastTextSend && confirmedMessagePreview) {
+          replyText =
+            "The message was not sent because something went wrong. Please try again.";
+        }
+
         return res.json({
           success: true,
           role: "assistant",
-          content: textBlock?.text || "",
+          content: attachPickerToken(replyText, pickerToken),
           usage,
           iterations: iteration,
         });
@@ -700,6 +850,19 @@ export const handleSamvaadikChat = async (req, res) => {
               JSON.stringify(block.input),
             );
             const result = await executeTool(block.name, block.input, user_id);
+            // The template-picker token is attached to the reply by the server
+            // (see attachPickerToken). Hide it from the model so it can't
+            // echo a mangled copy (placeholder text / bare UUID).
+            if (block.name === "send_text_message") {
+              lastTextSend = result || { sent: false, error: "No result" };
+            }
+            if (
+              block.name === "open_template_picker" &&
+              result?.picker_token
+            ) {
+              pickerToken = result.picker_token;
+              delete result.picker_token;
+            }
             console.log(
               `[SamvaadikAI] Tool result: ${block.name}`,
               JSON.stringify(result),

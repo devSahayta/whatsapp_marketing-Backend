@@ -5,6 +5,11 @@ import { v4 as uuidv4 } from "uuid";
 import { supabase } from "../config/supabase.js";
 import * as wsService from "../services/whatsappTemplateService.js";
 import { getSheetsClient, getDriveClient } from "../services/google.service.js";
+import {
+  getTextWindowStatus,
+  sendTextToChat,
+  normalizePhone,
+} from "../services/chatMessagingService.js";
 
 // ─────────────────────────────────────────────
 // TOOL DEFINITIONS  (sent to Anthropic API)
@@ -379,6 +384,65 @@ export const CAMPAIGN_TOOLS = [
       required: ["group_name", "spreadsheet_id"],
     },
   },
+  {
+    name: "find_contact",
+    description:
+      "Find a person to message one-to-one, by name or phone number. Searches the user's chats and contact groups. Returns each match's chat_id (null if they have never been messaged), name, phone, and whether a normal text message is allowed right now (can_send_text, text_block_reason, hours_left_in_window). WhatsApp only allows free-form text within 24 hours of the person's last reply; otherwise only a template can be sent.",
+    input_schema: {
+      type: "object",
+      properties: {
+        search: {
+          type: "string",
+          description: "Name or phone number (or part of it) of the person.",
+        },
+      },
+      required: ["search"],
+    },
+  },
+  {
+    name: "send_text_message",
+    description:
+      "Send a normal (free-form) WhatsApp text message to one person in an existing chat. Only works when find_contact returned can_send_text: true. Only call this AFTER showing the Message Preview and receiving explicit confirmation. The person is identified by phone_number — copy it from the 'To:' line of the Message Preview.",
+    input_schema: {
+      type: "object",
+      properties: {
+        phone_number: {
+          type: "string",
+          description:
+            "The person's phone number exactly as shown in the Message Preview 'To:' line (digits with country code).",
+        },
+        message: {
+          type: "string",
+          description: "The exact message text the user approved.",
+        },
+      },
+      required: ["phone_number", "message"],
+    },
+  },
+  {
+    name: "open_template_picker",
+    description:
+      "Prepare the template picker so the user can choose an approved template, fill its values, preview and send it to one person. Templates can be sent any time, even outside the 24-hour window. Pass chat_id when find_contact returned one; otherwise pass the person's phone_number (a new contact). You must call this tool for the 'Choose template' button to appear — it is attached to your reply only after this tool succeeds in the current turn.",
+    input_schema: {
+      type: "object",
+      properties: {
+        chat_id: {
+          type: "string",
+          description: "Exact chat_id from find_contact, if the person has one.",
+        },
+        phone_number: {
+          type: "string",
+          description:
+            "Phone number with country code, used only when there is no chat_id.",
+        },
+        contact_name: {
+          type: "string",
+          description: "Optional name of the person (for a new contact).",
+        },
+      },
+      required: [],
+    },
+  },
 ];
 
 // ─────────────────────────────────────────────
@@ -411,6 +475,12 @@ export async function executeTool(toolName, toolInput, userId) {
       return await createGroupFromSheet(userId, toolInput);
     case "create_agent":
       return await createAgentTool(userId, toolInput);
+    case "find_contact":
+      return await findContact(userId, toolInput.search);
+    case "send_text_message":
+      return await sendTextMessageTool(userId, toolInput);
+    case "open_template_picker":
+      return await openTemplatePicker(userId, toolInput);
     default:
       return { error: `Unknown tool: ${toolName}` };
   }
@@ -1583,6 +1653,229 @@ async function createAgentTool(userId, input) {
       fallback_action: agent.fallback_action,
       exit_keywords: agent.exit_keywords,
       message: `Agent "${agent.name}" created successfully. You can find it on the Agents page and assign it to flows.`,
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// ─────────────────────────────────────────────
+// ONE-TO-ONE MESSAGING (find_contact / send_text_message / open_template_picker)
+// The 24-hour window rule lives in services/chatMessagingService.js and is
+// shared with the chat dashboard's /admin/chat/send route.
+// ─────────────────────────────────────────────
+
+const last10 = (phone) => String(phone || "").replace(/\D/g, "").slice(-10);
+
+async function findContact(userId, search) {
+  try {
+    const raw = String(search || "").trim();
+    // Keep only characters that are safe inside a PostgREST or() filter
+    const q = raw.replace(/[^\p{L}\p{N}\s.'+-]/gu, "").trim();
+    const digits = raw.replace(/\D/g, "");
+    const nameQ = q.replace(/[+\d]/g, "").trim();
+
+    if (!nameQ && digits.length < 4) {
+      return { error: "Give at least part of the person's name or 4+ digits of their phone number." };
+    }
+
+    const conditions = (nameCol, phoneCol) => {
+      const parts = [];
+      if (nameQ) parts.push(`${nameCol}.ilike.%${nameQ}%`);
+      if (digits.length >= 4) parts.push(`${phoneCol}.ilike.%${last10(digits)}%`);
+      return parts.join(",");
+    };
+
+    // 1. Existing chats (people already messaged / who messaged the business)
+    const { data: chats, error: chatErr } = await supabase
+      .from("chats")
+      .select("chat_id, phone_number, person_name, last_message_at")
+      .eq("user_id", userId)
+      .or(conditions("person_name", "phone_number"))
+      .order("last_message_at", { ascending: false })
+      .limit(8);
+    if (chatErr) return { error: chatErr.message };
+
+    // 2. Contacts in the user's groups who may not have a chat yet
+    const { data: groupContacts } = await supabase
+      .from("group_contacts")
+      .select("full_name, phone_number, groups!inner(user_id, group_name)")
+      .eq("groups.user_id", userId)
+      .or(conditions("full_name", "phone_number"))
+      .limit(15);
+
+    const results = await Promise.all(
+      (chats || []).map(async (c) => {
+        const w = await getTextWindowStatus(c.chat_id);
+        return {
+          chat_id: c.chat_id,
+          name:
+            c.person_name && c.person_name !== c.phone_number && c.person_name !== "Unknown"
+              ? c.person_name
+              : null,
+          phone: c.phone_number,
+          has_chat: true,
+          can_send_text: w.allowed,
+          text_block_reason: w.reason,
+          hours_left_in_window: w.hours_left,
+          last_user_reply_at: w.last_user_message_at,
+        };
+      }),
+    );
+
+    const seen = new Set(results.map((r) => last10(r.phone)));
+    for (const gc of groupContacts || []) {
+      const key = last10(gc.phone_number);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      results.push({
+        chat_id: null,
+        name: gc.full_name || null,
+        phone: normalizePhone(gc.phone_number) || gc.phone_number,
+        group_name: gc.groups?.group_name || null,
+        has_chat: false,
+        can_send_text: false,
+        text_block_reason: "NO_USER_REPLY",
+        hours_left_in_window: 0,
+      });
+      if (results.length >= 10) break;
+    }
+
+    if (results.length === 0) {
+      return {
+        contacts: [],
+        message: `No chat or contact found matching "${raw}".` +
+          (digits.length >= 10
+            ? " A template can still be sent to this phone number as a new contact."
+            : ""),
+      };
+    }
+    return { contacts: results };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+async function sendTextMessageTool(userId, input) {
+  try {
+    // Resolved by phone number (visible in the conversation) rather than a
+    // chat_id the model would have to remember — it tended to invent UUIDs.
+    const { phone_number, chat_id, message } = input || {};
+    if (!message?.trim()) {
+      return { success: false, sent: false, error: "message is required" };
+    }
+
+    let chat = null;
+    const phone = normalizePhone(phone_number);
+    if (phone) {
+      const { data, error } = await supabase
+        .from("chats")
+        .select("chat_id, user_id, phone_number, person_name")
+        .eq("user_id", userId)
+        .eq("phone_number", phone)
+        .order("last_message_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (error) return { success: false, sent: false, error: error.message };
+      chat = data;
+    } else if (chat_id) {
+      const { data } = await supabase
+        .from("chats")
+        .select("chat_id, user_id, phone_number, person_name")
+        .eq("chat_id", chat_id)
+        .eq("user_id", userId)
+        .maybeSingle();
+      chat = data;
+    }
+
+    if (!chat) {
+      return {
+        success: false,
+        sent: false,
+        error:
+          "MESSAGE NOT SENT: no chat found for this phone number. This person has never messaged you, so only a template can be sent.",
+        code: "NO_USER_REPLY",
+      };
+    }
+
+    const result = await sendTextToChat(chat, message);
+    if (!result.ok) {
+      return {
+        success: false,
+        sent: false,
+        error: `MESSAGE NOT SENT: ${result.error}`,
+        code: result.code,
+        ...(["NO_USER_REPLY", "WINDOW_EXPIRED"].includes(result.code) && {
+          suggestion: "Offer to send a template instead (open_template_picker).",
+        }),
+      };
+    }
+    return {
+      success: true,
+      sent: true,
+      sent_to: chat.person_name || chat.phone_number,
+      phone: chat.phone_number,
+    };
+  } catch (err) {
+    return { success: false, sent: false, error: `MESSAGE NOT SENT: ${err.message}` };
+  }
+}
+
+async function openTemplatePicker(userId, input) {
+  try {
+    const { chat_id, phone_number, contact_name } = input || {};
+    let chatId = null;
+    let phone;
+    let name = (contact_name || "").trim();
+
+    // A chat_id the model invented falls back to the phone number when given
+    let chat = null;
+    if (chat_id) {
+      const { data } = await supabase
+        .from("chats")
+        .select("chat_id, user_id, phone_number, person_name")
+        .eq("chat_id", chat_id)
+        .eq("user_id", userId)
+        .maybeSingle();
+      chat = data;
+      if (!chat && !phone_number) {
+        return { error: "Chat not found. Call find_contact again and pass the person's phone_number." };
+      }
+    }
+
+    if (chat) {
+      chatId = chat.chat_id;
+      phone = chat.phone_number;
+      if (!name && chat.person_name && chat.person_name !== phone && chat.person_name !== "Unknown") {
+        name = chat.person_name;
+      }
+    } else {
+      phone = normalizePhone(phone_number);
+      if (!phone) {
+        return { error: "Invalid phone number. Ask the user for the number with country code, e.g. +91 98765 43210." };
+      }
+      // Reuse an existing chat for this number if there is one
+      const { data: existing } = await supabase
+        .from("chats")
+        .select("chat_id, person_name")
+        .eq("user_id", userId)
+        .eq("phone_number", phone)
+        .limit(1)
+        .maybeSingle();
+      if (existing?.chat_id) {
+        chatId = existing.chat_id;
+        if (!name && existing.person_name && existing.person_name !== phone) name = existing.person_name;
+      }
+    }
+
+    const token = `OPEN_TEMPLATE_PICKER:${chatId || "new"}|${phone}|${encodeURIComponent(name)}`;
+    return {
+      ready: true,
+      contact_name: name || null,
+      phone,
+      picker_token: token,
+      instruction:
+        "Reply in one short sentence telling the user to choose the template using the button below. The button is added automatically; do not write any token or ID.",
     };
   } catch (err) {
     return { error: err.message };
