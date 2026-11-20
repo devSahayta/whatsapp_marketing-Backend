@@ -17,6 +17,8 @@ import analyticsRoutes from "./routes/analyticsRoutes.js";
 import campaignRoutes from "./routes/campaignRoutes.js";
 // import { startCampaignScheduler } from "./scheduler/campaignScheduler.js";
 import paymentRoutes from "./routes/paymentRoutes.js";
+import creditRoutes from "./routes/creditRoutes.js";
+import customPricingRoutes from "./routes/customPricingRoutes.js";
 import mediaRoutes from "./routes/mediaRoutes.js";
 import WarmupRoute from "./routes/warmup.js";
 import googleRoutes from "./routes/google.routes.js";
@@ -72,6 +74,10 @@ app.use("/api/campaigns", campaignRoutes);
 
 //Payment routes
 app.use("/api/payment", paymentRoutes);
+
+//Samvaadik AI credit system routes
+app.use("/api/credits", creditRoutes);
+app.use("/api/custom-pricing", customPricingRoutes);
 
 //mediaforCampaigns
 app.use("/api/media", mediaRoutes);

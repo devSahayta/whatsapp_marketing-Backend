@@ -1,4 +1,5 @@
 import { supabase } from "../config/supabase.js";
+import { grantFirstSubscriptionBonusIfEligible } from "./creditService.js";
 
 /**
  * Create or Extend Subscription
@@ -83,6 +84,17 @@ export const activateSubscription = async (userId, plan, paymentId) => {
       current_subscription_id: subscription.subscription_id,
     })
     .eq("user_id", userId);
+
+  // 6️⃣ One-time 1000 free AI credits for a user's first-ever subscription.
+  // Guarded atomically inside creditService so it never double-grants, even
+  // if this runs for both a renewal and a brand-new subscriber, or if the
+  // Razorpay webhook and the verify-payment call race each other.
+  try {
+    await grantFirstSubscriptionBonusIfEligible(userId);
+  } catch (err) {
+    // Never let a credit-bonus hiccup block subscription activation itself.
+    console.error("Free credit bonus grant failed:", err);
+  }
 
   return subscription;
 };

@@ -6,6 +6,15 @@ import { ANTHROPIC_API_KEY } from "../config/anthropic.js";
 import { CAMPAIGN_TOOLS, executeTool } from "../agents/agentTools.js";
 import { Readable } from "stream";
 import { parse as parseCsv } from "@fast-csv/parse";
+import {
+  deductCredits,
+  getCreditBalance,
+  InsufficientCreditsError,
+} from "../services/creditService.js";
+import {
+  usageToRealRupees,
+  realRupeesToCredits,
+} from "../config/creditConfig.js";
 
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
@@ -564,6 +573,26 @@ function buildSystemPrompt() {
 
 const MAX_TOOL_ITERATIONS = 8;
 
+// The assistant's own "you're out of credits" reply — same shape as any other
+// chat response, so the frontend doesn't need a special status-code path. The
+// REDIRECT_TO_PRICING: marker is picked up by FormattedMessage on the
+// frontend (see SamvaadikAssistant.jsx) to render a "Top Up Credits" card,
+// the same way REDIRECT_TO_TEMPLATES / REDIRECT_TO_FLOWS etc. already do.
+const buildOutOfCreditsPayload = (
+  creditsRemaining,
+  creditsChargedThisTurn = 0,
+) => ({
+  success: true,
+  role: "assistant",
+  content:
+    "You're out of Samvaadik AI credits, so I can't continue with this right now. " +
+    "Top up to keep chatting with me — once you're back I can pick up right where we left off.\n\n" +
+    "REDIRECT_TO_PRICING:",
+  credits_charged: creditsChargedThisTurn,
+  credits_remaining: creditsRemaining,
+  out_of_credits: true,
+});
+
 // ── handleSamvaadikChat ───────────────────────────────────────────────────────
 export const handleSamvaadikChat = async (req, res) => {
   try {
@@ -591,6 +620,22 @@ export const handleSamvaadikChat = async (req, res) => {
           .status(400)
           .json({ success: false, error: `Invalid role "${msg.role}".` });
       }
+    }
+
+    // ── Credits pre-check ───────────────────────────────────────────────────
+    // Refuse up front if the user has nothing left, instead of spending real
+    // Anthropic API cost on a turn we already know we can't bill for. This is
+    // a normal (200) chat-shaped response, not an error — the assistant
+    // itself tells the user, with a redirect card, same as any other
+    // "you need to do X first" message (see REDIRECT_TO_PRICING below).
+    let creditBalance;
+    try {
+      creditBalance = await getCreditBalance(user_id);
+    } catch (err) {
+      return res.status(404).json({ success: false, error: "User not found" });
+    }
+    if (creditBalance <= 0) {
+      return res.json(buildOutOfCreditsPayload(creditBalance));
     }
 
     // Build system prompt with current IST time + optional media attachment context
@@ -659,6 +704,53 @@ export const handleSamvaadikChat = async (req, res) => {
       );
     }
 
+    // Every iteration below is a separate Anthropic API call and therefore a
+    // separate real cost. Charged right after it happens (not lumped at the
+    // end of the whole turn) so a multi-tool-call turn that runs a user out
+    // of credits partway through is caught BEFORE the next, un-billable
+    // Anthropic call — not after racking up more cost we can't charge for.
+    let turnCreditsCharged = 0; // sum across every iteration of this turn
+
+    const chargeIteration = async (usage) => {
+      const realRupees = usageToRealRupees(usage);
+      const creditsCharged =
+        realRupees > 0 ? realRupeesToCredits(realRupees) : 0;
+
+      console.log(
+        `[SamvaadikAI][billing] user=${user_id} iteration=${iteration} ` +
+          `tokens(in=${usage?.input_tokens || 0}, out=${usage?.output_tokens || 0}, ` +
+          `cacheWrite=${usage?.cache_creation_input_tokens || 0}, cacheRead=${usage?.cache_read_input_tokens || 0}) ` +
+          `realCost=₹${realRupees.toFixed(4)} creditsCharged=${creditsCharged}`,
+      );
+
+      if (creditsCharged === 0) return;
+
+      try {
+        const updatedUser = await deductCredits(
+          user_id,
+          creditsCharged,
+          "Samvaadik AI Assistant usage",
+        );
+        creditBalance = Number(updatedUser.credits) || 0;
+        turnCreditsCharged += creditsCharged;
+        console.log(
+          `[SamvaadikAI][billing] user=${user_id} balance -> ${creditBalance}`,
+        );
+      } catch (err) {
+        if (err instanceof InsufficientCreditsError) {
+          // Balance couldn't cover this iteration's real cost. Treat the
+          // user as depleted (stops the turn before the next API call)
+          // without writing a charge the ledger would reject anyway.
+          console.warn(
+            `[SamvaadikAI][billing] user=${user_id} insufficient credits for this iteration (needed ${creditsCharged}) — treating as depleted.`,
+          );
+          creditBalance = 0;
+        } else {
+          console.error("[SamvaadikAI][billing] Credit deduction failed:", err);
+        }
+      }
+    };
+
     while (iteration < MAX_TOOL_ITERATIONS) {
       iteration++;
 
@@ -677,6 +769,7 @@ export const handleSamvaadikChat = async (req, res) => {
       });
 
       const { stop_reason, content, usage } = response;
+      await chargeIteration(usage);
 
       if (stop_reason === "end_turn") {
         const textBlock = content.find((b) => b.type === "text");
@@ -686,10 +779,21 @@ export const handleSamvaadikChat = async (req, res) => {
           content: textBlock?.text || "",
           usage,
           iterations: iteration,
+          credits_charged: turnCreditsCharged,
+          credits_remaining: creditBalance,
         });
       }
 
       if (stop_reason === "tool_use") {
+        // Claude wants another round (tool results fed back in), which means
+        // another billable Anthropic call. If this iteration's charge just
+        // used up what was left, stop here instead of making that call.
+        if (creditBalance <= 0) {
+          return res.json(
+            buildOutOfCreditsPayload(creditBalance, turnCreditsCharged),
+          );
+        }
+
         currentMessages.push({ role: "assistant", content });
 
         const toolResults = [];
@@ -722,6 +826,8 @@ export const handleSamvaadikChat = async (req, res) => {
         role: "assistant",
         content: "I ran into an unexpected issue. Please try again.",
         iterations: iteration,
+        credits_charged: turnCreditsCharged,
+        credits_remaining: creditBalance,
       });
     }
 
@@ -731,6 +837,8 @@ export const handleSamvaadikChat = async (req, res) => {
       content:
         "I had trouble completing that. Could you rephrase or break it into smaller steps?",
       iterations: iteration,
+      credits_charged: turnCreditsCharged,
+      credits_remaining: creditBalance,
     });
   } catch (err) {
     console.error("❌ handleSamvaadikChat:", err);

@@ -186,6 +186,104 @@ export const getSubscriptionStatus = async (req, res) => {
   });
 };
 
+/**
+ * Unified Payment Logs
+ * Merges subscription payments (payments table) and the credit ledger
+ * (credit_transactions table — top-ups, the one-time free-subscription
+ * bonus, future deductions) into one timeline for the "Payment Logs" page.
+ */
+export const getPaymentLogs = async (req, res) => {
+  try {
+    const { userId, page = 1, pageSize = 20 } = req.query;
+
+    if (!userId) {
+      return res.status(400).json({ message: "userId is required" });
+    }
+
+    // Subscription payments (plan purchases/renewals)
+    const { data: payments, error: paymentsError } = await supabase
+      .from("payments")
+      .select("*, plans(name)")
+      .eq("user_id", userId);
+
+    if (paymentsError) throw paymentsError;
+
+    // Credit ledger (top-ups + the one-time free-subscription bonus)
+    const { data: creditTxns, error: creditError } = await supabase
+      .from("credit_transactions")
+      .select("*")
+      .eq("user_id", userId);
+
+    if (creditError) throw creditError;
+
+    const subscriptionLogs = (payments || []).map((p) => ({
+      id: `payment_${p.payment_id}`,
+      // Fall back through every timestamp-ish column so an order that was
+      // created but never paid/webhooked still has a date to sort by.
+      date: p.paid_at || p.created_at || p.updated_at || p.created_on || null,
+      category: "subscription",
+      label: p.plans?.name
+        ? `${p.plans.name} subscription`
+        : "Subscription payment",
+      amount: p.amount != null ? Number(p.amount) : null,
+      credits: null,
+      status: p.status || "unknown",
+      razorpayPaymentId: p.razorpay_payment_id || null,
+      razorpayOrderId: p.razorpay_order_id || null,
+      planId: p.plan_id || null,
+    }));
+
+    const creditLogs = (creditTxns || []).map((t) => {
+      const defaultLabel =
+        t.type === "subscription_bonus"
+          ? "Free credits — first subscription"
+          : t.type === "purchase"
+            ? "Credit top-up"
+            : t.type === "deduction"
+              ? "Credits used"
+              : "Credit adjustment";
+
+      return {
+        id: `credit_${t.transaction_id}`,
+        date: t.created_at || null,
+        category: t.type, // 'purchase' | 'subscription_bonus' | 'deduction' | 'adjustment'
+        label: t.description || defaultLabel,
+        amount: t.amount_paid != null ? Number(t.amount_paid) : null,
+        credits: t.credits != null ? Number(t.credits) : null,
+        status: t.status || "unknown",
+        razorpayPaymentId: t.razorpay_payment_id || null,
+        razorpayOrderId: t.razorpay_order_id || null,
+        balanceAfter: t.balance_after != null ? Number(t.balance_after) : null,
+      };
+    });
+
+    // Every row is kept — created-but-unpaid orders and failed attempts
+    // included — so the page reflects the full payment history, not just
+    // successful ones. Rows with no timestamp at all (shouldn't normally
+    // happen) sort to the bottom instead of being dropped.
+    const allLogs = [...subscriptionLogs, ...creditLogs].sort((a, b) => {
+      if (!a.date && !b.date) return 0;
+      if (!a.date) return 1;
+      if (!b.date) return -1;
+      return new Date(b.date) - new Date(a.date);
+    });
+
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const size = Math.min(100, Math.max(1, parseInt(pageSize, 10) || 20));
+    const start = (pageNum - 1) * size;
+
+    res.json({
+      logs: allLogs.slice(start, start + size),
+      total: allLogs.length,
+      page: pageNum,
+      pageSize: size,
+    });
+  } catch (err) {
+    console.error("Get Payment Logs Error:", err);
+    res.status(500).json({ message: "Failed to fetch payment logs" });
+  }
+};
+
 export const getPlans = async (req, res) => {
   try {
     const { data, error } = await supabase
