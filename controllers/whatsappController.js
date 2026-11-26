@@ -20,7 +20,35 @@ import {
 import { createNotification } from "../controllers/notificationController.js";
 import { markCodOrderConfirmed } from "./woocommerceController.js";
 import { processAssistantInbound } from "./samvaadikWaController.js";
+import { getLinkByWaId, normalizeWaId } from "../services/samvaadikWaService.js";
 import crypto from "crypto";
+
+/**
+ * Decides whether an incoming message on the assistant number is meant for
+ * the assistant. A dedicated assistant number (not in whatsapp_accounts):
+ * always. A number that customers also use: only a "LINK XXXXXX" message or
+ * a message from a phone linked to the assistant — everything else belongs
+ * to the customer's chat. Any lookup error → customer path (safe default).
+ */
+async function isAssistantMessage(phoneNumberId, message) {
+  try {
+    const { count, error } = await supabase
+      .from("whatsapp_accounts")
+      .select("wa_id", { count: "exact", head: true })
+      .eq("phone_number_id", phoneNumberId);
+    if (error) throw error;
+    if (!count) return true; // dedicated assistant number
+
+    const text = message?.type === "text" ? message.text?.body || "" : "";
+    if (/^\s*link\s*[:\-]?\s*[a-z0-9]{6}\s*[.!]?\s*$/i.test(text)) return true;
+
+    const from = normalizeWaId(message?.from);
+    return !!(from && (await getLinkByWaId(from)));
+  } catch (err) {
+    console.error("[SamvaadikWA] isAssistantMessage check failed:", err);
+    return false;
+  }
+}
 
 /**
  * Verifies Meta's X-Hub-Signature-256 header (HMAC-SHA256 of the raw body
@@ -604,14 +632,18 @@ export const handleIncomingMessage = async (req, res) => {
   }
 
   // ── Samvaadik AI Assistant over WhatsApp ────────────────────────────────
-  // Messages to Samvaadik's OWN assistant number never belong to any
-  // customer's connected WABA (whatsapp_accounts), so they're routed here
-  // before the per-customer handling below — including its status updates
-  // (sent/delivered/read of the assistant's replies), which are ignored.
+  // Only incoming MESSAGES can be for the assistant. Status updates
+  // (sent/delivered/read) always continue to the normal handling below, so
+  // customer campaign/chat ticks keep working whatever the env says.
+  // If the assistant number is also a customer's number (whatsapp_accounts),
+  // only "LINK XXXXXX" and messages from linked phones go to the assistant;
+  // every other message is the customer's and is handled as before.
   // See samvaadikWaController.js.
   if (
+    value?.messages &&
     process.env.ASSISTANT_PHONE_NUMBER_ID &&
-    phoneNumberId === process.env.ASSISTANT_PHONE_NUMBER_ID
+    phoneNumberId === process.env.ASSISTANT_PHONE_NUMBER_ID &&
+    (await isAssistantMessage(phoneNumberId, value.messages[0]))
   ) {
     // The assistant can create campaigns and send messages for an account,
     // so only act on requests that really come from Meta.
@@ -620,7 +652,7 @@ export const handleIncomingMessage = async (req, res) => {
       return res.sendStatus(401);
     }
     res.sendStatus(200);
-    if (value?.messages) waitUntil(processAssistantInbound(value));
+    waitUntil(processAssistantInbound(value));
     return;
   }
 
