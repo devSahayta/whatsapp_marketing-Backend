@@ -428,7 +428,8 @@ export const CAMPAIGN_TOOLS = [
       properties: {
         chat_id: {
           type: "string",
-          description: "Exact chat_id from find_contact, if the person has one.",
+          description:
+            "Exact chat_id from find_contact, if the person has one.",
         },
         phone_number: {
           type: "string",
@@ -785,8 +786,9 @@ async function createCampaign(userId, input) {
 
       if (!effectiveMediaId) {
         return {
-          error: `MEDIA_REQUIRED: Template "${template.name}" is a ${template.header_format} template and requires a media file. Please go to the Templates page to upload media for this template, then come back to create the campaign.`,
+          error: `MEDIA_REQUIRED: Template "${template.name}" is a ${template.header_format} template and requires a media file before this campaign can be created.`,
           requires_media_upload: true,
+          template_id,
           template_name: template.name,
           header_format: template.header_format,
         };
@@ -799,8 +801,9 @@ async function createCampaign(userId, input) {
       );
       if (!mediaValidity.valid) {
         return {
-          error: `MEDIA_EXPIRED: The ${template.header_format} media for template "${template.name}" has ${mediaValidity.reason === "expired" ? `expired (uploaded ${mediaValidity.days_old} days ago — Meta expires media after 25 days)` : "not been found"}. Please go to the Templates page to upload fresh media, then come back to create the campaign.`,
+          error: `MEDIA_EXPIRED: The ${template.header_format} media for template "${template.name}" has ${mediaValidity.reason === "expired" ? `expired (uploaded ${mediaValidity.days_old} days ago — Meta expires media after 25 days)` : "not been found"}.`,
           requires_media_upload: true,
+          template_id,
           template_name: template.name,
           header_format: template.header_format,
           media_reason: mediaValidity.reason,
@@ -1665,7 +1668,10 @@ async function createAgentTool(userId, input) {
 // shared with the chat dashboard's /admin/chat/send route.
 // ─────────────────────────────────────────────
 
-const last10 = (phone) => String(phone || "").replace(/\D/g, "").slice(-10);
+const last10 = (phone) =>
+  String(phone || "")
+    .replace(/\D/g, "")
+    .slice(-10);
 
 async function findContact(userId, search) {
   try {
@@ -1676,13 +1682,17 @@ async function findContact(userId, search) {
     const nameQ = q.replace(/[+\d]/g, "").trim();
 
     if (!nameQ && digits.length < 4) {
-      return { error: "Give at least part of the person's name or 4+ digits of their phone number." };
+      return {
+        error:
+          "Give at least part of the person's name or 4+ digits of their phone number.",
+      };
     }
 
     const conditions = (nameCol, phoneCol) => {
       const parts = [];
       if (nameQ) parts.push(`${nameCol}.ilike.%${nameQ}%`);
-      if (digits.length >= 4) parts.push(`${phoneCol}.ilike.%${last10(digits)}%`);
+      if (digits.length >= 4)
+        parts.push(`${phoneCol}.ilike.%${last10(digits)}%`);
       return parts.join(",");
     };
 
@@ -1710,7 +1720,9 @@ async function findContact(userId, search) {
         return {
           chat_id: c.chat_id,
           name:
-            c.person_name && c.person_name !== c.phone_number && c.person_name !== "Unknown"
+            c.person_name &&
+            c.person_name !== c.phone_number &&
+            c.person_name !== "Unknown"
               ? c.person_name
               : null,
           phone: c.phone_number,
@@ -1744,7 +1756,8 @@ async function findContact(userId, search) {
     if (results.length === 0) {
       return {
         contacts: [],
-        message: `No chat or contact found matching "${raw}".` +
+        message:
+          `No chat or contact found matching "${raw}".` +
           (digits.length >= 10
             ? " A template can still be sent to this phone number as a new contact."
             : ""),
@@ -1806,7 +1819,8 @@ async function sendTextMessageTool(userId, input) {
         error: `MESSAGE NOT SENT: ${result.error}`,
         code: result.code,
         ...(["NO_USER_REPLY", "WINDOW_EXPIRED"].includes(result.code) && {
-          suggestion: "Offer to send a template instead (open_template_picker).",
+          suggestion:
+            "Offer to send a template instead (open_template_picker).",
         }),
       };
     }
@@ -1817,7 +1831,11 @@ async function sendTextMessageTool(userId, input) {
       phone: chat.phone_number,
     };
   } catch (err) {
-    return { success: false, sent: false, error: `MESSAGE NOT SENT: ${err.message}` };
+    return {
+      success: false,
+      sent: false,
+      error: `MESSAGE NOT SENT: ${err.message}`,
+    };
   }
 }
 
@@ -1839,20 +1857,31 @@ async function openTemplatePicker(userId, input) {
         .maybeSingle();
       chat = data;
       if (!chat && !phone_number) {
-        return { error: "Chat not found. Call find_contact again and pass the person's phone_number." };
+        return {
+          error:
+            "Chat not found. Call find_contact again and pass the person's phone_number.",
+        };
       }
     }
 
     if (chat) {
       chatId = chat.chat_id;
       phone = chat.phone_number;
-      if (!name && chat.person_name && chat.person_name !== phone && chat.person_name !== "Unknown") {
+      if (
+        !name &&
+        chat.person_name &&
+        chat.person_name !== phone &&
+        chat.person_name !== "Unknown"
+      ) {
         name = chat.person_name;
       }
     } else {
       phone = normalizePhone(phone_number);
       if (!phone) {
-        return { error: "Invalid phone number. Ask the user for the number with country code, e.g. +91 98765 43210." };
+        return {
+          error:
+            "Invalid phone number. Ask the user for the number with country code, e.g. +91 98765 43210.",
+        };
       }
       // Reuse an existing chat for this number if there is one
       const { data: existing } = await supabase
@@ -1864,7 +1893,8 @@ async function openTemplatePicker(userId, input) {
         .maybeSingle();
       if (existing?.chat_id) {
         chatId = existing.chat_id;
-        if (!name && existing.person_name && existing.person_name !== phone) name = existing.person_name;
+        if (!name && existing.person_name && existing.person_name !== phone)
+          name = existing.person_name;
       }
     }
 

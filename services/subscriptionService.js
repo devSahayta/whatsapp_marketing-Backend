@@ -1,3 +1,5 @@
+//src/services/subscriptionService.js
+
 import { supabase } from "../config/supabase.js";
 import { grantFirstSubscriptionBonusIfEligible } from "./creditService.js";
 

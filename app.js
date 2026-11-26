@@ -31,6 +31,8 @@ import shopifyRoutes from "./routes/shopifyRoutes.js";
 import apiKeyRoutes from "./routes/apiKeyRoutes.js";
 import publicApiRoutes from "./routes/publicApiRoutes.js";
 import notificationRoutes from "./routes/notificationRoutes.js";
+import autoPayRoutes from "./routes/autoPayRoutes.js";
+import subscriptionRenewalRoutes from "./routes/subscriptionRenewalRoutes.js";
 
 const app = express();
 app.use(express.json());
@@ -77,7 +79,9 @@ app.use("/api/payment", paymentRoutes);
 
 //Samvaadik AI credit system routes
 app.use("/api/credits", creditRoutes);
+app.use("/api/autopay", autoPayRoutes);
 app.use("/api/custom-pricing", customPricingRoutes);
+app.use("/api/subscription", subscriptionRenewalRoutes);
 
 //mediaforCampaigns
 app.use("/api/media", mediaRoutes);

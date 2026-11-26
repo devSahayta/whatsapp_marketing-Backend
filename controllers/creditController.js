@@ -5,6 +5,7 @@ import {
   createCreditOrder,
   verifyCreditPurchase,
   handleCreditPaymentCaptured,
+  purchaseCreditsWithSavedMethod,
   InsufficientCreditsError,
 } from "../services/creditService.js";
 import { getUserById } from "../models/userModel.js";
@@ -67,6 +68,35 @@ export const verify = async (req, res) => {
   } catch (err) {
     console.error("Verify credit purchase error:", err.message);
     res.status(400).json({ message: err.message || "Verification failed" });
+  }
+};
+
+// POST /api/credits/purchase-with-saved-method  { userId, credits?, packageId? }
+// One-click top-up: charges the user's saved default payment method
+// directly — no Razorpay popup, no separate verify step from the client.
+export const purchaseWithSavedMethod = async (req, res) => {
+  try {
+    const { userId, credits, packageId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ message: "userId is required" });
+    }
+    if (!credits && !packageId) {
+      return res
+        .status(400)
+        .json({ message: "Provide either a packageId or a credits amount" });
+    }
+
+    const result = await purchaseCreditsWithSavedMethod({
+      userId,
+      credits,
+      packageId,
+    });
+
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error("Purchase credits with saved method error:", err.message);
+    res.status(400).json({ message: err.message || "Charge failed" });
   }
 };
 

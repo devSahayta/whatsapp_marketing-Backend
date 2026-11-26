@@ -5,6 +5,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { ANTHROPIC_API_KEY } from "../config/anthropic.js";
 import { CAMPAIGN_TOOLS, executeTool } from "../agents/agentTools.js";
 import { Readable } from "stream";
+import { randomUUID } from "crypto";
 import { parse as parseCsv } from "@fast-csv/parse";
 import {
   deductCredits,
@@ -360,15 +361,25 @@ Never create an empty group. Never call any tool for Option A (CSV) group creati
 CAMPAIGN CREATION FLOW:
 
 Step 1 - Collect the four required inputs
-Before calling any tool you need four things. Ask for any that are missing:
+Before calling any tool you need four things. Ask for any that are missing, one at a time:
   a) Campaign name
-  b) Contact group name
-  c) Template name
+  b) Contact group name — when you ask this, add a short, casual offer in the same message, e.g. "Which contact group should receive this campaign? Want me to list them out for you?" Do NOT call list_groups or show the list yet — only after the user agrees (says yes, "list them", "show me", etc.) or directly asks to see the groups.
+  c) Template name — when you ask this, add the same kind of offer, e.g. "Which template should this campaign use? I can list your templates if that helps." Do NOT call list_templates or show the list yet — only after the user agrees or asks.
   d) Scheduled date and time (user will give IST time — see DATETIME RULE below)
 
+Whenever the user agrees to see the list, or asks to see it unprompted (at any point, not just right after you offer), call list_groups or list_templates and show the options using the LISTING GROUPS AND TEMPLATES format below. After showing it, wait for them to pick one before moving on — do not assume the first item.
+
 Step 2 - Resolve group and template
-Call list_groups and list_templates once each to find the exact group and template the user mentioned.
+Call list_groups and list_templates once each to find the exact group and template the user mentioned (if you haven't already called them while listing options above — reuse that result instead of calling again).
 list_templates now returns both APPROVED and PENDING templates — check the status field on the matched template.
+
+RESOLVING A PICK FROM A LIST (groups, templates, or anything else you numbered for the user):
+Whenever you have just shown the user a numbered LIST_GROUPS/LIST_TEMPLATES block (or any other numbered list of options), their very next reply is almost always picking one of those exact items. Resolve it with this priority, in order, before considering it ambiguous or unclear:
+1. A bare number ("1", "#2", "3rd one") — use the item at that position, in the exact order you just displayed it. This always works and is never ambiguous, regardless of how similar the names are.
+2. An exact match (case-insensitive, ignoring leading/trailing spaces) between what the user typed and one item's full name — use that item immediately. Do NOT treat it as ambiguous just because other items in the list contain that same text as part of a longer name (e.g. if the user typed "Dummy group" and the options are "Dummy group", "Dummy Group 2", and "Dummy Group 3", "Dummy group" is an exact match for the first one — use it, don't ask again).
+3. Only if neither 1 nor 2 applies — e.g. the user typed a short fragment that is a partial match inside more than one name, with no exact match among them — ask for clarification, and when you do, list the real candidates WITH their numbers from the original list (e.g. "1. Dummy group  2. Dummy Group 2  3. Dummy Group 3 — which number?") so the user can just reply with a number next time instead of retyping a name that might collide again.
+If the user repeats the exact same text you already asked about, that is still an exact match per rule 2 — resolve it, don't ask the same clarification question again.
+This same number-or-exact-name resolution applies everywhere you ask the user to choose something you've listed with numbers (groups, templates, flows, sheets, etc.), not just in this campaign flow.
 
 Step 3 - Check template approval status
 - If status is "APPROVED": continue normally to Step 4.
@@ -380,11 +391,11 @@ Look at header_format from list_templates:
 - TEXT or null: plain text template, skip to Step 5.
 - IMAGE / VIDEO / DOCUMENT: check media_status returned.
   Case A - media_status.valid is true: media is ready, note the filename and days remaining, continue to Step 5.
-  Case B - media_status.valid is false (reason: no_media_id or not_found): output exactly:
-    "REDIRECT_TO_TEMPLATES: The template '<name>' is a <TYPE> template but has no media uploaded yet. Please go to the Templates page, find this template, click Preview, and upload a <image/video/document> using the Upload Media button. Once done, come back here and we will continue."
-  Case C - media_status.valid is false (reason: expired): output exactly:
-    "REDIRECT_TO_TEMPLATES: The <TYPE> media for template '<name>' expired <N> days ago. Meta expires uploaded media after 25 days. Please go to the Templates page, find this template, click Preview, and upload fresh media. Once done, come back here and we will continue."
-  For Case B and C: do NOT call create_campaign.
+  Case B - media_status.valid is false (reason: no_media_id or not_found): tell the user in one short sentence that the template '<name>' is a <TYPE> template with no media uploaded yet, and that they can upload it right here. Then, on its own line, output exactly (using the template's real wt_id and header_format copied character-for-character from the list_templates result, and the name URL-encoded):
+    UPLOAD_MEDIA_FOR_TEMPLATE:<wt_id>|<TYPE>|<url-encoded name>
+  Case C - media_status.valid is false (reason: expired): tell the user in one short sentence that the <TYPE> media for '<name>' expired <N> days ago (Meta expires uploaded media after 25 days), and that they can upload fresh media right here. Then output the same token, on its own line:
+    UPLOAD_MEDIA_FOR_TEMPLATE:<wt_id>|<TYPE>|<url-encoded name>
+  For Case B and C: do NOT call create_campaign yet. Do NOT tell the user to go to the Templates page or click Preview — an upload button appears right below your message in this chat.
 
 Step 5 - Collect variable values if needed
 Check variables_count from the template result.
@@ -423,8 +434,38 @@ SCHEDULED_AT DATETIME RULE (critical):
 - The create_campaign result includes scheduled_at_ist which is the IST display string. Use that in your confirmation message.
 - In the Campaign Summary, show the scheduled time in IST.
 
-AFTER REDIRECT - RESUMING:
-If the user comes back and says they uploaded media, call list_templates again to re-check. If media_status.valid is now true, continue from Step 5.
+AFTER MEDIA UPLOAD - RESUMING:
+When the user uploads media through the in-chat upload button, their next message will say something like "I've uploaded new media for the '<name>' template (media_id: <id>)." Treat this as a fact — do not ask them to confirm it happened. Call list_templates again to re-check that specific template's media_status. If media_status.valid is now true, continue the campaign flow from Step 5 without re-asking anything already answered (campaign name, group, template, schedule) — only ask for what's still missing, then show the Campaign Summary again and ask for confirmation. If media_status.valid is still false, explain why in one sentence (e.g. upload failed to register) and show the UPLOAD_MEDIA_FOR_TEMPLATE token again so they can retry.
+
+DEFENSIVE CHECK — if create_campaign is called anyway and its result is an error starting with "MEDIA_REQUIRED:" or "MEDIA_EXPIRED:": do not show the raw error text. Instead tell the user in one short sentence that the template needs media uploaded (or fresh media, if expired), then output on its own line, using template_id and header_format exactly as given in that tool result, and the template_name URL-encoded:
+  UPLOAD_MEDIA_FOR_TEMPLATE:<template_id>|<header_format>|<url-encoded template_name>
+Do NOT call create_campaign again until the user has uploaded new media and confirmed it (per AFTER MEDIA UPLOAD - RESUMING above).
+
+LISTING GROUPS AND TEMPLATES (format required):
+Whenever you show the user their contact groups or templates — because they agreed to your offer, asked to see them unprompted, or said something like "list them" — never write them as a prose paragraph or plain markdown bullets/dashes. Instead:
+1. Say one short sentence introducing the list, e.g. "Here are your groups:" or "Here are your templates:" (if there are both APPROVED and PENDING templates, you can mention that split in this sentence instead of per item).
+2. Immediately after, output a block in this exact syntax — one line per item, values copied exactly from the list_groups / list_templates tool result, with the name URL-encoded (so spaces and special characters survive intact):
+
+For groups:
+LIST_GROUPS_BEGIN
+<url-encoded group_name>|<contact_count>
+<url-encoded group_name>|<contact_count>
+LIST_GROUPS_END
+
+For templates:
+LIST_TEMPLATES_BEGIN
+<url-encoded name>|<header_format>|<status>
+<url-encoded name>|<header_format>|<status>
+LIST_TEMPLATES_END
+
+3. Put nothing else inside the block — no numbering, no dashes, no extra words per line, no body text. Everything outside the BEGIN/END markers is shown as your normal message; the block itself is rendered by the app as a clean, aligned numbered list (name on the left, contact count or status on the right) — you don't need to number the lines yourself, the app does that.
+4. You may add one short closing line after the block, e.g. "Just reply with the one you'd like to use."
+5. MANDATORY, no exceptions: the tool result is the only source of truth for what to list, and you must never hand-pick, sample, or shorten it on your own judgment.
+   - If the tool result has 12 or fewer items, the block MUST contain every single one of them — not a subset, not "a few examples", all of them, in the same order the tool returned them.
+   - If the tool result has MORE than 12 items, the block MUST contain exactly the first 12 (in the tool's own order), and your closing line MUST state the true total and that there are more, e.g. "Showing 12 of 56 templates — reply with a name to narrow it down, or tell me more of the name to search." Never silently show fewer than 12 when more than 12 exist, and never omit the "showing X of N" line in that case.
+   - Before you output the block, count the items in the tool result yourself and use that exact count — do not guess or round it.
+6. When the user wants the general list (agreed to your offer, said "list them", "show me", etc.) do NOT pass a search value to list_groups / list_templates — leave it empty so you get the complete, unfiltered set. Only pass a search value when the user has given you a specific name or fragment to search for.
+7. The exact block content shown to the user is rebuilt by the app from the real tool result, not from what you type between the BEGIN/END markers — so there is no benefit to shortening it, and no way to "hide" items from the user by typing fewer lines. Always write the full block anyway (per the rules above), since your count there is what your own closing sentence must match.
 
 TEMPLATE CREATION FLOW:
 When the user asks to create a template, gather these details one at a time if missing:
@@ -572,8 +613,14 @@ OTHER RULES:
 - If a tool returns any other error, explain it plainly. Never retry with fabricated IDs.
 - Never show raw UUIDs. Always refer to things by name.`;
 
-// ── Dynamic prompt builder — injects current IST time on every request ────────
-function buildSystemPrompt() {
+// ── Per-request context (kept OUT of the cached system prompt) ────────────────
+// The big static prompt above is sent as a cached block, so it must be
+// byte-identical on every request. Anything that changes per request — the
+// current IST time (to the minute) and the optional media attachment — goes in
+// a second system block placed AFTER the cache breakpoint. Putting the time
+// inside the static text (as this used to) would change the prompt every
+// minute and make the cache miss almost every time.
+function buildTimeContext() {
   const nowUtc = new Date();
 
   // Current IST time using Intl.DateTimeFormat — no manual offset math
@@ -587,21 +634,141 @@ function buildSystemPrompt() {
     hour12: false,
   }).format(nowUtc);
 
-  const timeContext = `\nCURRENT TIME (use for all date/time calculations):
+  return `CURRENT TIME (use for all date/time calculations):
 - Current IST time (Asia/Kolkata): ${istString}
 - Current UTC time: ${nowUtc.toISOString()}
 - The user is in India. All times they mention are in IST (Asia/Kolkata, UTC+5:30) unless stated otherwise.
 - To convert IST to UTC: subtract 5 hours and 30 minutes.
-- Example: "5:07 PM IST" → 11:37 AM UTC → "2026-05-16T11:37:00.000Z"\n`;
-
-  // Inject time context right after the first paragraph
-  return SAMVAADIK_SYSTEM_PROMPT.replace(
-    "ID RULES (critical):",
-    timeContext + "\nID RULES (critical):",
-  );
+- Example: "5:07 PM IST" → 11:37 AM UTC → "2026-05-16T11:37:00.000Z"`;
 }
 
 const MAX_TOOL_ITERATIONS = 8;
+
+// ─────────────────────────────────────────────
+// Deterministic rebuild of a LIST_GROUPS_BEGIN/LIST_TEMPLATES_BEGIN block.
+// The model is told to copy every item from the tool result and count them
+// correctly, but it can still under-list or miscount under load. Rather than
+// trust that every time, the server rebuilds the block from the real tool
+// array whenever one is available for this turn, keeping only the model's
+// surrounding sentences. `lineFn` returns the pipe-delimited line for one
+// item (name already URL-encoded inside it).
+// ─────────────────────────────────────────────
+
+function rebuildListBlockInText(
+  text,
+  beginToken,
+  endToken,
+  items,
+  lineFn,
+  noun,
+) {
+  if (!text || !Array.isArray(items) || items.length === 0) return text;
+  const startIdx = text.indexOf(beginToken);
+  if (startIdx === -1) return text;
+  const endIdx = text.indexOf(endToken, startIdx);
+  if (endIdx === -1) return text;
+
+  const before = text.slice(0, startIdx);
+  let after = text.slice(endIdx + endToken.length);
+
+  const total = items.length;
+  const shown = items.slice(0, 12);
+  const lines = shown.map(lineFn).join("\n");
+  const block = `${beginToken}\n${lines}\n${endToken}`;
+
+  if (total > 12) {
+    // The model's own "N total" sentence is often wrong when it under-lists;
+    // drop a leading line that looks like one and replace it with the real
+    // count so the two never contradict each other.
+    after = after.replace(
+      /^[ \t]*\n?[ \t]*[^\n]*\b\d+[^\n]*\b(templates?|groups?|total)\b[^\n]*\n?/i,
+      "\n",
+    );
+    const note = `\nShowing ${shown.length} of ${total} ${noun} — reply with a name or number, or part of a name to narrow it down.\n`;
+    return `${before}${block}${note}${after}`;
+  }
+
+  return `${before}${block}${after}`;
+}
+
+// ─────────────────────────────────────────────
+// Resolve a bare numeric pick ("option 3", "#3", "3rd one"...) against the
+// LIST_GROUPS_BEGIN/LIST_TEMPLATES_BEGIN block the assistant showed in its
+// immediately preceding turn. Counting "the 3rd item" is the kind of
+// off-by-one-prone arithmetic a model can get wrong under load, so instead
+// of trusting it to recount correctly, the server does the counting here
+// and hands the model the exact resolved name — nothing left to miscount.
+// ─────────────────────────────────────────────
+
+function stripLineNumberingServer(line) {
+  return line.replace(/^\s*(?:\d+[.)]|[-*•])\s*/, "");
+}
+
+function parseListBlockNames(text, beginToken, endToken) {
+  const startIdx = text.indexOf(beginToken);
+  if (startIdx === -1) return null;
+  const endIdx = text.indexOf(endToken, startIdx);
+  if (endIdx === -1) return null;
+  const body = text.slice(startIdx + beginToken.length, endIdx);
+  return body
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [rawName] = stripLineNumberingServer(line).split("|");
+      let name = (rawName || "").trim();
+      try {
+        name = decodeURIComponent(name);
+      } catch {
+        // keep raw name
+      }
+      return name;
+    })
+    .filter(Boolean);
+}
+
+const NUMERIC_PICK_RE =
+  /^(?:option|opt|number|no\.?|item|choice|pick|select)?\s*#?\s*(\d{1,3})(?:st|nd|rd|th)?\s*(?:one)?\s*\.?$/i;
+
+function resolveNumericPick(trimmedMessages) {
+  const last = trimmedMessages[trimmedMessages.length - 1];
+  if (!last || last.role !== "user" || typeof last.content !== "string") {
+    return trimmedMessages;
+  }
+  const match = last.content.trim().match(NUMERIC_PICK_RE);
+  if (!match) return trimmedMessages;
+  const n = parseInt(match[1], 10);
+  if (!n || n < 1 || n > 50) return trimmedMessages;
+
+  const prev = trimmedMessages[trimmedMessages.length - 2];
+  if (!prev || prev.role !== "assistant" || typeof prev.content !== "string") {
+    return trimmedMessages;
+  }
+
+  let names = null;
+  if (prev.content.includes("LIST_GROUPS_BEGIN")) {
+    names = parseListBlockNames(
+      prev.content,
+      "LIST_GROUPS_BEGIN",
+      "LIST_GROUPS_END",
+    );
+  } else if (prev.content.includes("LIST_TEMPLATES_BEGIN")) {
+    names = parseListBlockNames(
+      prev.content,
+      "LIST_TEMPLATES_BEGIN",
+      "LIST_TEMPLATES_END",
+    );
+  }
+  if (!names || n > names.length) return trimmedMessages;
+
+  const resolvedName = names[n - 1];
+  const updated = [...trimmedMessages];
+  updated[updated.length - 1] = {
+    ...last,
+    content: `${last.content} (this picks item ${n} from the list you just showed, which is exactly: "${resolvedName}" — use that exact name, do not recount)`,
+  };
+  return updated;
+}
 
 // The assistant's own "you're out of credits" reply — same shape as any other
 // chat response, so the frontend doesn't need a special status-code path. The
@@ -688,9 +855,9 @@ export const handleSamvaadikChat = async (req, res) => {
     }
 
     // Build system prompt with current IST time + optional media attachment context
-    let systemPrompt = buildSystemPrompt();
+    let dynamicContext = buildTimeContext();
     if (media_attachment?.header_handle) {
-      systemPrompt +=
+      dynamicContext +=
         `\n\nMEDIA ATTACHMENT FOR THIS SESSION:\n` +
         `The user has already uploaded a ${media_attachment.header_format || "IMAGE"} file` +
         (media_attachment.file_name
@@ -726,7 +893,11 @@ export const handleSamvaadikChat = async (req, res) => {
           }
         : m,
     );
-    let currentMessages = [...trimmedMessages];
+    // If the user's latest message is a bare numeric pick ("option 3", "#3",
+    // "3rd one"...) right after a LIST_GROUPS/LIST_TEMPLATES block, resolve
+    // it to the exact name here rather than letting the model recount.
+    const resolvedMessages = resolveNumericPick(trimmedMessages);
+    let currentMessages = [...resolvedMessages];
     let iteration = 0;
     let pickerToken = null; // set when open_template_picker succeeds this turn
 
@@ -777,10 +948,46 @@ export const handleSamvaadikChat = async (req, res) => {
     // Anthropic call — not after racking up more cost we can't charge for.
     let turnCreditsCharged = 0; // sum across every iteration of this turn
 
-    const chargeIteration = async (usage) => {
+    // One id per chat turn. Every iteration's ledger row carries it (plus that
+    // call's token counts) so the AI Usage table can show ONE line per chat
+    // message with the total credits and the input/output tokens.
+    const turnId = randomUUID().slice(0, 8);
+    const turnTotals = {
+      calls: 0,
+      input: 0, // fresh (uncached) input tokens
+      output: 0,
+      cacheWrite: 0,
+      cacheRead: 0,
+      realRupees: 0,
+    };
+
+    // Printed once, when the response for this turn has been sent — no matter
+    // which return path the turn took.
+    res.once("finish", () => {
+      const totalIn =
+        turnTotals.input + turnTotals.cacheWrite + turnTotals.cacheRead;
+      console.log(
+        `[SamvaadikAI][billing] user=${user_id} TURN ${turnId} TOTAL ` +
+          `calls=${turnTotals.calls} ` +
+          `tokens(in=${turnTotals.input}, out=${turnTotals.output}, ` +
+          `cacheWrite=${turnTotals.cacheWrite}, cacheRead=${turnTotals.cacheRead}, ` +
+          `totalInput=${totalIn}) ` +
+          `realCost=\u20B9${turnTotals.realRupees.toFixed(4)} ` +
+          `creditsCharged=${turnCreditsCharged} balance=${creditBalance}`,
+      );
+    });
+
+    const chargeIteration = async (usage, content = []) => {
       const realRupees = usageToRealRupees(usage);
       const creditsCharged =
         realRupees > 0 ? realRupeesToCredits(realRupees) : 0;
+
+      turnTotals.calls += 1;
+      turnTotals.input += usage?.input_tokens || 0;
+      turnTotals.output += usage?.output_tokens || 0;
+      turnTotals.cacheWrite += usage?.cache_creation_input_tokens || 0;
+      turnTotals.cacheRead += usage?.cache_read_input_tokens || 0;
+      turnTotals.realRupees += realRupees;
 
       console.log(
         `[SamvaadikAI][billing] user=${user_id} iteration=${iteration} ` +
@@ -791,11 +998,21 @@ export const handleSamvaadikChat = async (req, res) => {
 
       if (creditsCharged === 0) return;
 
+      // Which tools the assistant used in this step (e.g. "list_templates").
+      const stepTools = (Array.isArray(content) ? content : [])
+        .filter((b) => b?.type === "tool_use" && b?.name)
+        .map((b) => b.name)
+        .join(",");
+
       try {
         const updatedUser = await deductCredits(
           user_id,
           creditsCharged,
-          "Samvaadik AI Assistant usage",
+          // The [[...]] tag is read (and hidden) by the AI Usage table to
+          // group this turn's calls into one row and describe what the
+          // assistant did. Token counts are deliberately NOT stored here —
+          // they stay in the server log only.
+          `Samvaadik AI Assistant usage [[t=${turnId};s=${iteration};tools=${stepTools}]]`,
         );
         creditBalance = Number(updatedUser.credits) || 0;
         turnCreditsCharged += creditsCharged;
@@ -829,6 +1046,13 @@ export const handleSamvaadikChat = async (req, res) => {
     const confirmedMessagePreview =
       forceToolUse && lastAssistantMsg?.content.includes("Message Preview");
 
+    // Raw arrays from the most recent list_groups/list_templates call this
+    // turn, captured so the LIST_GROUPS_BEGIN/LIST_TEMPLATES_BEGIN block the
+    // model writes can be rebuilt deterministically below instead of trusting
+    // the model to copy every item and count correctly.
+    let lastGroupsResult = null;
+    let lastTemplatesResult = null;
+
     while (iteration < MAX_TOOL_ITERATIONS) {
       iteration++;
 
@@ -844,17 +1068,36 @@ export const handleSamvaadikChat = async (req, res) => {
       forcePickerTool = false;
       forceSendTool = false;
 
+      // Prompt caching. Order of the cached prefix is tools -> system ->
+      // messages:
+      //  - explicit breakpoint on the static system block caches the tool
+      //    definitions + the big system prompt (identical on every request);
+      //  - the top-level cache_control (automatic caching) also caches the
+      //    growing conversation, so the 2nd, 3rd... tool iteration inside one
+      //    turn only pays full price for what is new.
+      // tool_choice changes do not invalidate the tools/system cache.
+      // The per-request block (time, media attachment) sits after the static
+      // block, so it never breaks the cache. Cache reads cost 10% of normal
+      // input; usage is billed from the real token counts in chargeIteration.
       const response = await anthropic.messages.create({
-        model: "claude-haiku-4-5-20251001",
+        model: "claude-haiku-5-5",
         max_tokens: 4096,
-        system: systemPrompt,
+        cache_control: { type: "ephemeral" },
+        system: [
+          {
+            type: "text",
+            text: SAMVAADIK_SYSTEM_PROMPT,
+            cache_control: { type: "ephemeral" },
+          },
+          { type: "text", text: dynamicContext },
+        ],
         tools: CAMPAIGN_TOOLS,
         tool_choice: toolChoice,
         messages: currentMessages,
       });
 
       const { stop_reason, content, usage } = response;
-      await chargeIteration(usage);
+      await chargeIteration(usage, content);
 
       if (stop_reason === "end_turn") {
         const textBlock = content.find((b) => b.type === "text");
@@ -865,7 +1108,9 @@ export const handleSamvaadikChat = async (req, res) => {
         const promisesPicker =
           /template/i.test(textBlock?.text || "") &&
           /button (below|above)/i.test(textBlock?.text || "") &&
-          !/REDIRECT_TO_TEMPLATES|GOOGLE_/.test(textBlock?.text || "");
+          !/REDIRECT_TO_TEMPLATES|GOOGLE_|UPLOAD_MEDIA_FOR_TEMPLATE|LIST_TEMPLATES_BEGIN|LIST_GROUPS_BEGIN/.test(
+            textBlock?.text || "",
+          );
         if (promisesPicker && !pickerToken && !pickerRetried) {
           if (creditBalance <= 0) {
             return res.json(
@@ -930,6 +1175,28 @@ export const handleSamvaadikChat = async (req, res) => {
             "The message was not sent because something went wrong. Please try again.";
         }
 
+        // Rebuild any group/template list block from the real tool result
+        // for this turn, so the displayed list can never be shorter than, or
+        // miscounted against, what the account actually has.
+        replyText = rebuildListBlockInText(
+          replyText,
+          "LIST_GROUPS_BEGIN",
+          "LIST_GROUPS_END",
+          lastGroupsResult,
+          (g) =>
+            `${encodeURIComponent(g.group_name || "")}|${g.contact_count ?? 0}`,
+          "groups",
+        );
+        replyText = rebuildListBlockInText(
+          replyText,
+          "LIST_TEMPLATES_BEGIN",
+          "LIST_TEMPLATES_END",
+          lastTemplatesResult,
+          (t) =>
+            `${encodeURIComponent(t.name || "")}|${t.header_format || "TEXT"}|${t.status || ""}`,
+          "templates",
+        );
+
         return res.json({
           success: true,
           role: "assistant",
@@ -970,6 +1237,18 @@ export const handleSamvaadikChat = async (req, res) => {
             if (block.name === "open_template_picker" && result?.picker_token) {
               pickerToken = result.picker_token;
               delete result.picker_token;
+            }
+            // Keep the raw, unfiltered arrays so the LIST_GROUPS_BEGIN /
+            // LIST_TEMPLATES_BEGIN block can be rebuilt from ground truth
+            // further down, regardless of what the model writes.
+            if (block.name === "list_groups" && Array.isArray(result?.groups)) {
+              lastGroupsResult = result.groups;
+            }
+            if (
+              block.name === "list_templates" &&
+              Array.isArray(result?.templates)
+            ) {
+              lastTemplatesResult = result.templates;
             }
             console.log(
               `[SamvaadikAI] Tool result: ${block.name}`,

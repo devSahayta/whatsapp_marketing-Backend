@@ -63,24 +63,48 @@ export const USAGE_MARKUP_MULTIPLIER = 2;
 export const USD_TO_INR_RATE = Number(process.env.USD_TO_INR_RATE) || 95;
 
 // Anthropic list pricing (USD per 1,000,000 tokens) for the model
-// handleSamvaadikChat actually calls. If that model changes, update this
-// to match — see https://platform.claude.com/docs/en/about-claude/pricing.
-export const CLAUDE_HAIKU_4_5_PRICING_USD_PER_MILLION = {
-  input: 1.0,
-  output: 5.0,
-  cacheWrite: 1.25, // 5-minute cache write (not currently used by this call)
-  cacheRead: 0.1,
+// handleSamvaadikChat actually calls (claude-haiku-5-5). If that model
+// changes, update this to match — see
+// https://platform.claude.com/docs/en/about-claude/pricing.
+//
+// Haiku 5.5 is tiered by prompt length: prompts up to 100K tokens (cache
+// reads and writes count toward the length) use the base rates; longer ones
+// use the higher rates. The assistant's prompt is a few thousand tokens, so
+// the long tier is a safety net, not the normal case.
+export const CLAUDE_HAIKU_5_5_PRICING_USD_PER_MILLION = {
+  input: 0.1,
+  output: 0.5,
+  cacheWrite: 0.125, // 5-minute cache write (the default TTL we use)
+  cacheRead: 0.01,
 };
+
+export const CLAUDE_HAIKU_5_5_LONG_PROMPT_PRICING_USD_PER_MILLION = {
+  input: 0.5,
+  output: 2.5,
+  cacheWrite: 0.625,
+  cacheRead: 0.05,
+};
+
+export const LONG_PROMPT_THRESHOLD_TOKENS = 100_000;
 
 /**
  * Real cost (in rupees, no markup) of one or more Anthropic API calls, from
  * their combined token usage.
  */
-export const usageToRealRupees = (
-  usage,
-  pricing = CLAUDE_HAIKU_4_5_PRICING_USD_PER_MILLION,
-) => {
+export const usageToRealRupees = (usage, pricingOverride) => {
   const million = 1_000_000;
+
+  // Total prompt = uncached + cache writes + cache reads.
+  const promptTokens =
+    (usage?.input_tokens || 0) +
+    (usage?.cache_creation_input_tokens || 0) +
+    (usage?.cache_read_input_tokens || 0);
+  const pricing =
+    pricingOverride ||
+    (promptTokens > LONG_PROMPT_THRESHOLD_TOKENS
+      ? CLAUDE_HAIKU_5_5_LONG_PROMPT_PRICING_USD_PER_MILLION
+      : CLAUDE_HAIKU_5_5_PRICING_USD_PER_MILLION);
+
   const usd =
     ((usage?.input_tokens || 0) / million) * pricing.input +
     ((usage?.output_tokens || 0) / million) * pricing.output +
