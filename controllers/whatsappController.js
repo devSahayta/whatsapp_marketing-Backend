@@ -19,6 +19,59 @@ import {
 } from "../services/chatbotEngine.js";
 import { createNotification } from "../controllers/notificationController.js";
 import { markCodOrderConfirmed } from "./woocommerceController.js";
+import { processAssistantInbound } from "./samvaadikWaController.js";
+import { getLinkByWaId, normalizeWaId } from "../services/samvaadikWaService.js";
+import crypto from "crypto";
+
+/**
+ * Decides whether an incoming message on the assistant number is meant for
+ * the assistant. A dedicated assistant number (not in whatsapp_accounts):
+ * always. A number that customers also use: only a "LINK XXXXXX" message or
+ * a message from a phone linked to the assistant — everything else belongs
+ * to the customer's chat. Any lookup error → customer path (safe default).
+ */
+async function isAssistantMessage(phoneNumberId, message) {
+  try {
+    const { count, error } = await supabase
+      .from("whatsapp_accounts")
+      .select("wa_id", { count: "exact", head: true })
+      .eq("phone_number_id", phoneNumberId);
+    if (error) throw error;
+    if (!count) return true; // dedicated assistant number
+
+    const text = message?.type === "text" ? message.text?.body || "" : "";
+    if (/^\s*link\s*[:\-]?\s*[a-z0-9]{6}\s*[.!]?\s*$/i.test(text)) return true;
+
+    const from = normalizeWaId(message?.from);
+    return !!(from && (await getLinkByWaId(from)));
+  } catch (err) {
+    console.error("[SamvaadikWA] isAssistantMessage check failed:", err);
+    return false;
+  }
+}
+
+/**
+ * Verifies Meta's X-Hub-Signature-256 header (HMAC-SHA256 of the raw body
+ * with the app secret). req.rawBody is captured by express.json's verify
+ * hook in app.js. Used for the AI assistant number only; customer webhooks
+ * are unchanged. Without a configured secret the check is skipped (with a
+ * warning) so local testing still works.
+ */
+function isValidMetaSignature(req) {
+  const secret = process.env.ASSISTANT_WEBHOOK_APP_SECRET || process.env.META_APP_SECRET;
+  if (!secret) {
+    console.warn("[SamvaadikWA] META_APP_SECRET not set — webhook signature NOT verified");
+    return true;
+  }
+  const header = req.headers["x-hub-signature-256"];
+  if (!header || !req.rawBody) return false;
+  const expected =
+    "sha256=" +
+    crypto.createHmac("sha256", secret).update(req.rawBody).digest("hex");
+  const a = Buffer.from(String(header));
+  const b = Buffer.from(expected);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
 
 /* ─── Webhook Forwarding ────────────────────────────────────────────────────
    Forward incoming messages to any external app that has registered a
@@ -576,6 +629,31 @@ export const handleIncomingMessage = async (req, res) => {
   if (!wabaId || !phoneNumberId) {
     console.error("❌ Missing WABA ID or phone_number_id");
     return res.sendStatus(200);
+  }
+
+  // ── Samvaadik AI Assistant over WhatsApp ────────────────────────────────
+  // Only incoming MESSAGES can be for the assistant. Status updates
+  // (sent/delivered/read) always continue to the normal handling below, so
+  // customer campaign/chat ticks keep working whatever the env says.
+  // If the assistant number is also a customer's number (whatsapp_accounts),
+  // only "LINK XXXXXX" and messages from linked phones go to the assistant;
+  // every other message is the customer's and is handled as before.
+  // See samvaadikWaController.js.
+  if (
+    value?.messages &&
+    process.env.ASSISTANT_PHONE_NUMBER_ID &&
+    phoneNumberId === process.env.ASSISTANT_PHONE_NUMBER_ID &&
+    (await isAssistantMessage(phoneNumberId, value.messages[0]))
+  ) {
+    // The assistant can create campaigns and send messages for an account,
+    // so only act on requests that really come from Meta.
+    if (!isValidMetaSignature(req)) {
+      console.warn("[SamvaadikWA] Rejected webhook with invalid signature");
+      return res.sendStatus(401);
+    }
+    res.sendStatus(200);
+    waitUntil(processAssistantInbound(value));
+    return;
   }
 
   // if (value?.statuses) {

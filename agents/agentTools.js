@@ -6,6 +6,10 @@ import { supabase } from "../config/supabase.js";
 import * as wsService from "../services/whatsappTemplateService.js";
 import { getSheetsClient, getDriveClient } from "../services/google.service.js";
 import {
+  sendTemplateToContact,
+  describeTemplateRequirements,
+} from "../controllers/chatTemplateController.js";
+import {
   getTextWindowStatus,
   sendTextToChat,
   normalizePhone,
@@ -444,7 +448,84 @@ export const CAMPAIGN_TOOLS = [
       required: [],
     },
   },
+  // ── WhatsApp-channel only (no picker UI there) — see toolsForChannel ──
+  {
+    name: "get_template_details",
+    description:
+      "Get what an APPROVED template needs before sending it to one person: body variables (with examples), whether the header needs a value, dynamic URL button values, and whether its media is ready. Use the wt_id from list_templates.",
+    input_schema: {
+      type: "object",
+      properties: {
+        wt_id: {
+          type: "string",
+          description: "Exact wt_id from list_templates. Never guess.",
+        },
+        template_name: {
+          type: "string",
+          description: "Exact template name, if wt_id is not at hand.",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "send_template_message",
+    description:
+      "Send one APPROVED template to one person. Works any time, even outside the 24-hour window. Only call this AFTER showing the Template Message Preview and receiving explicit confirmation. The person is identified by phone_number (copy it from the preview's 'To:' line).",
+    input_schema: {
+      type: "object",
+      properties: {
+        phone_number: {
+          type: "string",
+          description: "Recipient phone number with country code, from the preview's 'To:' line.",
+        },
+        contact_name: {
+          type: "string",
+          description: "Recipient's name if known (used when creating a new chat).",
+        },
+        template_name: {
+          type: "string",
+          description:
+            "Exact template name as shown in the Template Message Preview. Preferred — the template is looked up by this name.",
+        },
+        wt_id: {
+          type: "string",
+          description: "wt_id from list_templates in this same turn (optional if template_name is given).",
+        },
+        body_variables: {
+          type: "object",
+          description:
+            'Values for body placeholders keyed by placeholder, e.g. {"1": "Rahul", "2": "#123"} or {"name": "Rahul"}.',
+        },
+        header_variable: {
+          type: "string",
+          description: "Value for the header placeholder, only if get_template_details says header_variable_needed.",
+        },
+        button_variables: {
+          type: "array",
+          description:
+            "Values for dynamic URL buttons: [{button_index, value}] or, for carousel cards, [{card_index, button_index, value}].",
+          items: { type: "object" },
+        },
+      },
+      required: ["phone_number"],
+    },
+  },
 ];
+
+// Tools that only make sense on one channel. The web assistant has the
+// template picker UI; WhatsApp has no buttons/forms, so it collects template
+// values in chat and sends directly instead.
+const WEB_ONLY_TOOLS = new Set(["open_template_picker"]);
+const WHATSAPP_ONLY_TOOLS = new Set([
+  "get_template_details",
+  "send_template_message",
+]);
+
+export function toolsForChannel(channel = "web") {
+  const exclude = channel === "whatsapp" ? WEB_ONLY_TOOLS : WHATSAPP_ONLY_TOOLS;
+  return CAMPAIGN_TOOLS.filter((t) => !exclude.has(t.name));
+}
 
 // ─────────────────────────────────────────────
 // TOOL EXECUTOR
@@ -482,6 +563,10 @@ export async function executeTool(toolName, toolInput, userId) {
       return await sendTextMessageTool(userId, toolInput);
     case "open_template_picker":
       return await openTemplatePicker(userId, toolInput);
+    case "get_template_details":
+      return await getTemplateDetailsTool(userId, toolInput);
+    case "send_template_message":
+      return await sendTemplateMessageTool(userId, toolInput);
     default:
       return { error: `Unknown tool: ${toolName}` };
   }
@@ -1909,5 +1994,120 @@ async function openTemplatePicker(userId, input) {
     };
   } catch (err) {
     return { error: err.message };
+  }
+}
+
+// ─────────────────────────────────────────────
+// get_template_details / send_template_message  (WhatsApp channel)
+// Text-only equivalent of the template picker: the assistant asks for the
+// values in chat, then sends through the same code path as the picker
+// (chatTemplateController.sendTemplateToContact).
+// ─────────────────────────────────────────────
+
+// Resolve a template of this user's account by name (preferred — it is
+// visible in the conversation) or by wt_id (the model may misremember UUIDs).
+async function loadOwnTemplate(userId, { wt_id, template_name } = {}) {
+  const accountId = await getAccountId(userId);
+  if (!accountId) return { error: "No active WhatsApp account found." };
+
+  const name = String(template_name || "").trim();
+  if (name) {
+    const { data, error } = await supabase
+      .from("whatsapp_templates")
+      .select("*")
+      .eq("account_id", accountId)
+      .ilike("name", name.replace(/[%_]/g, "\\$&"))
+      .order("created_at", { ascending: false });
+    if (error) return { error: error.message };
+    // Prefer an APPROVED version when the same name exists more than once
+    const match =
+      (data || []).find((t) => (t.status || "").toUpperCase() === "APPROVED") ||
+      (data || [])[0];
+    if (match) return { template: match };
+  }
+
+  if (wt_id) {
+    const { data, error } = await supabase
+      .from("whatsapp_templates")
+      .select("*")
+      .eq("wt_id", wt_id)
+      .eq("account_id", accountId)
+      .maybeSingle();
+    if (error && !/invalid input syntax/i.test(error.message)) {
+      return { error: error.message };
+    }
+    if (data) return { template: data };
+  }
+
+  return {
+    error: "Template not found. Call list_templates and use the exact template name.",
+  };
+}
+
+async function getTemplateDetailsTool(userId, input) {
+  try {
+    if (!input?.wt_id && !input?.template_name) {
+      return { error: "wt_id or template_name is required" };
+    }
+    const { template, error } = await loadOwnTemplate(userId, input);
+    if (error) return { error };
+    const details = describeTemplateRequirements(template);
+    if ((template.status || "").toUpperCase() !== "APPROVED") {
+      details.can_send = false;
+      details.reason = `Only approved templates can be sent (this one is ${template.status}).`;
+    } else if (!details.media_ready) {
+      details.can_send = false;
+      details.reason =
+        "This template's media is missing or needs re-uploading on the Templates page before it can be sent.";
+    } else {
+      details.can_send = true;
+    }
+    return details;
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+async function sendTemplateMessageTool(userId, input) {
+  try {
+    const { phone_number, contact_name } = input || {};
+    if (!phone_number || (!input?.wt_id && !input?.template_name)) {
+      return {
+        success: false,
+        sent: false,
+        error: "MESSAGE NOT SENT: phone_number and template_name are required",
+      };
+    }
+    const { template, error } = await loadOwnTemplate(userId, input);
+    if (error) return { success: false, sent: false, error: `MESSAGE NOT SENT: ${error}` };
+
+    const { status, data } = await sendTemplateToContact(userId, {
+      phone_number,
+      person_name: contact_name || "",
+      wt_id: template.wt_id,
+      body_variables: input.body_variables || {},
+      header_variable: input.header_variable,
+      button_variables: Array.isArray(input.button_variables)
+        ? input.button_variables
+        : [],
+    });
+    if (status !== 200 || !data?.success) {
+      return {
+        success: false,
+        sent: false,
+        error: `MESSAGE NOT SENT: ${data?.error || "Failed to send template"}`,
+        code: data?.code || null,
+        ...(data?.missing && { missing: data.missing }),
+      };
+    }
+    return {
+      success: true,
+      sent: true,
+      template: template.name,
+      sent_to: contact_name || phone_number,
+      phone: phone_number,
+    };
+  } catch (err) {
+    return { success: false, sent: false, error: `MESSAGE NOT SENT: ${err.message}` };
   }
 }

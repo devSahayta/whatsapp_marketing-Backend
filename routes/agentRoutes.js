@@ -14,6 +14,11 @@ import {
   handleGroupPreview,
   handleGroupFromCsv,
 } from "../controllers/agentController.js";
+import {
+  startLink,
+  listLinks,
+  unlink,
+} from "../controllers/samvaadikWaController.js";
 import { extractKindeUser } from "../middleware/extractKindeUser.js";
 import { authenticateUser } from "../middleware/authMiddleware.js";
 
@@ -88,6 +93,29 @@ router.post(
   authenticateUser,
   bindAuthenticatedUser,
   handleGroupFromCsv,
+);
+
+// ─── WhatsApp number linking (use the assistant from your own WhatsApp) ───────
+// Dashboard-only (Kinde-authed). The actual inbound WhatsApp message handling
+// lives in samvaadikWaController.processAssistantInbound, called from
+// whatsappController.handleIncomingMessage — not reachable via HTTP route.
+router.post(
+  "/samvaadik/wa/link/start",
+  extractKindeUser,
+  authenticateUser,
+  startLink,
+);
+router.get(
+  "/samvaadik/wa/links",
+  extractKindeUser,
+  authenticateUser,
+  listLinks,
+);
+router.post(
+  "/samvaadik/wa/links/:link_id/unlink",
+  extractKindeUser,
+  authenticateUser,
+  unlink,
 );
 
 export default router;

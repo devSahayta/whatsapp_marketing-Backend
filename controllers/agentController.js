@@ -3,7 +3,7 @@
 import { supabase } from "../config/supabase.js";
 import Anthropic from "@anthropic-ai/sdk";
 import { ANTHROPIC_API_KEY } from "../config/anthropic.js";
-import { CAMPAIGN_TOOLS, executeTool } from "../agents/agentTools.js";
+import { executeTool, toolsForChannel } from "../agents/agentTools.js";
 import { Readable } from "stream";
 import { randomUUID } from "crypto";
 import { parse as parseCsv } from "@fast-csv/parse";
@@ -809,250 +809,337 @@ function attachPickerToken(text, token) {
   return `${body}\n${token}`;
 }
 
-// ── handleSamvaadikChat ───────────────────────────────────────────────────────
-export const handleSamvaadikChat = async (req, res) => {
-  try {
-    const { user_id, messages, media_attachment } = req.body;
+// ── WhatsApp channel instructions ───────────────────────────────────────────
+// Appended to the system prompt when the assistant is used from the user's
+// own WhatsApp (samvaadikWaController). Plain text only: no buttons, no file
+// uploads, no template picker — so those flows are replaced here.
+// The summary titles ("Campaign Summary", "Message Preview", "Template Message
+// Preview", ...) and their "Ready to ..." questions must stay word-for-word:
+// confirmation detection in runSamvaadikAssistant relies on them.
+const WHATSAPP_CHANNEL_PROMPT = `
 
-    if (!user_id) {
-      return res
-        .status(400)
-        .json({ success: false, error: "user_id is required" });
-    }
-    if (!messages || !Array.isArray(messages) || messages.length === 0) {
-      return res
-        .status(400)
-        .json({ success: false, error: "messages array is required" });
-    }
-    for (const msg of messages) {
-      if (!msg.role || !msg.content) {
-        return res.status(400).json({
-          success: false,
-          error: "Each message must have role and content.",
-        });
-      }
-      if (!["user", "assistant"].includes(msg.role)) {
-        return res
-          .status(400)
-          .json({ success: false, error: `Invalid role "${msg.role}".` });
-      }
-    }
+CHANNEL: WHATSAPP
+This conversation is happening in WhatsApp text messages from the user's own phone, not in the dashboard. The user is the account owner (or their team) — not a customer.
 
-    // ── Credits pre-check ───────────────────────────────────────────────────
-    // Refuse up front if the user has nothing left, instead of spending real
-    // Anthropic API cost on a turn we already know we can't bill for. This is
-    // a normal (200) chat-shaped response, not an error — the assistant
-    // itself tells the user, with a redirect card, same as any other
-    // "you need to do X first" message (see REDIRECT_TO_PRICING below).
-    let creditBalance;
-    try {
-      creditBalance = await getCreditBalance(user_id);
-    } catch (err) {
-      return res.status(404).json({ success: false, error: "User not found" });
-    }
-    if (creditBalance <= 0) {
-      return res.json(buildOutOfCreditsPayload(creditBalance));
-    }
+Formatting:
+- Plain WhatsApp text. Use *single asterisks* for bold, never **double**. No markdown headings or tables.
+- Keep replies short. Summaries/previews: keep the exact title line (e.g. "Campaign Summary", "Message Preview", "Template Message Preview") and the exact "Ready to ..." question; the "───" separator lines are optional.
 
-    // Build system prompt with current IST time + optional media attachment context
-    let dynamicContext = buildTimeContext();
-    if (media_attachment?.header_handle) {
-      dynamicContext +=
-        `\n\nMEDIA ATTACHMENT FOR THIS SESSION:\n` +
-        `The user has already uploaded a ${media_attachment.header_format || "IMAGE"} file` +
-        (media_attachment.file_name
-          ? ` named "${media_attachment.file_name}"`
-          : "") +
-        ` to use as a template header. ` +
-        `Meta header handle: ${media_attachment.header_handle}. ` +
-        (media_attachment.media_id
-          ? `Meta media_id: ${media_attachment.media_id}. `
-          : "") +
-        `When creating a template with this media, pass ` +
-        `header_format="${media_attachment.header_format || "IMAGE"}", ` +
-        `header_handle="${media_attachment.header_handle}"` +
-        (media_attachment.media_id
-          ? `, and media_id="${media_attachment.media_id}"`
-          : "") +
-        ` to the create_template tool. Do NOT ask the user to upload a file — the upload is already complete.`;
-    }
+What is different on WhatsApp:
+- CSV/Excel group upload (Group creation Option A) is not possible here — there is no file upload. Offer Option B (Google Sheets), or tell the user to upload the file from the Samvaadik dashboard.
+- If a Google Sheet must be picked from Google Drive, tell the user to do that once from the AI Assistant in the Samvaadik dashboard, then continue here.
+- Images, videos and documents sent here cannot be read. Media templates cannot be created here.
+- There is no in-chat upload button here (this replaces every instruction above about UPLOAD_MEDIA_FOR_TEMPLATE; never output that token). If a template's media is missing or expired, tell the user in one short sentence to upload it from the Templates page in the Samvaadik dashboard (open the template, click Preview) and then come back here, and output REDIRECT_TO_TEMPLATES: on its own line.
 
-    // Trim to last 20 messages to prevent context bloat across multiple campaigns
-    // Earlier picker tokens are replaced with a short note so the model
-    // never sees (and imitates) them.
-    const trimmedMessages = (
-      messages.length > 20 ? messages.slice(-20) : messages
-    ).map((m) =>
-      m.role === "assistant" && m.content.includes("OPEN_TEMPLATE_PICKER:")
-        ? {
-            ...m,
-            content: m.content.replace(
-              /OPEN_TEMPLATE_PICKER:\S*/g,
-              "[Choose template button shown]",
-            ),
-          }
-        : m,
-    );
-    // If the user's latest message is a bare numeric pick ("option 3", "#3",
-    // "3rd one"...) right after a LIST_GROUPS/LIST_TEMPLATES block, resolve
-    // it to the exact name here rather than letting the model recount.
-    const resolvedMessages = resolveNumericPick(trimmedMessages);
-    let currentMessages = [...resolvedMessages];
-    let iteration = 0;
-    let pickerToken = null; // set when open_template_picker succeeds this turn
+ONE-TO-ONE TEMPLATE MESSAGE (replaces Step 2b of ONE-TO-ONE MESSAGING — there is no template picker here; open_template_picker does not exist):
+1. Identify the person with find_contact as usual (or use the full phone number the user gave).
+2. If the user did not name a template, call list_templates and show the APPROVED ones as a short numbered list (name and a few words of the body). Ask which one.
+3. Call get_template_details with the template's wt_id. If can_send is false, explain the reason in one sentence and stop.
+4. Ask for every value that is needed, in one message:
+   - each body variable (show its example as a hint; offer the contact's name for a name-like variable),
+   - the header value if header_variable_needed is true,
+   - each button value that is not optional.
+5. Show:
+   ───────────────────────
+   Template Message Preview
+   To: <name> (<phone>)
+   Template: <exact template name>
+   Values: <{{1}} = value, {{2}} = value, ... or "None">
+   ───────────────────────
+   Ready to send this template?
+6. Only after the user confirms, call send_template_message with phone_number from the "To:" line, template_name exactly as in the preview, and the values. Do not rely on remembering wt_id from an earlier message.
+7. Report the result truthfully: only if sent is true say it was sent. If sent is false, say it was NOT sent and give the reason; if values are missing, ask for them.`;
 
-    // ── Detect if user just confirmed a campaign or agent summary ─────────────
-    // If yes, force Claude to call a tool on the first iteration using tool_choice:any.
-    // This is enforced at the API level — Claude physically cannot return text
-    // without calling a tool when tool_choice is "any".
-    const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
-    const isConfirmation =
-      lastUserMsg &&
-      /^(yes|yeah|yep|confirm|go ahead|sure|ok|okay|proceed|do it|create it|create( the)? (campaign|agent)|send( it)?|send (the )?message|correct|crct|looks good|that('s| is) (fine|good|correct)|yep do it)$/i.test(
-        lastUserMsg.content.trim(),
-      );
-
-    // Check if the last assistant message contains a pending campaign or agent summary
-    const lastAssistantMsg = [...messages]
-      .reverse()
-      .find((m) => m.role === "assistant");
-    const hasSummaryPending =
-      lastAssistantMsg &&
-      lastAssistantMsg.content.includes("\u2500\u2500\u2500") &&
-      // Campaign summary pending
-      ((lastAssistantMsg.content.includes("Campaign Summary") &&
-        (lastAssistantMsg.content.includes("Ready to create") ||
-          lastAssistantMsg.content.includes(
-            "Ready to create this campaign",
-          ))) ||
-        // Agent preview pending
-        (lastAssistantMsg.content.includes("Agent Preview") &&
-          lastAssistantMsg.content.includes("Ready to create this agent")) ||
-        // One-to-one text message preview pending
-        (lastAssistantMsg.content.includes("Message Preview") &&
-          lastAssistantMsg.content.includes("Ready to send this message")));
-
-    // Force tool use only when user confirmed AND a summary was just shown
-    const forceToolUse = isConfirmation && hasSummaryPending;
-
-    if (forceToolUse) {
-      console.log(
-        "[SamvaadikAI] Confirmation after summary detected — forcing tool call (tool_choice:any)",
-      );
-    }
-
-    // Every iteration below is a separate Anthropic API call and therefore a
-    // separate real cost. Charged right after it happens (not lumped at the
-    // end of the whole turn) so a multi-tool-call turn that runs a user out
-    // of credits partway through is caught BEFORE the next, un-billable
-    // Anthropic call — not after racking up more cost we can't charge for.
-    let turnCreditsCharged = 0; // sum across every iteration of this turn
-
-    // One id per chat turn. Every iteration's ledger row carries it (plus that
-    // call's token counts) so the AI Usage table can show ONE line per chat
-    // message with the total credits and the input/output tokens.
-    const turnId = randomUUID().slice(0, 8);
-    const turnTotals = {
-      calls: 0,
-      input: 0, // fresh (uncached) input tokens
-      output: 0,
-      cacheWrite: 0,
-      cacheRead: 0,
-      realRupees: 0,
-    };
-
-    // Printed once, when the response for this turn has been sent — no matter
-    // which return path the turn took.
-    res.once("finish", () => {
-      const totalIn =
-        turnTotals.input + turnTotals.cacheWrite + turnTotals.cacheRead;
-      console.log(
-        `[SamvaadikAI][billing] user=${user_id} TURN ${turnId} TOTAL ` +
-          `calls=${turnTotals.calls} ` +
-          `tokens(in=${turnTotals.input}, out=${turnTotals.output}, ` +
-          `cacheWrite=${turnTotals.cacheWrite}, cacheRead=${turnTotals.cacheRead}, ` +
-          `totalInput=${totalIn}) ` +
-          `realCost=\u20B9${turnTotals.realRupees.toFixed(4)} ` +
-          `creditsCharged=${turnCreditsCharged} balance=${creditBalance}`,
-      );
+// ── runSamvaadikAssistant ─────────────────────────────────────────────────────
+// The actual agentic tool-loop, independent of req/res. Used by both the
+// dashboard's HTTP endpoint (handleSamvaadikChat, below — a thin wrapper that
+// maps this to res.json) and the WhatsApp assistant webhook (see
+// controllers/samvaadikWaController.js), which has no browser session to hold
+// `messages` in and persists them to samvaadik_wa_sessions instead. Throws a
+// tagged error ({ code, status }) on bad input / unknown user / upstream
+// Anthropic failure; each caller decides how to surface that on its own
+// channel (HTTP status vs a plain WhatsApp text reply).
+//
+// `channel` lets the system prompt adapt to where the reply is actually
+// going: "web" (default) keeps every flow exactly as before (template-picker
+// button, CSV upload via the dashboard's + button). "whatsapp" swaps those
+// two for text-only fallbacks, since a plain WhatsApp text message has no
+// button or file-upload widget.
+export async function runSamvaadikAssistant({
+  user_id,
+  messages,
+  media_attachment,
+  channel = "web",
+}) {
+  if (!user_id) {
+    throw Object.assign(new Error("user_id is required"), {
+      code: "BAD_REQUEST",
+      status: 400,
     });
-
-    const chargeIteration = async (usage, content = []) => {
-      const realRupees = usageToRealRupees(usage);
-      const creditsCharged =
-        realRupees > 0 ? realRupeesToCredits(realRupees) : 0;
-
-      turnTotals.calls += 1;
-      turnTotals.input += usage?.input_tokens || 0;
-      turnTotals.output += usage?.output_tokens || 0;
-      turnTotals.cacheWrite += usage?.cache_creation_input_tokens || 0;
-      turnTotals.cacheRead += usage?.cache_read_input_tokens || 0;
-      turnTotals.realRupees += realRupees;
-
-      console.log(
-        `[SamvaadikAI][billing] user=${user_id} iteration=${iteration} ` +
-          `tokens(in=${usage?.input_tokens || 0}, out=${usage?.output_tokens || 0}, ` +
-          `cacheWrite=${usage?.cache_creation_input_tokens || 0}, cacheRead=${usage?.cache_read_input_tokens || 0}) ` +
-          `realCost=₹${realRupees.toFixed(4)} creditsCharged=${creditsCharged}`,
+  }
+  if (!messages || !Array.isArray(messages) || messages.length === 0) {
+    throw Object.assign(new Error("messages array is required"), {
+      code: "BAD_REQUEST",
+      status: 400,
+    });
+  }
+  for (const msg of messages) {
+    if (!msg.role || !msg.content) {
+      throw Object.assign(
+        new Error("Each message must have role and content."),
+        { code: "BAD_REQUEST", status: 400 },
       );
+    }
+    if (!["user", "assistant"].includes(msg.role)) {
+      throw Object.assign(new Error(`Invalid role "${msg.role}".`), {
+        code: "BAD_REQUEST",
+        status: 400,
+      });
+    }
+  }
 
-      if (creditsCharged === 0) return;
+  // ── Credits pre-check ───────────────────────────────────────────────────
+  // Refuse up front if the user has nothing left, instead of spending real
+  // Anthropic API cost on a turn we already know we can't bill for. This is
+  // a normal (200) chat-shaped response, not an error — the assistant
+  // itself tells the user, with a redirect card, same as any other
+  // "you need to do X first" message (see REDIRECT_TO_PRICING below).
+  let creditBalance;
+  try {
+    creditBalance = await getCreditBalance(user_id);
+  } catch (err) {
+    throw Object.assign(new Error("User not found"), {
+      code: "USER_NOT_FOUND",
+      status: 404,
+    });
+  }
+  if (creditBalance <= 0) {
+    return buildOutOfCreditsPayload(creditBalance);
+  }
 
-      // Which tools the assistant used in this step (e.g. "list_templates").
-      const stepTools = (Array.isArray(content) ? content : [])
-        .filter((b) => b?.type === "tool_use" && b?.name)
-        .map((b) => b.name)
-        .join(",");
+  // Static prompt for this channel. It never changes between requests, so it
+  // can be sent as a cached block.
+  const staticPrompt =
+    channel === "whatsapp"
+      ? SAMVAADIK_SYSTEM_PROMPT + WHATSAPP_CHANNEL_PROMPT
+      : SAMVAADIK_SYSTEM_PROMPT;
 
-      try {
-        const updatedUser = await deductCredits(
-          user_id,
-          creditsCharged,
-          // The [[...]] tag is read (and hidden) by the AI Usage table to
-          // group this turn's calls into one row and describe what the
-          // assistant did. Token counts are deliberately NOT stored here —
-          // they stay in the server log only.
-          `Samvaadik AI Assistant usage [[t=${turnId};s=${iteration};tools=${stepTools}]]`,
-        );
-        creditBalance = Number(updatedUser.credits) || 0;
-        turnCreditsCharged += creditsCharged;
-        console.log(
-          `[SamvaadikAI][billing] user=${user_id} balance -> ${creditBalance}`,
-        );
-      } catch (err) {
-        if (err instanceof InsufficientCreditsError) {
-          // Balance couldn't cover this iteration's real cost. Treat the
-          // user as depleted (stops the turn before the next API call)
-          // without writing a charge the ledger would reject anyway.
-          console.warn(
-            `[SamvaadikAI][billing] user=${user_id} insufficient credits for this iteration (needed ${creditsCharged}) — treating as depleted.`,
-          );
-          creditBalance = 0;
-        } else {
-          console.error("[SamvaadikAI][billing] Credit deduction failed:", err);
+  // Per-request context: current IST time + optional media attachment
+  let dynamicContext = buildTimeContext();
+  if (media_attachment?.header_handle) {
+    dynamicContext +=
+      `\n\nMEDIA ATTACHMENT FOR THIS SESSION:\n` +
+      `The user has already uploaded a ${media_attachment.header_format || "IMAGE"} file` +
+      (media_attachment.file_name
+        ? ` named "${media_attachment.file_name}"`
+        : "") +
+      ` to use as a template header. ` +
+      `Meta header handle: ${media_attachment.header_handle}. ` +
+      (media_attachment.media_id
+        ? `Meta media_id: ${media_attachment.media_id}. `
+        : "") +
+      `When creating a template with this media, pass ` +
+      `header_format="${media_attachment.header_format || "IMAGE"}", ` +
+      `header_handle="${media_attachment.header_handle}"` +
+      (media_attachment.media_id
+        ? `, and media_id="${media_attachment.media_id}"`
+        : "") +
+      ` to the create_template tool. Do NOT ask the user to upload a file — the upload is already complete.`;
+  }
+
+  // Trim to last 20 messages to prevent context bloat across multiple campaigns
+  // Earlier picker tokens are replaced with a short note so the model
+  // never sees (and imitates) them.
+  const trimmedMessages = (
+    messages.length > 20 ? messages.slice(-20) : messages
+  ).map((m) =>
+    m.role === "assistant" && m.content.includes("OPEN_TEMPLATE_PICKER:")
+      ? {
+          ...m,
+          content: m.content.replace(
+            /OPEN_TEMPLATE_PICKER:\S*/g,
+            "[Choose template button shown]",
+          ),
         }
+      : m,
+  );
+  // If the user's latest message is a bare numeric pick ("option 3", "#3",
+  // "3rd one"...) right after a LIST_GROUPS/LIST_TEMPLATES block, resolve
+  // it to the exact name here rather than letting the model recount.
+  const resolvedMessages = resolveNumericPick(trimmedMessages);
+  let currentMessages = [...resolvedMessages];
+  let iteration = 0;
+  let pickerToken = null; // set when open_template_picker succeeds this turn
+
+  // ── Detect if user just confirmed a campaign or agent summary ─────────────
+  // If yes, force Claude to call a tool on the first iteration using tool_choice:any.
+  // This is enforced at the API level — Claude physically cannot return text
+  // without calling a tool when tool_choice is "any".
+  const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
+  // Trailing punctuation/emoji ("Yes.", "ok 👍" — common on WhatsApp) still counts
+  const confirmText = (lastUserMsg?.content || "")
+    .trim()
+    .replace(/[\s.!,]+$/u, "")
+    .replace(/\s*\p{Extended_Pictographic}+$/u, "")
+    .trim();
+  const isConfirmation =
+    !!lastUserMsg &&
+    /^(yes|yeah|yep|confirm|go ahead|sure|ok|okay|proceed|do it|create it|create( the)? (campaign|agent)|send( it)?|send (the )?(message|template)|correct|crct|looks good|that('s| is) (fine|good|correct)|yep do it)$/i.test(
+      confirmText,
+    );
+
+  // Check if the last assistant message contains a pending summary/preview.
+  // Matched on the title + question only (not the "───" separators, which the
+  // WhatsApp channel may leave out).
+  const lastAssistantMsg = [...messages]
+    .reverse()
+    .find((m) => m.role === "assistant");
+  const lastAssistantText = lastAssistantMsg?.content || "";
+  // Which send tool a confirmed preview must lead to (null for create flows)
+  const pendingSendTool = lastAssistantText.includes("Template Message Preview")
+    ? lastAssistantText.includes("Ready to send this template")
+      ? "send_template_message"
+      : null
+    : lastAssistantText.includes("Message Preview") &&
+        lastAssistantText.includes("Ready to send this message")
+      ? "send_text_message"
+      : null;
+  const hasSummaryPending =
+    // Campaign summary pending
+    (lastAssistantText.includes("Campaign Summary") &&
+      lastAssistantText.includes("Ready to create")) ||
+    // Agent preview pending
+    (lastAssistantText.includes("Agent Preview") &&
+      lastAssistantText.includes("Ready to create this agent")) ||
+    // One-to-one text / template message preview pending
+    !!pendingSendTool;
+
+  // Force tool use only when user confirmed AND a summary was just shown
+  const forceToolUse = isConfirmation && hasSummaryPending;
+
+  if (forceToolUse) {
+    console.log(
+      "[SamvaadikAI] Confirmation after summary detected — forcing tool call (tool_choice:any)",
+    );
+  }
+
+  // Every iteration below is a separate Anthropic API call and therefore a
+  // separate real cost. Charged right after it happens (not lumped at the
+  // end of the whole turn) so a multi-tool-call turn that runs a user out
+  // of credits partway through is caught BEFORE the next, un-billable
+  // Anthropic call — not after racking up more cost we can't charge for.
+  let turnCreditsCharged = 0; // sum across every iteration of this turn
+
+  // One id per chat turn. Every iteration's ledger row carries it (plus that
+  // call's token counts) so the AI Usage table can show ONE line per chat
+  // message with the total credits and the input/output tokens.
+  const turnId = randomUUID().slice(0, 8);
+  const turnTotals = {
+    calls: 0,
+    input: 0, // fresh (uncached) input tokens
+    output: 0,
+    cacheWrite: 0,
+    cacheRead: 0,
+    realRupees: 0,
+  };
+
+  // Printed once, when this turn ends — no matter which return path (or
+  // error) the turn took.
+  const logTurnTotals = () => {
+    const totalIn =
+      turnTotals.input + turnTotals.cacheWrite + turnTotals.cacheRead;
+    console.log(
+      `[SamvaadikAI][billing] user=${user_id} TURN ${turnId} TOTAL ` +
+        `calls=${turnTotals.calls} ` +
+        `tokens(in=${turnTotals.input}, out=${turnTotals.output}, ` +
+        `cacheWrite=${turnTotals.cacheWrite}, cacheRead=${turnTotals.cacheRead}, ` +
+        `totalInput=${totalIn}) ` +
+        `realCost=\u20B9${turnTotals.realRupees.toFixed(4)} ` +
+        `creditsCharged=${turnCreditsCharged} balance=${creditBalance}`,
+    );
+  };
+
+  const chargeIteration = async (usage, content = []) => {
+    const realRupees = usageToRealRupees(usage);
+    const creditsCharged =
+      realRupees > 0 ? realRupeesToCredits(realRupees) : 0;
+
+    turnTotals.calls += 1;
+    turnTotals.input += usage?.input_tokens || 0;
+    turnTotals.output += usage?.output_tokens || 0;
+    turnTotals.cacheWrite += usage?.cache_creation_input_tokens || 0;
+    turnTotals.cacheRead += usage?.cache_read_input_tokens || 0;
+    turnTotals.realRupees += realRupees;
+
+    console.log(
+      `[SamvaadikAI][billing] user=${user_id} iteration=${iteration} ` +
+        `tokens(in=${usage?.input_tokens || 0}, out=${usage?.output_tokens || 0}, ` +
+        `cacheWrite=${usage?.cache_creation_input_tokens || 0}, cacheRead=${usage?.cache_read_input_tokens || 0}) ` +
+        `realCost=₹${realRupees.toFixed(4)} creditsCharged=${creditsCharged}`,
+    );
+
+    if (creditsCharged === 0) return;
+
+    // Which tools the assistant used in this step (e.g. "list_templates").
+    const stepTools = (Array.isArray(content) ? content : [])
+      .filter((b) => b?.type === "tool_use" && b?.name)
+      .map((b) => b.name)
+      .join(",");
+
+    try {
+      const updatedUser = await deductCredits(
+        user_id,
+        creditsCharged,
+        // The [[...]] tag is read (and hidden) by the AI Usage table to
+        // group this turn's calls into one row and describe what the
+        // assistant did. Token counts are deliberately NOT stored here —
+        // they stay in the server log only.
+        `Samvaadik AI Assistant usage [[t=${turnId};s=${iteration};tools=${stepTools}]]`,
+      );
+      creditBalance = Number(updatedUser.credits) || 0;
+      turnCreditsCharged += creditsCharged;
+      console.log(
+        `[SamvaadikAI][billing] user=${user_id} balance -> ${creditBalance}`,
+      );
+    } catch (err) {
+      if (err instanceof InsufficientCreditsError) {
+        // Balance couldn't cover this iteration's real cost. Treat the
+        // user as depleted (stops the turn before the next API call)
+        // without writing a charge the ledger would reject anyway.
+        console.warn(
+          `[SamvaadikAI][billing] user=${user_id} insufficient credits for this iteration (needed ${creditsCharged}) — treating as depleted.`,
+        );
+        creditBalance = 0;
+      } else {
+        console.error("[SamvaadikAI][billing] Credit deduction failed:", err);
       }
-    };
-    // Set when the model promises the template button without having called
-    // open_template_picker — the next iteration forces exactly that tool.
-    let forcePickerTool = false;
-    let pickerRetried = false;
+    }
+  };
+  // Set when the model promises the template button without having called
+  // open_template_picker — the next iteration forces exactly that tool.
+  let forcePickerTool = false;
+  let pickerRetried = false;
 
-    // Outcome of the last send_text_message call this turn (null = not called).
-    // Used so the reply can never claim a message was sent when it was not.
-    let lastTextSend = null;
-    let forceSendTool = false;
-    let sendRetried = false;
-    const confirmedMessagePreview =
-      forceToolUse && lastAssistantMsg?.content.includes("Message Preview");
+  // Outcome of the last send_text_message / send_template_message call this
+  // turn (null = not called). Used so the reply can never claim a message
+  // was sent when it was not.
+  let lastTextSend = null;
+  let forceSendTool = false;
+  let sendRetried = false;
+  const confirmedSendTool = forceToolUse ? pendingSendTool : null;
+  const confirmedMessagePreview = !!confirmedSendTool;
 
-    // Raw arrays from the most recent list_groups/list_templates call this
-    // turn, captured so the LIST_GROUPS_BEGIN/LIST_TEMPLATES_BEGIN block the
-    // model writes can be rebuilt deterministically below instead of trusting
-    // the model to copy every item and count correctly.
-    let lastGroupsResult = null;
-    let lastTemplatesResult = null;
+  const tools = toolsForChannel(channel);
+  const toolNames = new Set(tools.map((t) => t.name));
 
+  // Raw arrays from the most recent list_groups/list_templates call this
+  // turn, captured so the LIST_GROUPS_BEGIN/LIST_TEMPLATES_BEGIN block the
+  // model writes can be rebuilt deterministically below instead of trusting
+  // the model to copy every item and count correctly.
+  let lastGroupsResult = null;
+  let lastTemplatesResult = null;
+
+  try {
     while (iteration < MAX_TOOL_ITERATIONS) {
       iteration++;
 
@@ -1061,7 +1148,7 @@ export const handleSamvaadikChat = async (req, res) => {
       const toolChoice = forcePickerTool
         ? { type: "tool", name: "open_template_picker" }
         : forceSendTool
-          ? { type: "tool", name: "send_text_message" }
+          ? { type: "tool", name: confirmedSendTool }
           : forceToolUse && iteration === 1
             ? { type: "any" }
             : { type: "auto" };
@@ -1086,12 +1173,12 @@ export const handleSamvaadikChat = async (req, res) => {
         system: [
           {
             type: "text",
-            text: SAMVAADIK_SYSTEM_PROMPT,
+            text: staticPrompt,
             cache_control: { type: "ephemeral" },
           },
           { type: "text", text: dynamicContext },
         ],
-        tools: CAMPAIGN_TOOLS,
+        tools,
         tool_choice: toolChoice,
         messages: currentMessages,
       });
@@ -1105,7 +1192,9 @@ export const handleSamvaadikChat = async (req, res) => {
         // Guard: the reply points to a template button but the picker tool
         // was never called this turn, so no button would appear. Make the
         // model call it (once), then let it answer again.
+        // Web only — the picker (and this tool) doesn't exist on WhatsApp.
         const promisesPicker =
+          toolNames.has("open_template_picker") &&
           /template/i.test(textBlock?.text || "") &&
           /button (below|above)/i.test(textBlock?.text || "") &&
           !/REDIRECT_TO_TEMPLATES|GOOGLE_|UPLOAD_MEDIA_FOR_TEMPLATE|LIST_TEMPLATES_BEGIN|LIST_GROUPS_BEGIN/.test(
@@ -1113,9 +1202,7 @@ export const handleSamvaadikChat = async (req, res) => {
           );
         if (promisesPicker && !pickerToken && !pickerRetried) {
           if (creditBalance <= 0) {
-            return res.json(
-              buildOutOfCreditsPayload(creditBalance, turnCreditsCharged),
-            );
+            return buildOutOfCreditsPayload(creditBalance, turnCreditsCharged);
           }
           console.warn(
             "[SamvaadikAI] Template button promised without open_template_picker — forcing the tool call",
@@ -1142,12 +1229,10 @@ export const handleSamvaadikChat = async (req, res) => {
         // without calling send_text_message. Force the call once.
         if (confirmedMessagePreview && !lastTextSend && !sendRetried) {
           if (creditBalance <= 0) {
-            return res.json(
-              buildOutOfCreditsPayload(creditBalance, turnCreditsCharged),
-            );
+            return buildOutOfCreditsPayload(creditBalance, turnCreditsCharged);
           }
           console.warn(
-            "[SamvaadikAI] Message confirmed but send_text_message not called — forcing the tool call",
+            `[SamvaadikAI] Preview confirmed but ${confirmedSendTool} not called — forcing the tool call`,
           );
           sendRetried = true;
           forceSendTool = true;
@@ -1155,7 +1240,9 @@ export const handleSamvaadikChat = async (req, res) => {
           currentMessages.push({
             role: "user",
             content:
-              "(System note, not from the user) The user confirmed the Message Preview but send_text_message was not called, so nothing was sent. Call send_text_message now with the phone_number from the preview's 'To:' line and the exact message text. Then report the real result.",
+              confirmedSendTool === "send_template_message"
+                ? "(System note, not from the user) The user confirmed the Template Message Preview but send_template_message was not called, so nothing was sent. Call send_template_message now with the phone_number from the preview's 'To:' line, the template_name and the values from the preview. Then report the real result."
+                : "(System note, not from the user) The user confirmed the Message Preview but send_text_message was not called, so nothing was sent. Call send_text_message now with the phone_number from the preview's 'To:' line and the exact message text. Then report the real result.",
           });
           continue;
         }
@@ -1197,7 +1284,7 @@ export const handleSamvaadikChat = async (req, res) => {
           "templates",
         );
 
-        return res.json({
+        return {
           success: true,
           role: "assistant",
           content: attachPickerToken(replyText, pickerToken),
@@ -1205,7 +1292,7 @@ export const handleSamvaadikChat = async (req, res) => {
           iterations: iteration,
           credits_charged: turnCreditsCharged,
           credits_remaining: creditBalance,
-        });
+        };
       }
 
       if (stop_reason === "tool_use") {
@@ -1213,9 +1300,7 @@ export const handleSamvaadikChat = async (req, res) => {
         // another billable Anthropic call. If this iteration's charge just
         // used up what was left, stop here instead of making that call.
         if (creditBalance <= 0) {
-          return res.json(
-            buildOutOfCreditsPayload(creditBalance, turnCreditsCharged),
-          );
+          return buildOutOfCreditsPayload(creditBalance, turnCreditsCharged);
         }
 
         currentMessages.push({ role: "assistant", content });
@@ -1227,11 +1312,17 @@ export const handleSamvaadikChat = async (req, res) => {
               `[SamvaadikAI] Tool call: ${block.name}`,
               JSON.stringify(block.input),
             );
-            const result = await executeTool(block.name, block.input, user_id);
+            // Only tools offered on this channel may run (defence in depth)
+          const result = toolNames.has(block.name)
+            ? await executeTool(block.name, block.input, user_id)
+            : { error: `Tool ${block.name} is not available here.` };
             // The template-picker token is attached to the reply by the server
             // (see attachPickerToken). Hide it from the model so it can't
             // echo a mangled copy (placeholder text / bare UUID).
-            if (block.name === "send_text_message") {
+            if (
+            block.name === "send_text_message" ||
+            block.name === "send_template_message"
+          ) {
               lastTextSend = result || { sent: false, error: "No result" };
             }
             if (block.name === "open_template_picker" && result?.picker_token) {
@@ -1267,17 +1358,17 @@ export const handleSamvaadikChat = async (req, res) => {
       }
 
       console.warn("[SamvaadikAI] Unexpected stop_reason:", stop_reason);
-      return res.json({
+      return {
         success: true,
         role: "assistant",
         content: "I ran into an unexpected issue. Please try again.",
         iterations: iteration,
         credits_charged: turnCreditsCharged,
         credits_remaining: creditBalance,
-      });
+      };
     }
 
-    return res.json({
+    return {
       success: true,
       role: "assistant",
       content:
@@ -1285,9 +1376,34 @@ export const handleSamvaadikChat = async (req, res) => {
       iterations: iteration,
       credits_charged: turnCreditsCharged,
       credits_remaining: creditBalance,
+    };
+  } finally {
+    logTurnTotals();
+  }
+}
+
+// ── handleSamvaadikChat ───────────────────────────────────────────────────────
+// Thin HTTP wrapper around runSamvaadikAssistant for the dashboard chat
+// widget (SamvaadikAssistant.jsx). Request/response shape is unchanged from
+// before the refactor — only the actual loop moved.
+export const handleSamvaadikChat = async (req, res) => {
+  try {
+    const { user_id, messages, media_attachment } = req.body;
+    const result = await runSamvaadikAssistant({
+      user_id,
+      messages,
+      media_attachment,
+      channel: "web",
     });
+    return res.json(result);
   } catch (err) {
     console.error("❌ handleSamvaadikChat:", err);
+    if (err.code === "BAD_REQUEST") {
+      return res.status(400).json({ success: false, error: err.message });
+    }
+    if (err.code === "USER_NOT_FOUND") {
+      return res.status(404).json({ success: false, error: err.message });
+    }
     if (err.status === 401)
       return res
         .status(500)
