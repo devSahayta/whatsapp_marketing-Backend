@@ -19,6 +19,31 @@ import {
 } from "../services/chatbotEngine.js";
 import { createNotification } from "../controllers/notificationController.js";
 import { markCodOrderConfirmed } from "./woocommerceController.js";
+import { processAssistantInbound } from "./samvaadikWaController.js";
+import crypto from "crypto";
+
+/**
+ * Verifies Meta's X-Hub-Signature-256 header (HMAC-SHA256 of the raw body
+ * with the app secret). req.rawBody is captured by express.json's verify
+ * hook in app.js. Used for the AI assistant number only; customer webhooks
+ * are unchanged. Without a configured secret the check is skipped (with a
+ * warning) so local testing still works.
+ */
+function isValidMetaSignature(req) {
+  const secret = process.env.ASSISTANT_WEBHOOK_APP_SECRET || process.env.META_APP_SECRET;
+  if (!secret) {
+    console.warn("[SamvaadikWA] META_APP_SECRET not set — webhook signature NOT verified");
+    return true;
+  }
+  const header = req.headers["x-hub-signature-256"];
+  if (!header || !req.rawBody) return false;
+  const expected =
+    "sha256=" +
+    crypto.createHmac("sha256", secret).update(req.rawBody).digest("hex");
+  const a = Buffer.from(String(header));
+  const b = Buffer.from(expected);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
 
 /* ─── Webhook Forwarding ────────────────────────────────────────────────────
    Forward incoming messages to any external app that has registered a
@@ -576,6 +601,27 @@ export const handleIncomingMessage = async (req, res) => {
   if (!wabaId || !phoneNumberId) {
     console.error("❌ Missing WABA ID or phone_number_id");
     return res.sendStatus(200);
+  }
+
+  // ── Samvaadik AI Assistant over WhatsApp ────────────────────────────────
+  // Messages to Samvaadik's OWN assistant number never belong to any
+  // customer's connected WABA (whatsapp_accounts), so they're routed here
+  // before the per-customer handling below — including its status updates
+  // (sent/delivered/read of the assistant's replies), which are ignored.
+  // See samvaadikWaController.js.
+  if (
+    process.env.ASSISTANT_PHONE_NUMBER_ID &&
+    phoneNumberId === process.env.ASSISTANT_PHONE_NUMBER_ID
+  ) {
+    // The assistant can create campaigns and send messages for an account,
+    // so only act on requests that really come from Meta.
+    if (!isValidMetaSignature(req)) {
+      console.warn("[SamvaadikWA] Rejected webhook with invalid signature");
+      return res.sendStatus(401);
+    }
+    res.sendStatus(200);
+    if (value?.messages) waitUntil(processAssistantInbound(value));
+    return;
   }
 
   // if (value?.statuses) {

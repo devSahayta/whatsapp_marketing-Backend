@@ -33,7 +33,15 @@ import publicApiRoutes from "./routes/publicApiRoutes.js";
 import notificationRoutes from "./routes/notificationRoutes.js";
 
 const app = express();
-app.use(express.json());
+app.use(
+  express.json({
+    // Keep the raw bytes of WhatsApp webhooks so Meta's X-Hub-Signature-256
+    // can be verified (see isValidMetaSignature in whatsappController.js).
+    verify: (req, _res, buf) => {
+      if (req.originalUrl?.startsWith("/whatsapp/webhook")) req.rawBody = buf;
+    },
+  }),
+);
 
 // CORS: allow your frontend origin(s)
 app.use(

@@ -271,7 +271,107 @@ function buildCarouselComponents(template, components, input) {
   };
 }
 
-/* ─── POST /admin/chat/send-template ────────────────────────────────────── */
+/**
+ * What a sender must supply for this template — the text-only counterpart of
+ * the template picker form (used by the AI assistant on WhatsApp, which has
+ * no form). Mirrors the builders above so the two can't disagree.
+ */
+export function describeTemplateRequirements(template) {
+  const components = parseJson(template.components, []) || [];
+  const isCarousel =
+    !!template.is_carousel || !!findComp(components, "CAROUSEL");
+  const body = findComp(components, "BODY");
+  const bodyKeys = getPlaceholderKeys(body?.text);
+  const bodyExamples = body?.example?.body_text?.[0] || [];
+  const namedExamples = Object.fromEntries(
+    (body?.example?.body_text_named_params || []).map((p) => [
+      p.param_name,
+      p.example,
+    ]),
+  );
+
+  const req = {
+    wt_id: template.wt_id,
+    name: template.name,
+    status: template.status,
+    is_carousel: isCarousel,
+    body_text: body?.text || "",
+    body_variables: bodyKeys.map((key, i) => ({
+      key,
+      example: namedExamples[key] ?? bodyExamples[i] ?? null,
+    })),
+    header_variable_needed: false,
+    header_text: null,
+    media_needed: null,
+    media_ready: true,
+    button_variables: [],
+  };
+
+  if (isCarousel) {
+    const carouselMedia = parseJson(template.carousel_media, []) || [];
+    const cards = findComp(components, "CAROUSEL")?.cards || [];
+    req.card_count = cards.length;
+    const missingCards = cards
+      .map((_, i) => i)
+      .filter(
+        (i) =>
+          !carouselMedia.find((m) => Number(m.card_index) === i)?.media_id,
+      );
+    req.media_needed = "CAROUSEL_CARDS";
+    req.media_ready = missingCards.length === 0;
+    if (missingCards.length) {
+      req.cards_missing_media = missingCards.map((i) => i + 1);
+    }
+    // Card URL buttons fall back to the template's saved example, so they
+    // are optional per send; list them so a value can be overridden.
+    cards.forEach((card, cardIndex) => {
+      (findComp(card.components, "BUTTONS")?.buttons || []).forEach(
+        (btn, buttonIndex) => {
+          if (isDynamicUrlButton(btn)) {
+            req.button_variables.push({
+              card_index: cardIndex,
+              button_index: buttonIndex,
+              button_text: btn.text,
+              url: btn.url,
+              optional: true,
+            });
+          }
+        },
+      );
+    });
+    return req;
+  }
+
+  const header = findComp(components, "HEADER");
+  const headerFormat = (header?.format || "").toUpperCase();
+  if (MEDIA_HEADER_FORMATS.includes(headerFormat)) {
+    req.media_needed = headerFormat;
+    req.media_ready = !!template.media_id;
+  } else if (headerFormat === "TEXT" && header?.text) {
+    req.header_text = header.text;
+    req.header_variable_needed = getPlaceholderKeys(header.text).length > 0;
+  }
+  (findComp(components, "BUTTONS")?.buttons || []).forEach((btn, index) => {
+    if (isDynamicUrlButton(btn)) {
+      req.button_variables.push({
+        button_index: index,
+        button_text: btn.text,
+        url: btn.url,
+        optional: false,
+      });
+    }
+  });
+  return req;
+}
+
+// Result shape for sendTemplateToContact: HTTP-style status + JSON body, so
+// both the Express route and the AI assistant tool can use it.
+const reply = (status, data) => ({ status, data });
+
+/* ─── Send one template to one contact (shared core) ────────────────────── */
+// Used by POST /admin/chat/send-template and by the AI assistant's
+// send_template_message tool (WhatsApp channel). user_id must already be
+// authenticated by the caller.
 /*
   Body:
   {
@@ -285,15 +385,11 @@ function buildCarouselComponents(template, components, input) {
     ]
   }
 */
-export const sendChatTemplate = async (req, res) => {
-  const user_id = req.user?.user_id;
-  const { chat_id: chatIdInput, wt_id, phone_number, person_name } =
-    req.body || {};
+export async function sendTemplateToContact(user_id, body = {}) {
+  const { chat_id: chatIdInput, wt_id, phone_number, person_name } = body;
 
   if ((!chatIdInput && !phone_number) || !wt_id) {
-    return res
-      .status(400)
-      .json({ error: "chat_id (or phone_number) and wt_id are required" });
+    return reply(400, { error: "chat_id (or phone_number) and wt_id are required" });
   }
 
   try {
@@ -309,13 +405,13 @@ export const sendChatTemplate = async (req, res) => {
         .maybeSingle();
       if (chatErr) throw chatErr;
       if (!data || data.user_id !== user_id) {
-        return res.status(404).json({ error: "Chat not found" });
+        return reply(404, { error: "Chat not found" });
       }
       chat = data;
     } else {
       const phone = normalizePhone(phone_number);
       if (!phone) {
-        return res.status(400).json({
+        return reply(400, {
           error: "Invalid phone number. Include the country code, e.g. +91 98765 43210.",
           code: "INVALID_PHONE",
         });
@@ -335,9 +431,7 @@ export const sendChatTemplate = async (req, res) => {
     // 2. WhatsApp account
     const account = await getWhatsappAccount(user_id);
     if (!account?.phone_number_id || !account?.system_user_access_token) {
-      return res
-        .status(400)
-        .json({ error: "WhatsApp account is not connected" });
+      return reply(400, { error: "WhatsApp account is not connected" });
     }
 
     // 3. Template must belong to this account and be approved
@@ -350,10 +444,10 @@ export const sendChatTemplate = async (req, res) => {
 
     if (tplErr) throw tplErr;
     if (!template) {
-      return res.status(404).json({ error: "Template not found" });
+      return reply(404, { error: "Template not found" });
     }
     if ((template.status || "").toUpperCase() !== "APPROVED") {
-      return res.status(400).json({
+      return reply(400, {
         error: `Only approved templates can be sent (this one is ${template.status}).`,
         code: "TEMPLATE_NOT_APPROVED",
       });
@@ -364,10 +458,10 @@ export const sendChatTemplate = async (req, res) => {
     const isCarousel =
       !!template.is_carousel || !!findComp(components, "CAROUSEL");
     const input = {
-      body_variables: req.body.body_variables || {},
-      header_variable: req.body.header_variable,
-      button_variables: Array.isArray(req.body.button_variables)
-        ? req.body.button_variables
+      body_variables: body.body_variables || {},
+      header_variable: body.header_variable,
+      button_variables: Array.isArray(body.button_variables)
+        ? body.button_variables
         : [],
     };
 
@@ -378,9 +472,7 @@ export const sendChatTemplate = async (req, res) => {
         : buildRegularComponents(template, components, input);
     } catch (err) {
       if (err instanceof SendValidationError) {
-        return res
-          .status(400)
-          .json({ error: err.message, code: err.code, ...err.extra });
+        return reply(400, { error: err.message, code: err.code, ...err.extra });
       }
       throw err;
     }
@@ -413,7 +505,7 @@ export const sendChatTemplate = async (req, res) => {
     } catch (err) {
       const metaErr = err.response?.data?.error;
       console.error("sendChatTemplate Meta error:", metaErr || err.message);
-      return res.status(502).json({
+      return reply(502, {
         error:
           metaErr?.error_data?.details ||
           metaErr?.message ||
@@ -471,7 +563,7 @@ export const sendChatTemplate = async (req, res) => {
       if (newChatErr) {
         console.error("sendChatTemplate chat create error:", newChatErr);
         // The message was delivered to Meta; report success without a chat row
-        return res.json({
+        return reply(200, {
           success: true,
           wa_message_id,
           wm_id: wmRecord?.wm_id || null,
@@ -543,7 +635,7 @@ export const sendChatTemplate = async (req, res) => {
       })
       .eq("chat_id", chat_id);
 
-    return res.json({
+    return reply(200, {
       success: true,
       wa_message_id,
       wm_id: wmRecord?.wm_id || null,
@@ -552,6 +644,15 @@ export const sendChatTemplate = async (req, res) => {
     });
   } catch (err) {
     console.error("sendChatTemplate error:", err);
-    return res.status(500).json({ error: "Failed to send template" });
+    return reply(500, { error: "Failed to send template" });
   }
+}
+
+/** Express handler: POST /admin/chat/send-template (chat dashboard + web assistant). */
+export const sendChatTemplate = async (req, res) => {
+  const { status, data } = await sendTemplateToContact(
+    req.user?.user_id,
+    req.body || {},
+  );
+  return res.status(status).json(data);
 };
