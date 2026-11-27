@@ -126,6 +126,13 @@ export function adaptReplyForWhatsApp(text) {
   take(/`?OPEN_TEMPLATE_PICKER:\S*`?/g, null);
 
   out = out
+    // No buttons exist on WhatsApp — drop "using the button below" style
+    // phrases the model may copy from the web instructions
+    .replace(
+      /(?<=\w)(?:,\s*|[ \t]+)(?:by\s+)?(?:using|use|with|via|click(?:ing)?|tap(?:ping)?)\s+(?:on\s+)?the\s+(?:[\w"'“”-]+\s+){0,4}button(?:\s+(?:below|above))?/gi,
+      "",
+    )
+    .replace(/\s*\((?:see\s+)?(?:the\s+)?button\s+below\)/gi, "")
     // WhatsApp bold is *single*; the web assistant uses **double**
     .replace(/\*\*([^*\n]+)\*\*/g, "*$1*")
     .replace(/[ \t]+\n/g, "\n")
