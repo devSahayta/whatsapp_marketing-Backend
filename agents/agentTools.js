@@ -60,7 +60,7 @@ export const CAMPAIGN_TOOLS = [
   {
     name: "create_template",
     description:
-      "Create a new WhatsApp message template (text only, no media) and submit it to Meta for approval. Only call this AFTER showing the user a full preview and receiving explicit confirmation.",
+      "Create a new WhatsApp message template and submit it to Meta for approval. Supports a TEXT header, or an IMAGE/VIDEO/DOCUMENT header when the user has already uploaded a media file in this conversation (its handle appears in a media_attachment context block — pass header_format/header_handle/media_id from that block; never guess them). Only call this AFTER showing the user a full preview and receiving explicit confirmation.",
     input_schema: {
       type: "object",
       properties: {
