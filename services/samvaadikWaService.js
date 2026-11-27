@@ -13,8 +13,17 @@
 import axios from "axios";
 import crypto from "crypto";
 import { supabase } from "../config/supabase.js";
+import { getWhatsappAccount } from "./waAccountService.js";
+import {
+  createUploadSession,
+  uploadBinaryToSession,
+  uploadMediaForMessage,
+} from "./whatsappTemplateService.js";
 
 const GRAPH_BASE = "https://graph.facebook.com/v21.0";
+// Same pattern as whatsappTemplateController.js — Node's built-in globals,
+// not a bundler/polyfill import.
+const { FormData, Blob } = globalThis;
 
 // A business number cannot send a single WhatsApp text message over 4096
 // characters; split on sentence/line boundaries where possible, hard-cut
@@ -165,7 +174,9 @@ export async function getLinkByWaId(wa_id) {
  * { error: "..." } on an invalid/expired/already-used code.
  */
 export async function consumeLinkCode(rawCode, wa_id) {
-  const code = String(rawCode || "").trim().toUpperCase();
+  const code = String(rawCode || "")
+    .trim()
+    .toUpperCase();
   if (!code) return { error: "EMPTY_CODE" };
 
   const { data: codeRow, error: codeErr } = await supabase
@@ -249,6 +260,246 @@ export async function clearSession(link_id) {
     .delete()
     .eq("link_id", link_id);
   if (error) console.error("[SamvaadikWA] clearSession error:", error);
+}
+
+// ─── Pending actions (CSV group import, template media) ────────────────────
+//
+// Deterministic sub-flows that never go through the model, same spirit as
+// the LINK/RESET handling above: a document or image arrives, we store just
+// enough state on this number's session row to understand a plain yes/no (or
+// a new group name) on the very next message, and execute with the existing
+// group/template services directly. The model never sees raw contact rows
+// or an unconfirmed upload.
+//
+// Two independent slots, because they serve different purposes and can be
+// in flight for different reasons at once is not expected, but keeping them
+// separate (rather than one "pending" blob with a discriminant) means a
+// media upload confirmation never has to worry about clobbering a group
+// import that's mid-confirmation, or vice versa — setting one never touches
+// the other column.
+//   - pending_action: short-lived, needs a yes/no (or a replacement value)
+//     on the user's very next text message. Cleared as soon as it's resolved.
+//   - media_attachment: longer-lived (mirrors the web dashboard's "pending
+//     attachment" chip, which also survives across turns until removed or
+//     replaced). Forwarded into every runSamvaadikAssistant call on this
+//     link until create_template consumes it, the user cancels it, or it
+//     expires.
+const PENDING_ACTION_TTL_MINUTES = 30;
+const MEDIA_ATTACHMENT_TTL_MINUTES = 30;
+
+function futureIso(minutes) {
+  return new Date(Date.now() + minutes * 60 * 1000).toISOString();
+}
+
+/** Pending action for this link, or null if there isn't one or it expired. */
+export async function getPendingAction(link_id) {
+  const { data, error } = await supabase
+    .from("samvaadik_wa_sessions")
+    .select("pending_action, pending_action_expires_at")
+    .eq("link_id", link_id)
+    .maybeSingle();
+  if (error) throw error;
+  if (!data?.pending_action) return null;
+  if (
+    data.pending_action_expires_at &&
+    new Date(data.pending_action_expires_at).getTime() < Date.now()
+  ) {
+    return null;
+  }
+  return data.pending_action;
+}
+
+export async function setPendingAction(link_id, action) {
+  const { error } = await supabase.from("samvaadik_wa_sessions").upsert({
+    link_id,
+    pending_action: action,
+    pending_action_expires_at: futureIso(PENDING_ACTION_TTL_MINUTES),
+    updated_at: new Date().toISOString(),
+  });
+  if (error) throw error;
+}
+
+export async function clearPendingAction(link_id) {
+  const { error } = await supabase
+    .from("samvaadik_wa_sessions")
+    .update({ pending_action: null, pending_action_expires_at: null })
+    .eq("link_id", link_id);
+  if (error) console.error("[SamvaadikWA] clearPendingAction error:", error);
+}
+
+/** The session's standing media attachment (for create_template), or null. */
+export async function getMediaAttachment(link_id) {
+  const { data, error } = await supabase
+    .from("samvaadik_wa_sessions")
+    .select("media_attachment, media_attachment_expires_at")
+    .eq("link_id", link_id)
+    .maybeSingle();
+  if (error) throw error;
+  if (!data?.media_attachment) return null;
+  if (
+    data.media_attachment_expires_at &&
+    new Date(data.media_attachment_expires_at).getTime() < Date.now()
+  ) {
+    return null;
+  }
+  return data.media_attachment;
+}
+
+export async function setMediaAttachment(link_id, attachment) {
+  const { error } = await supabase.from("samvaadik_wa_sessions").upsert({
+    link_id,
+    media_attachment: attachment,
+    media_attachment_expires_at: futureIso(MEDIA_ATTACHMENT_TTL_MINUTES),
+    updated_at: new Date().toISOString(),
+  });
+  if (error) throw error;
+}
+
+export async function clearMediaAttachment(link_id) {
+  const { error } = await supabase
+    .from("samvaadik_wa_sessions")
+    .update({ media_attachment: null, media_attachment_expires_at: null })
+    .eq("link_id", link_id);
+  if (error) console.error("[SamvaadikWA] clearMediaAttachment error:", error);
+}
+
+// ─── Inbound media (CSV/Excel documents, template header photos) ───────────
+
+/**
+ * Downloads a media object the user sent to Samvaadik's own assistant
+ * number. Uses ASSISTANT_WA_TOKEN — the inbound message belongs to the
+ * assistant's own WABA inbox, never the customer's connected WABA (see
+ * utils/whatsappMedia.js, which uses WHATSAPP_TOKEN for that other case and
+ * would be the wrong token here).
+ */
+export async function downloadAssistantMedia(mediaId) {
+  const token = process.env.ASSISTANT_WA_TOKEN;
+  if (!token) throw new Error("ASSISTANT_WA_TOKEN not configured");
+
+  const metaResp = await axios.get(`${GRAPH_BASE}/${mediaId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+    timeout: 15000,
+  });
+  const { url, mime_type, file_size } = metaResp.data || {};
+  if (!url) throw new Error("Meta did not return a media URL");
+
+  const fileResp = await axios.get(url, {
+    responseType: "arraybuffer",
+    headers: { Authorization: `Bearer ${token}` },
+    timeout: 30000,
+  });
+
+  return {
+    buffer: Buffer.from(fileResp.data),
+    mimeType:
+      mime_type ||
+      fileResp.headers["content-type"] ||
+      "application/octet-stream",
+    sizeBytes: file_size || fileResp.data.byteLength,
+  };
+}
+
+const EXT_BY_MIME = {
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+  "video/mp4": "mp4",
+  "application/pdf": "pdf",
+  "text/csv": "csv",
+  "application/vnd.ms-excel": "xls",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+};
+
+function headerFormatForMime(mimeType) {
+  if (mimeType?.startsWith("image/")) return "IMAGE";
+  if (mimeType?.startsWith("video/")) return "VIDEO";
+  return "DOCUMENT";
+}
+
+/**
+ * Uploads a buffer the user sent over WhatsApp as a template header, using
+ * the CUSTOMER'S OWN connected WABA credentials (app_id + system user access
+ * token from whatsapp_accounts) — not the assistant number's. Templates
+ * belong to the customer's WABA, so Meta requires the upload session and the
+ * /media call to be authenticated as that WABA's own app/token, exactly like
+ * the dashboard's prepareMediaHeader flow (whatsappTemplateController.js).
+ *
+ * Returns the same shape the web dashboard's media_attachment carries, so it
+ * can be forwarded straight into runSamvaadikAssistant unchanged.
+ */
+export async function uploadMediaForTemplateHeader(
+  user_id,
+  { buffer, mimeType, fileName },
+) {
+  const account = await getWhatsappAccount(user_id); // throws if not connected
+  const ext = EXT_BY_MIME[mimeType] || "bin";
+  const resolvedName = fileName || `whatsapp-upload-${Date.now()}.${ext}`;
+
+  const session = await createUploadSession(
+    account.app_id,
+    account.system_user_access_token,
+    { file_name: resolvedName, file_type: mimeType },
+  );
+  if (!session?.id) throw new Error("Failed to create Meta upload session");
+
+  const binaryResp = await uploadBinaryToSession(
+    session.id,
+    buffer,
+    mimeType,
+    account.system_user_access_token,
+  );
+  const header_handle = binaryResp?.h;
+  if (!header_handle) throw new Error("Meta did not return a header handle");
+
+  const form = new FormData();
+  form.append("messaging_product", "whatsapp");
+  form.append("type", mimeType);
+  form.append("file", new Blob([buffer], { type: mimeType }), resolvedName);
+  const mediaResp = await uploadMediaForMessage(
+    account.phone_number_id,
+    account.system_user_access_token,
+    form,
+  );
+  const media_id = mediaResp?.id || null;
+
+  if (media_id) {
+    await supabase.from("whatsapp_media_uploads").insert({
+      account_id: account.wa_id,
+      media_id,
+      file_name: resolvedName,
+      type: mimeType,
+      mime_type: mimeType,
+      size_bytes: buffer.byteLength,
+    });
+  }
+
+  return {
+    header_handle,
+    header_format: headerFormatForMime(mimeType),
+    media_id,
+    file_name: resolvedName,
+  };
+}
+
+/**
+ * Attaches a freshly-uploaded media_id to an EXISTING template — the "my
+ * template's media expired, here's a new photo" path, same DB write as the
+ * dashboard's updateTemplateMediaId endpoint (whatsappTemplateController.js)
+ * but called directly rather than over HTTP, since the WhatsApp webhook has
+ * no request/response cycle to route through that controller.
+ */
+export async function attachMediaToExistingTemplate(user_id, wt_id, media_id) {
+  const account = await getWhatsappAccount(user_id);
+  const { data, error } = await supabase
+    .from("whatsapp_templates")
+    .update({ media_id })
+    .eq("wt_id", wt_id)
+    .eq("account_id", account.wa_id)
+    .select("wt_id, name, header_format")
+    .maybeSingle();
+  if (error) throw error;
+  if (!data) throw new Error("Template not found");
+  return data;
 }
 
 // ─── Sending replies back over WhatsApp ────────────────────────────────────

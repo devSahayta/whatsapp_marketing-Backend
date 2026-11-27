@@ -12,7 +12,11 @@
 //     widget uses (runSamvaadikAssistant in agentController.js) — nothing
 //     about campaign/template/contact logic is duplicated here.
 
-import { runSamvaadikAssistant } from "./agentController.js";
+import {
+  runSamvaadikAssistant,
+  createGroupFromContacts,
+} from "./agentController.js";
+import { parseContactsFile } from "../utils/contactFileParser.js";
 import {
   startLinkCode,
   listLinksForUser,
@@ -26,6 +30,15 @@ import {
   markReadWithTyping,
   normalizeWaId,
   isAssistantConfigured,
+  getPendingAction,
+  setPendingAction,
+  clearPendingAction,
+  getMediaAttachment,
+  setMediaAttachment,
+  clearMediaAttachment,
+  downloadAssistantMedia,
+  uploadMediaForTemplateHeader,
+  attachMediaToExistingTemplate,
 } from "../services/samvaadikWaService.js";
 
 // ── Dashboard endpoints (Kinde-authed) ──────────────────────────────────────
@@ -56,7 +69,12 @@ export const listLinks = async (req, res) => {
   try {
     // Feature off (env not set): tell the card, skip the database entirely
     if (!isAssistantConfigured()) {
-      return res.json({ success: true, enabled: false, links: [], assistant_number: null });
+      return res.json({
+        success: true,
+        enabled: false,
+        links: [],
+        assistant_number: null,
+      });
     }
     const links = await listLinksForUser(req.user.user_id);
     return res.json({
@@ -92,6 +110,59 @@ export const unlink = async (req, res) => {
 
 const LINK_CODE_RE = /^\s*link\s*[:\-]?\s*([a-z0-9]{6})\s*[.!]?\s*$/i;
 const RESET_RE = /^\s*(reset|new chat|start over|clear)\s*[.!]?\s*$/i;
+const YES_RE =
+  /^\s*(yes|yeah|yep|y|confirm|ok|okay|go ahead|create it|sure|correct|crct)\s*[.!]?\s*$/i;
+const NO_RE = /^\s*(no|n|cancel|stop|never ?mind)\s*[.!]?\s*$/i;
+const CANCEL_MEDIA_RE =
+  /^\s*(remove|cancel|discard)\s+(the\s+)?(photo|image|video|file|media|upload|attachment)\s*[.!]?\s*$/i;
+
+// Files a WhatsApp user might send as a group's contact list.
+const CONTACT_FILE_MIME = new Set([
+  "text/csv",
+  "application/csv",
+  "application/vnd.ms-excel",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+]);
+const CONTACT_FILE_EXT = new Set(["csv", "xlsx", "xls"]);
+
+function isContactFileDocument(message) {
+  if (message.type !== "document") return false;
+  const doc = message.document || {};
+  const ext = (doc.filename || "").split(".").pop()?.toLowerCase();
+  return CONTACT_FILE_MIME.has(doc.mime_type) || CONTACT_FILE_EXT.has(ext);
+}
+
+// Turns "diwali_buyers_oct.xlsx" into "Diwali Buyers Oct" as a starting
+// group-name suggestion — the user can just reply with a different name
+// instead of "yes" to override it, no special syntax needed.
+function guessGroupNameFromFilename(filename) {
+  const base = String(filename || "").replace(/\.[^.]+$/, "");
+  const words = base
+    .replace(/[_\-]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1));
+  return words.length ? words.join(" ").slice(0, 60) : "New Group";
+}
+
+// Mirrors SamvaadikAssistant.jsx's own parsing of this marker (see
+// UPLOAD_MEDIA_FOR_TEMPLATE handling there) — run on the model's raw reply,
+// before adaptReplyForWhatsApp strips the marker out of the display text.
+const UPLOAD_MEDIA_MARKER_RE =
+  /UPLOAD_MEDIA_FOR_TEMPLATE:([A-Za-z0-9-]+)\|(IMAGE|VIDEO|DOCUMENT)\|(\S*)/;
+
+function parseUploadMediaMarker(text) {
+  const m = String(text || "").match(UPLOAD_MEDIA_MARKER_RE);
+  if (!m) return null;
+  let name = m[3];
+  try {
+    name = decodeURIComponent(name);
+  } catch {
+    // keep raw
+  }
+  return { wt_id: m[1], header_format: m[2], name };
+}
 
 const DASHBOARD_URL = (process.env.FRONTEND_URL || "").replace(/\/+$/, "");
 const withLink = (label, path) =>
@@ -119,9 +190,7 @@ function formatListBlock(_match, kind, body) {
       }
       // groups: name|contact_count — templates: name|header_format|status
       const detail =
-        kind === "GROUPS"
-          ? parts[1] && `${parts[1]} contacts`
-          : parts[2];
+        kind === "GROUPS" ? parts[1] && `${parts[1]} contacts` : parts[2];
       return `${i + 1}. ${name}${detail ? ` (${detail})` : ""}`;
     })
     .join("\n");
@@ -143,17 +212,26 @@ export function adaptReplyForWhatsApp(text) {
 
   take(/REDIRECT_TO_PRICING:\s*/g, withLink("Top up credits", "/pricing"));
   take(/REDIRECT_TO_TEMPLATES:\s*/g, withLink("Open Templates", "/templates"));
-  take(/REDIRECT_TO_BUILDER:[a-f0-9-]+\s*/gi, withLink("Open Chatbot Flows", "/chatbot"));
+  take(
+    /REDIRECT_TO_BUILDER:[a-f0-9-]+\s*/gi,
+    withLink("Open Chatbot Flows", "/chatbot"),
+  );
   take(/REDIRECT_TO_FLOWS:\s*/g, withLink("Open Chatbot Flows", "/chatbot"));
-  take(/GOOGLE_NOT_CONNECTED:\s*/g, withLink("Connect Google", "/integrations"));
+  take(
+    /GOOGLE_NOT_CONNECTED:\s*/g,
+    withLink("Connect Google", "/integrations"),
+  );
   take(
     /GOOGLE_PICK_SHEET:\s*/g,
     'To choose a sheet from Google Drive, open the AI Assistant in the Samvaadik dashboard and use "Choose from Google Drive", then come back here.',
   );
-  // Web-only in-chat media upload button
+  // On the web this opens an in-chat upload button; here the user just sends
+  // the photo/video/document as their next WhatsApp message instead (see
+  // parseUploadMediaMarker / handleMediaUpload in processAssistantInbound,
+  // which read this same marker off the raw reply before it's stripped here).
   take(
     /`?UPLOAD_MEDIA_FOR_TEMPLATE:\S*`?/g,
-    withLink("Upload the template media", "/templates"),
+    "Just send the photo, video or document here and I'll use it.",
   );
   // Web-only template picker — should not appear here, but never leak it
   take(/`?OPEN_TEMPLATE_PICKER:\S*`?/g, null);
@@ -202,6 +280,286 @@ export function toModelMessages(history) {
   return out;
 }
 
+// ── CSV/Excel group import (WhatsApp document → group) ──────────────────────
+//
+// Deterministic, same spirit as LINK/RESET: the model never sees raw contact
+// rows. We download the file, parse it, store the parsed contacts as this
+// link's pending_action, and ask a plain yes/no/rename question. Resolved in
+// handlePendingActionReply below.
+async function handleCsvDocument(link, from, message) {
+  const doc = message.document || {};
+  if (!doc.id) {
+    await sendAssistantWhatsAppText(
+      from,
+      "I couldn't read that file — please try sending it again.",
+    );
+    return;
+  }
+  try {
+    const { buffer, mimeType } = await downloadAssistantMedia(doc.id);
+    const parsed = await parseContactsFile(buffer, {
+      fileName: doc.filename || "contacts.csv",
+      mimeType,
+      userId: link.user_id,
+    });
+    const groupName = guessGroupNameFromFilename(doc.filename);
+    await setPendingAction(link.link_id, {
+      type: "group_import",
+      group_name: groupName,
+      contacts: parsed.contacts,
+      skipped: parsed.skipped,
+    });
+    const count = parsed.contacts.length;
+    await sendAssistantWhatsAppText(
+      from,
+      `Found *${count}* contact${count === 1 ? "" : "s"} in that file` +
+        (parsed.skipped
+          ? ` (${parsed.skipped} row${parsed.skipped === 1 ? "" : "s"} skipped — no valid phone number)`
+          : "") +
+        `.\n\nCreate a group called *"${groupName}"* with ${count === 1 ? "it" : "them"}? ` +
+        "Reply *yes* to confirm, send a different name to use that instead, or *cancel*.",
+    );
+  } catch (err) {
+    console.error("[SamvaadikWA] CSV/Excel import error:", err);
+    await sendAssistantWhatsAppText(
+      from,
+      `I couldn't use that file: ${err.message}`,
+    );
+  }
+}
+
+// ── Template header media (WhatsApp photo/video/document → Meta upload) ─────
+//
+// The upload itself always uses the CUSTOMER'S OWN connected WABA
+// credentials (see uploadMediaForTemplateHeader), never the assistant
+// number's — templates belong to that WABA. What happens next depends on
+// whether this link is currently waiting for a reupload on a SPECIFIC
+// existing template (set from the model's own UPLOAD_MEDIA_FOR_TEMPLATE
+// marker — see runModelTurn) or not:
+//   - waiting on a specific template: attach the fresh media_id to it
+//     directly and resume the conversation with a synthetic "I've uploaded
+//     new media..." turn, exactly mirroring the web dashboard's
+//     handleTemplateMediaUploaded flow.
+//   - not waiting on anything: offer it as the header for a NEW template,
+//     same as the spec's "Photos in" pattern — store it and ask yes/no.
+async function handleMediaUpload(link, from, message) {
+  const mediaObj = message.image || message.video || message.document;
+  if (!mediaObj?.id) {
+    await sendAssistantWhatsAppText(
+      from,
+      "I couldn't read that file — please try sending it again.",
+    );
+    return;
+  }
+
+  let uploaded;
+  try {
+    const { buffer, mimeType } = await downloadAssistantMedia(mediaObj.id);
+    uploaded = await uploadMediaForTemplateHeader(link.user_id, {
+      buffer,
+      mimeType,
+      fileName: mediaObj.filename,
+    });
+  } catch (err) {
+    console.error("[SamvaadikWA] Template media upload error:", err);
+    const notConnected = /whatsapp account not found/i.test(err.message || "");
+    await sendAssistantWhatsAppText(
+      from,
+      notConnected
+        ? "Your Samvaadik account isn't connected to a WhatsApp Business number yet, so I can't use this as a template header. Connect one from Integrations in the dashboard first."
+        : `I couldn't process that file: ${err.message}`,
+    );
+    return;
+  }
+
+  const pending = await getPendingAction(link.link_id);
+  if (pending?.type === "awaiting_template_reupload") {
+    await clearPendingAction(link.link_id);
+    try {
+      const tpl = await attachMediaToExistingTemplate(
+        link.user_id,
+        pending.wt_id,
+        uploaded.media_id,
+      );
+      const resumeText = `I've uploaded new media for the "${tpl.name}" template (media_id: ${uploaded.media_id}). Please continue.`;
+      const history = await getSessionMessages(link.link_id);
+      const withUser = [...history, { role: "user", content: resumeText }];
+      await saveSessionMessages(link.link_id, withUser);
+      await runModelTurn(link, from, withUser);
+    } catch (err) {
+      console.error("[SamvaadikWA] attachMediaToExistingTemplate error:", err);
+      await sendAssistantWhatsAppText(
+        from,
+        `The file uploaded, but I couldn't attach it to "${pending.name}": ${err.message}`,
+      );
+    }
+    return;
+  }
+
+  // No specific template was waiting — offer it for a new one.
+  await setPendingAction(link.link_id, {
+    type: "confirm_new_media",
+    attachment: uploaded,
+  });
+  await sendAssistantWhatsAppText(
+    from,
+    `Got it — I've uploaded that ${uploaded.header_format.toLowerCase()}. Use it as the header for a *new* template? Reply *yes* to continue, or *cancel*.`,
+  );
+}
+
+// ── Resolving a pending_action with the user's next text message ────────────
+// Returns true when the message was fully handled (CSV import confirmed and
+// run, a rename, a cancel, or a reupload reminder) — the caller stops there.
+// Returns false to let the normal model turn run instead (used for the
+// "confirm_new_media" yes-path, so the user's "yes" still becomes part of
+// the conversation now that media_attachment is set).
+async function handlePendingActionReply(link, from, text) {
+  const pending = await getPendingAction(link.link_id);
+  if (!pending) return false;
+
+  if (pending.type === "group_import") {
+    if (NO_RE.test(text)) {
+      await clearPendingAction(link.link_id);
+      await sendAssistantWhatsAppText(
+        from,
+        "No problem — group creation cancelled.",
+      );
+      return true;
+    }
+    if (YES_RE.test(text)) {
+      await clearPendingAction(link.link_id);
+      try {
+        const result = await createGroupFromContacts({
+          user_id: link.user_id,
+          group_name: pending.group_name,
+          contacts: pending.contacts,
+        });
+        await sendAssistantWhatsAppText(from, result.message);
+        // Record it in history (no model call) so later turns ("send a
+        // campaign to that group") have the context without re-asking.
+        const history = await getSessionMessages(link.link_id);
+        await saveSessionMessages(link.link_id, [
+          ...history,
+          {
+            role: "user",
+            content: `(Sent a contact file) Create group "${pending.group_name}" from the uploaded contacts.`,
+          },
+          { role: "assistant", content: result.message },
+        ]);
+      } catch (err) {
+        console.error("[SamvaadikWA] createGroupFromContacts error:", err);
+        await sendAssistantWhatsAppText(
+          from,
+          `Couldn't create the group: ${err.message}`,
+        );
+      }
+      return true;
+    }
+    // Anything else is treated as a replacement group name.
+    const newName = text.trim().slice(0, 60);
+    if (!newName) return true;
+    await setPendingAction(link.link_id, { ...pending, group_name: newName });
+    const count = pending.contacts.length;
+    await sendAssistantWhatsAppText(
+      from,
+      `Got it — create a group called *"${newName}"* with those ${count} contact${count === 1 ? "" : "s"}? Reply *yes* to confirm, or *cancel*.`,
+    );
+    return true;
+  }
+
+  if (pending.type === "awaiting_template_reupload") {
+    if (NO_RE.test(text) || /cancel/i.test(text)) {
+      await clearPendingAction(link.link_id);
+      await sendAssistantWhatsAppText(
+        from,
+        `Okay, cancelled — the "${pending.name}" template still needs new media whenever you're ready.`,
+      );
+      return true;
+    }
+    await sendAssistantWhatsAppText(
+      from,
+      `Please send the photo, video or document to use as the new header for "${pending.name}" — or reply *cancel*.`,
+    );
+    return true;
+  }
+
+  if (pending.type === "confirm_new_media") {
+    if (NO_RE.test(text)) {
+      await clearPendingAction(link.link_id);
+      await sendAssistantWhatsAppText(
+        from,
+        "No problem — discarded that upload.",
+      );
+      return true;
+    }
+    if (YES_RE.test(text)) {
+      await clearPendingAction(link.link_id);
+      await setMediaAttachment(link.link_id, pending.attachment);
+      return false; // let the model turn run, media_attachment is now active
+    }
+    await sendAssistantWhatsAppText(
+      from,
+      "Should I use that file as a header for a new template? Reply *yes* or *cancel*.",
+    );
+    return true;
+  }
+
+  return false;
+}
+
+// ── One turn of the actual model loop, shared by the normal inbound path
+// and the "media just finished uploading" resume path above ─────────────────
+async function runModelTurn(link, from, withUser) {
+  let mediaAttachment;
+  try {
+    mediaAttachment = await getMediaAttachment(link.link_id);
+  } catch (err) {
+    console.error("[SamvaadikWA] getMediaAttachment error:", err);
+  }
+
+  let result;
+  try {
+    result = await runSamvaadikAssistant({
+      user_id: link.user_id,
+      messages: toModelMessages(withUser),
+      media_attachment: mediaAttachment || undefined,
+      channel: "whatsapp",
+    });
+  } catch (err) {
+    console.error("[SamvaadikWA] runSamvaadikAssistant error:", err);
+    const friendly =
+      err.code === "BAD_REQUEST"
+        ? "I couldn't understand that — could you rephrase it?"
+        : "Something went wrong on my end. Please try again in a moment.";
+    await sendAssistantWhatsAppText(from, friendly);
+    return;
+  }
+
+  // The model asked for fresh/missing media on a SPECIFIC existing template
+  // (channel-agnostic instruction — see SAMVAADIK_SYSTEM_PROMPT). On WhatsApp
+  // the next photo/video/document IS the answer (see handleMediaUpload),
+  // so remember which template it's for.
+  const uploadTarget = parseUploadMediaMarker(result.content);
+  if (uploadTarget) {
+    await setPendingAction(link.link_id, {
+      type: "awaiting_template_reupload",
+      wt_id: uploadTarget.wt_id,
+      header_format: uploadTarget.header_format,
+      name: uploadTarget.name,
+    });
+  }
+
+  const replyText = adaptReplyForWhatsApp(result.content);
+  await sendAssistantWhatsAppText(from, replyText);
+
+  // Persist the raw assistant text (markers included) — confirmation
+  // detection on the next turn reads the preview titles from it.
+  await saveSessionMessages(link.link_id, [
+    ...withUser,
+    { role: "assistant", content: result.content },
+  ]);
+}
+
 /**
  * Called from whatsappController.handleIncomingMessage, in the background
  * (after Meta already got its 200), when the inbound phone_number_id is
@@ -216,18 +574,45 @@ export async function processAssistantInbound(value) {
 
     const from = normalizeWaId(message.from);
     if (!from) {
-      console.warn("[SamvaadikWA] Could not normalize inbound wa_id:", message.from);
+      console.warn(
+        "[SamvaadikWA] Could not normalize inbound wa_id:",
+        message.from,
+      );
+      return;
+    }
+
+    // Documents (CSV/Excel contact lists, or anything offered as a template
+    // header) and images/videos (template headers) are handled directly here
+    // — downloaded, parsed/uploaded, and confirmed over plain text — rather
+    // than being rejected the way audio/stickers/location still are below.
+    if (["document", "image", "video"].includes(message.type)) {
+      const link = await getLinkByWaId(from);
+      if (!link) {
+        await sendAssistantWhatsAppText(
+          from,
+          "This WhatsApp number isn't linked to a Samvaadik account yet. " +
+            "Open your Samvaadik dashboard → Integrations → WhatsApp Assistant " +
+            'to get a link code, then send "LINK XXXXXX" here.',
+        );
+        return;
+      }
+      if (isContactFileDocument(message)) {
+        await handleCsvDocument(link, from, message);
+      } else {
+        await handleMediaUpload(link, from, message);
+      }
       return;
     }
 
     const text = extractInboundText(message);
 
-    // Unsupported message type (image, document, audio, ...) — no model call.
+    // Unsupported message type (audio, sticker, location, contacts, ...) —
+    // no model call.
     if (text === null) {
       await sendAssistantWhatsAppText(
         from,
-        "I can only read text messages here for now — please type your request. " +
-          "For file uploads (like a contact list), use the Samvaadik dashboard.",
+        "I can read text messages, photos/videos/documents (for template headers) " +
+          "and CSV/Excel files (for contact groups) here — please send one of those.",
       );
       return;
     }
@@ -274,17 +659,37 @@ export async function processAssistantInbound(value) {
     }
 
     if (!text) {
-      await sendAssistantWhatsAppText(from, "Could you say that again as text?");
+      await sendAssistantWhatsAppText(
+        from,
+        "Could you say that again as text?",
+      );
       return;
     }
 
     if (RESET_RE.test(text)) {
       await clearSession(link.link_id);
+      await clearPendingAction(link.link_id);
+      await clearMediaAttachment(link.link_id);
       await sendAssistantWhatsAppText(
         from,
         "Started a fresh conversation. What would you like to do?",
       );
       return;
+    }
+
+    // Deterministic confirm/cancel/rename handling for a CSV group import or
+    // a pending template-media upload — resolved here, outside the model
+    // loop, same as LINK/RESET above. Returns true when it fully answered
+    // this message (nothing left for the model to do this turn).
+    if (await handlePendingActionReply(link, from, text)) return;
+
+    if (CANCEL_MEDIA_RE.test(text)) {
+      const attachment = await getMediaAttachment(link.link_id);
+      if (attachment) {
+        await clearMediaAttachment(link.link_id);
+        await sendAssistantWhatsAppText(from, "Removed that upload.");
+        return;
+      }
     }
 
     const history = await getSessionMessages(link.link_id);
@@ -307,32 +712,7 @@ export async function processAssistantInbound(value) {
     // Blue ticks + "typing…" while the assistant works (best effort)
     await markReadWithTyping(message.id);
 
-    let result;
-    try {
-      result = await runSamvaadikAssistant({
-        user_id: link.user_id,
-        messages: toModelMessages(withUser),
-        channel: "whatsapp",
-      });
-    } catch (err) {
-      console.error("[SamvaadikWA] runSamvaadikAssistant error:", err);
-      const friendly =
-        err.code === "BAD_REQUEST"
-          ? "I couldn't understand that — could you rephrase it?"
-          : "Something went wrong on my end. Please try again in a moment.";
-      await sendAssistantWhatsAppText(from, friendly);
-      return;
-    }
-
-    const replyText = adaptReplyForWhatsApp(result.content);
-    await sendAssistantWhatsAppText(from, replyText);
-
-    // Persist the raw assistant text (markers included) — confirmation
-    // detection on the next turn reads the preview titles from it.
-    await saveSessionMessages(link.link_id, [
-      ...withUser,
-      { role: "assistant", content: result.content },
-    ]);
+    await runModelTurn(link, from, withUser);
   } catch (err) {
     // Last-resort guard — this function must never throw back into
     // whatsappController's waitUntil(), since nothing there would handle it.

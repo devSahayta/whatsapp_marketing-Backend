@@ -4,9 +4,11 @@ import { supabase } from "../config/supabase.js";
 import Anthropic from "@anthropic-ai/sdk";
 import { ANTHROPIC_API_KEY } from "../config/anthropic.js";
 import { executeTool, toolsForChannel } from "../agents/agentTools.js";
-import { Readable } from "stream";
 import { randomUUID } from "crypto";
-import { parse as parseCsv } from "@fast-csv/parse";
+import {
+  parseContactsFile,
+  slugifyFileName,
+} from "../utils/contactFileParser.js";
 import {
   deductCredits,
   getCreditBalance,
@@ -826,10 +828,10 @@ Formatting:
 - Keep replies short. Summaries/previews: keep the exact title line (e.g. "Campaign Summary", "Message Preview", "Template Message Preview") and the exact "Ready to ..." question; the "───" separator lines are optional.
 
 What is different on WhatsApp:
-- CSV/Excel group upload (Group creation Option A) is not possible here — there is no file upload. Offer Option B (Google Sheets), or tell the user to upload the file from the Samvaadik dashboard.
+- CSV/Excel group upload (Group creation Option A) works here too: if the user sends a CSV or Excel file as a WhatsApp document, it is downloaded, parsed and confirmed with them automatically — outside of you, before you see anything about it. You will not see the file itself; you will only see a plain-text message afterwards telling you a group was created (or that it wasn't), as a fact. Do not ask the user to upload a file here yourself or claim you can't read it; if the user says they're about to send one, just wait. Option B (Google Sheets) also still works exactly as below.
 - If a Google Sheet must be picked from Google Drive, tell the user to do that once from the AI Assistant in the Samvaadik dashboard, then continue here.
-- Images, videos and documents sent here cannot be read. Media templates cannot be created here.
-- There is no in-chat upload button here (this replaces every instruction above about UPLOAD_MEDIA_FOR_TEMPLATE; never output that token). If a template's media is missing or expired, tell the user in one short sentence to upload it from the Templates page in the Samvaadik dashboard (open the template, click Preview) and then come back here, and output REDIRECT_TO_TEMPLATES: on its own line.
+- Media templates CAN be created here. If the user sends a photo, video or document to use as a template header, it is uploaded outside of you — you'll either see a media_attachment in the conversation context (ready to pass to create_template, exactly as the instructions for that tool describe) or a plain-text message telling you a specific template's media was refreshed (treat it as a fact, same as the group-import message above).
+- There is no in-chat upload *button* here — when you output UPLOAD_MEDIA_FOR_TEMPLATE:<wt_id>|<TYPE>|<name> for missing/expired media (per the instructions above), the user is told in plain text to just send the photo/video/document in this same chat; you do not need to say anything else about how to upload it.
 
 ONE-TO-ONE TEMPLATE MESSAGE (replaces Step 2b of ONE-TO-ONE MESSAGING — there is no template picker here; open_template_picker does not exist):
 1. Identify the person with find_contact as usual (or use the full phone number the user gave).
@@ -1061,8 +1063,7 @@ export async function runSamvaadikAssistant({
 
   const chargeIteration = async (usage, content = []) => {
     const realRupees = usageToRealRupees(usage);
-    const creditsCharged =
-      realRupees > 0 ? realRupeesToCredits(realRupees) : 0;
+    const creditsCharged = realRupees > 0 ? realRupeesToCredits(realRupees) : 0;
 
     turnTotals.calls += 1;
     turnTotals.input += usage?.input_tokens || 0;
@@ -1313,16 +1314,16 @@ export async function runSamvaadikAssistant({
               JSON.stringify(block.input),
             );
             // Only tools offered on this channel may run (defence in depth)
-          const result = toolNames.has(block.name)
-            ? await executeTool(block.name, block.input, user_id)
-            : { error: `Tool ${block.name} is not available here.` };
+            const result = toolNames.has(block.name)
+              ? await executeTool(block.name, block.input, user_id)
+              : { error: `Tool ${block.name} is not available here.` };
             // The template-picker token is attached to the reply by the server
             // (see attachPickerToken). Hide it from the model so it can't
             // echo a mangled copy (placeholder text / bare UUID).
             if (
-            block.name === "send_text_message" ||
-            block.name === "send_template_message"
-          ) {
+              block.name === "send_text_message" ||
+              block.name === "send_template_message"
+            ) {
               lastTextSend = result || { sent: false, error: "No result" };
             }
             if (block.name === "open_template_picker" && result?.picker_token) {
@@ -1417,29 +1418,14 @@ export const handleSamvaadikChat = async (req, res) => {
   }
 };
 
-// ─── HELPERS for group CSV parsing ────────────────────────────────────────────
-
-const findColumn = (headers, candidates) => {
-  const lower = headers.map((h) => h.toLowerCase().trim());
-  for (const c of candidates) {
-    const i = lower.indexOf(c.toLowerCase());
-    if (i !== -1) return headers[i];
-  }
-  return null;
-};
-
-const slugify = (s) =>
-  String(s || "")
-    .toLowerCase()
-    .replace(/\s+/g, "-")
-    .replace(/[^a-z0-9-_]/g, "")
-    .slice(0, 60);
-
 // ─── GROUP PREVIEW ────────────────────────────────────────────────────────────
 // POST /api/agents/samvaadik/preview-group
 // multipart/form-data: user_id, group_name, file
-// Parses CSV, uploads to Supabase storage, returns preview + contacts[].
-// NO DB writes to groups or group_contacts.
+// Parses CSV or Excel (see utils/contactFileParser.js — previously this only
+// ever ran @fast-csv against the buffer, so a real .xlsx/.xls upload here
+// either threw or silently produced garbage rows), uploads the original file
+// to Supabase storage, returns preview + contacts[]. NO DB writes to groups
+// or group_contacts — see handleGroupFromCsv / createGroupFromContacts.
 export const handleGroupPreview = async (req, res) => {
   try {
     const { user_id, group_name } = req.body;
@@ -1458,75 +1444,29 @@ export const handleGroupPreview = async (req, res) => {
         .status(400)
         .json({ success: false, error: "A CSV or Excel file is required" });
 
-    // Parse CSV
-    const rows = [];
-    const headers = [];
-
+    let parsed;
     try {
-      await new Promise((resolve, reject) => {
-        Readable.from(file.buffer)
-          .pipe(parseCsv({ headers: true, ignoreEmpty: true, trim: true }))
-          .on("headers", (h) => headers.push(...h))
-          .on("data", (row) => rows.push(row))
-          .on("error", reject)
-          .on("end", resolve);
+      parsed = await parseContactsFile(file.buffer, {
+        fileName: file.originalname,
+        mimeType: file.mimetype,
+        userId: user_id,
       });
-    } catch {
-      return res.status(400).json({
-        success: false,
-        error:
-          "Could not parse the file. Make sure it is a valid CSV with headers.",
-      });
+    } catch (parseErr) {
+      return res.status(400).json({ success: false, error: parseErr.message });
     }
 
-    if (!rows.length) {
-      return res
-        .status(400)
-        .json({ success: false, error: "The file has no data rows." });
-    }
+    const { contacts, rowCount, skipped, columns_found } = parsed;
 
-    // Detect columns
-    const nameCol = findColumn(headers, ["name", "full_name", "fullname"]);
-    const phoneCol = findColumn(headers, [
-      "phone",
-      "phone_number",
-      "phoneno",
-      "mobile",
-      "contact",
-    ]);
-    const emailCol = findColumn(headers, ["email", "email_address"]);
-
-    if (!phoneCol) {
-      return res.status(400).json({
-        success: false,
-        error: `No phone column found. Columns in your file: ${headers.join(", ")}. Rename one to "phone", "phoneno", or "mobile".`,
-      });
-    }
-
-    // Build contacts
-    const contacts = rows
-      .map((r) => ({
-        user_id,
-        full_name: nameCol ? r[nameCol]?.trim() || null : null,
-        email: emailCol ? r[emailCol]?.trim() || null : null,
-        phone_number: r[phoneCol]?.trim(),
-      }))
-      .filter((c) => c.phone_number);
-
-    if (!contacts.length) {
-      return res.status(400).json({
-        success: false,
-        error: "No valid phone numbers found in the file.",
-      });
-    }
-
-    // Upload CSV to Supabase storage (non-fatal)
+    // Upload the original file to Supabase storage (non-fatal)
     let csvUrl = null;
     try {
-      const storageKey = `${user_id}/${Date.now()}_${slugify(group_name)}.csv`;
+      const ext = (file.originalname?.split(".").pop() || "csv").toLowerCase();
+      const storageKey = `${user_id}/${Date.now()}_${slugifyFileName(group_name)}.${ext}`;
       const { error: uploadErr } = await supabase.storage
         .from("group-csvs")
-        .upload(storageKey, file.buffer, { contentType: "text/csv" });
+        .upload(storageKey, file.buffer, {
+          contentType: file.mimetype || "text/csv",
+        });
 
       if (!uploadErr) {
         const { data: urlData } = supabase.storage
@@ -1547,12 +1487,8 @@ export const handleGroupPreview = async (req, res) => {
       success: true,
       group_name: group_name.trim(),
       contact_count: contacts.length,
-      skipped: rows.length - contacts.length,
-      columns_found: {
-        name: nameCol || null,
-        phone: phoneCol,
-        email: emailCol || null,
-      },
+      skipped,
+      columns_found,
       sample: contacts.slice(0, 3),
       contacts, // full list — frontend holds and sends back on confirm
       csv_url: csvUrl, // Supabase storage URL — stored in groups.uploaded_csv
@@ -1564,87 +1500,89 @@ export const handleGroupPreview = async (req, res) => {
 };
 
 // ─── GROUP CREATION FROM CSV ──────────────────────────────────────────────────
+// Shared by the dashboard's create-group endpoint below AND the WhatsApp
+// assistant's document-upload flow (samvaadikWaController) — the latter has
+// no multipart request to hand a controller, just a parsed contacts array,
+// so it calls this directly instead of going back over HTTP to itself.
+// Throws a plain Error (not an HTTP response) on bad input.
+export async function createGroupFromContacts({
+  user_id,
+  group_name,
+  description = "",
+  contacts,
+  csv_url = null,
+}) {
+  const badInput = (msg) => Object.assign(new Error(msg), { status: 400 });
+  if (!user_id) throw badInput("user_id is required");
+  if (!group_name?.trim()) throw badInput("group_name is required");
+  if (!contacts?.length) throw badInput("No contacts provided");
+
+  const { data: group, error: groupErr } = await supabase
+    .from("groups")
+    .insert({
+      user_id,
+      group_name: group_name.trim(),
+      description: description?.trim() || null,
+      uploaded_csv: csv_url, // Supabase storage URL from preview step
+      status: "active",
+    })
+    .select()
+    .single();
+
+  if (groupErr)
+    throw Object.assign(new Error(groupErr.message), { status: 500 });
+
+  // Bulk insert contacts — attach group_id (preview didn't know it yet)
+  const contactsWithGroup = contacts.map((c) => ({
+    ...c,
+    group_id: group.group_id,
+    user_id,
+  }));
+
+  const BATCH = 500;
+  let insertedCount = 0;
+
+  for (let i = 0; i < contactsWithGroup.length; i += BATCH) {
+    const batch = contactsWithGroup.slice(i, i + BATCH);
+    const { data: inserted, error: insertErr } = await supabase
+      .from("group_contacts")
+      .insert(batch)
+      .select("contact_id");
+
+    if (insertErr) {
+      console.error(
+        `[AgentGroup] Batch insert error at offset ${i}:`,
+        insertErr.message,
+      );
+    } else {
+      insertedCount += inserted?.length ?? 0;
+    }
+  }
+
+  const skipped = contacts.length - insertedCount;
+
+  return {
+    success: true,
+    group_id: group.group_id,
+    group_name: group.group_name,
+    contacts_inserted: insertedCount,
+    skipped,
+    message: `Group "${group.group_name}" created with ${insertedCount} contact${insertedCount !== 1 ? "s" : ""}${skipped > 0 ? ` (${skipped} skipped)` : ""}.`,
+  };
+}
+
 // POST /api/agents/samvaadik/create-group
 // JSON body: { user_id, group_name, description, contacts[], csv_url }
 // contacts[] and csv_url come from the preview step — no file upload here.
+// Thin HTTP wrapper around createGroupFromContacts (see above).
 export const handleGroupFromCsv = async (req, res) => {
   try {
-    const {
-      user_id,
-      group_name,
-      description = "",
-      contacts,
-      csv_url = null,
-    } = req.body;
-
-    if (!user_id)
-      return res
-        .status(400)
-        .json({ success: false, error: "user_id is required" });
-    if (!group_name?.trim())
-      return res
-        .status(400)
-        .json({ success: false, error: "group_name is required" });
-    if (!contacts?.length)
-      return res
-        .status(400)
-        .json({ success: false, error: "No contacts provided" });
-
-    // Create group row
-    const { data: group, error: groupErr } = await supabase
-      .from("groups")
-      .insert({
-        user_id,
-        group_name: group_name.trim(),
-        description: description?.trim() || null,
-        uploaded_csv: csv_url, // Supabase storage URL from preview step
-        status: "active",
-      })
-      .select()
-      .single();
-
-    if (groupErr)
-      return res.status(500).json({ success: false, error: groupErr.message });
-
-    // Bulk insert contacts — attach group_id (preview didn't know it yet)
-    const contactsWithGroup = contacts.map((c) => ({
-      ...c,
-      group_id: group.group_id,
-      user_id,
-    }));
-
-    const BATCH = 500;
-    let insertedCount = 0;
-
-    for (let i = 0; i < contactsWithGroup.length; i += BATCH) {
-      const batch = contactsWithGroup.slice(i, i + BATCH);
-      const { data: inserted, error: insertErr } = await supabase
-        .from("group_contacts")
-        .insert(batch)
-        .select("contact_id");
-
-      if (insertErr) {
-        console.error(
-          `[AgentGroup] Batch insert error at offset ${i}:`,
-          insertErr.message,
-        );
-      } else {
-        insertedCount += inserted?.length ?? 0;
-      }
-    }
-
-    const skipped = contacts.length - insertedCount;
-
-    return res.status(201).json({
-      success: true,
-      group_id: group.group_id,
-      group_name: group.group_name,
-      contacts_inserted: insertedCount,
-      skipped,
-      message: `Group "${group.group_name}" created with ${insertedCount} contact${insertedCount !== 1 ? "s" : ""}${skipped > 0 ? ` (${skipped} skipped)` : ""}.`,
-    });
+    const result = await createGroupFromContacts(req.body);
+    return res.status(201).json(result);
   } catch (err) {
     console.error("❌ handleGroupFromCsv:", err);
-    return res.status(500).json({ success: false, error: err.message });
+    return res
+      .status(err.status || 500)
+      .json({ success: false, error: err.message });
   }
 };
