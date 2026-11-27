@@ -10,6 +10,61 @@ import {
 } from "../utils/whatsappTemplateHelpers.js";
 import fetch from "node-fetch";
 
+// ── Media-expiry status for a media template (IMAGE/VIDEO/DOCUMENT) ──────────
+// Meta expires an uploaded media_id 25 days after upload. This checks the
+// whatsapp_media_uploads row for a given media_id and returns a small,
+// frontend-ready status object. Mirrors the agent's own checkMediaValidity
+// (agents/agentTools.js) so both surfaces agree on what "expired" means.
+async function getMediaExpiryStatus(accountId, mediaId) {
+  if (!mediaId) return { state: "missing" };
+
+  const { data, error } = await supabase
+    .from("whatsapp_media_uploads")
+    .select("media_id, uploaded_at, file_name, type")
+    .eq("account_id", accountId)
+    .eq("media_id", mediaId)
+    .order("uploaded_at", { ascending: false })
+    .limit(1)
+    .single();
+
+  if (error || !data) return { state: "missing" };
+
+  const uploadedAt = new Date(data.uploaded_at);
+  const daysOld = Math.floor((Date.now() - uploadedAt.getTime()) / 86400000);
+  const daysRemaining = 25 - daysOld;
+
+  if (daysRemaining <= 0) {
+    return {
+      state: "expired",
+      days_old: daysOld,
+      uploaded_at: data.uploaded_at,
+      file_name: data.file_name,
+    };
+  }
+
+  return {
+    state: "valid",
+    days_remaining: daysRemaining,
+    days_old: daysOld,
+    uploaded_at: data.uploaded_at,
+    file_name: data.file_name,
+  };
+}
+
+const MEDIA_HEADER_FORMATS = ["IMAGE", "VIDEO", "DOCUMENT"];
+
+// Attaches a `media_status` field to every media template (IMAGE/VIDEO/
+// DOCUMENT) in a list of template rows, leaving plain-text templates alone.
+async function attachMediaStatus(templates, accountId) {
+  return Promise.all(
+    templates.map(async (t) => {
+      if (!MEDIA_HEADER_FORMATS.includes(t.header_format)) return t;
+      const media_status = await getMediaExpiryStatus(accountId, t.media_id);
+      return { ...t, media_status };
+    }),
+  );
+}
+
 // ── Fetch actual media URL from Meta (for storing in messages table) ──────────
 async function fetchMetaMediaUrl(mediaId, accessToken) {
   try {
@@ -781,6 +836,7 @@ export async function listTemplatesPaginated(req, res) {
 
     const search = (req.query.search || "").trim();
     const status = req.query.status; // "ALL" | "APPROVED" | "PENDING" | "REJECTED" | "PAUSED"
+    const type = (req.query.type || "ALL").toUpperCase(); // "ALL" | "TEXT" | "MEDIA" | "CAROUSEL"
 
     // escape % and _ so user input can't break the LIKE pattern
     const likePattern = (value) =>
@@ -792,6 +848,26 @@ export async function listTemplatesPaginated(req, res) {
       return q.or(`name.ilike.${p},category.ilike.${p},language.ilike.${p}`);
     };
 
+    // Classifies a template as TEXT (no media header, not a carousel), MEDIA
+    // (IMAGE/VIDEO/DOCUMENT header, not a carousel), or CAROUSEL (is_carousel
+    // true). is_carousel can be null on older rows, so both null and false
+    // count as "not a carousel" rather than only false.
+    const applyType = (q) => {
+      if (!type || type === "ALL") return q;
+      if (type === "CAROUSEL") return q.eq("is_carousel", true);
+      if (type === "MEDIA") {
+        return q
+          .or("is_carousel.is.null,is_carousel.eq.false")
+          .in("header_format", ["IMAGE", "VIDEO", "DOCUMENT"]);
+      }
+      if (type === "TEXT") {
+        return q
+          .or("is_carousel.is.null,is_carousel.eq.false")
+          .or("header_format.is.null,header_format.eq.TEXT");
+      }
+      return q;
+    };
+
     // ---- current page of results ----
     let dataQuery = supabase
       .from("whatsapp_templates")
@@ -799,12 +875,17 @@ export async function listTemplatesPaginated(req, res) {
       .eq("account_id", account.wa_id);
 
     if (status && status !== "ALL") dataQuery = dataQuery.eq("status", status);
-    dataQuery = applySearch(dataQuery)
+    dataQuery = applyType(applySearch(dataQuery))
       .order("created_at", { ascending: false })
       .range(from, to);
 
     const { data, error, count } = await dataQuery;
     if (error) throw error;
+
+    const dataWithMediaStatus = await attachMediaStatus(
+      data || [],
+      account.wa_id,
+    );
 
     // ---- status counts, independent of pagination/status filter, respecting search ----
     const countFor = async (statusValue) => {
@@ -813,7 +894,7 @@ export async function listTemplatesPaginated(req, res) {
         .select("wt_id", { count: "exact", head: true })
         .eq("account_id", account.wa_id);
       if (statusValue) q = q.eq("status", statusValue);
-      q = applySearch(q);
+      q = applyType(applySearch(q));
       const { count: c, error: cErr } = await q;
       if (cErr) throw cErr;
       return c || 0;
@@ -826,7 +907,7 @@ export async function listTemplatesPaginated(req, res) {
     ]);
 
     return res.json({
-      data,
+      data: dataWithMediaStatus,
       pagination: {
         page,
         limit,

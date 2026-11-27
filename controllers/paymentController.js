@@ -1,12 +1,23 @@
+// controllers/paymentController.js
+
 import Razorpay from "razorpay";
 import crypto from "crypto";
 import { supabase } from "../config/supabase.js";
 import { activateSubscription } from "../services/subscriptionService.js";
+import { generateInvoicePdf, toRupees } from "../services/invoiceService.js";
+import { addGst } from "../config/gstConfig.js";
 
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
+
+const normalizeStatus = (status) => {
+  const s = String(status || "").toLowerCase();
+  if (["paid", "completed", "success", "captured"].includes(s)) return "paid";
+  if (["failed", "error", "cancelled"].includes(s)) return "failed";
+  return "pending";
+};
 
 /**
  * Create Razorpay Order
@@ -31,8 +42,13 @@ export const createOrder = async (req, res) => {
       return res.status(404).json({ message: "Invalid plan" });
     }
 
+    // plan.price is the base cost; GST is added on top of it here, so the
+    // Razorpay order (and the amount we store) is the real, GST-inclusive
+    // total the customer is charged.
+    const chargeAmount = addGst(plan.price);
+
     const order = await razorpay.orders.create({
-      amount: plan.price,
+      amount: chargeAmount,
       currency: "INR",
       receipt: `receipt_${Date.now()}`,
       notes: {
@@ -44,7 +60,7 @@ export const createOrder = async (req, res) => {
     await supabase.from("payments").insert({
       user_id: userId,
       plan_id: planId,
-      amount: plan.price,
+      amount: chargeAmount,
       razorpay_order_id: order.id,
       status: "created",
     });
@@ -194,27 +210,49 @@ export const getSubscriptionStatus = async (req, res) => {
  */
 export const getPaymentLogs = async (req, res) => {
   try {
-    const { userId, page = 1, pageSize = 20 } = req.query;
+    const { userId, page = 1, pageSize = 20, kind = "all" } = req.query;
 
     if (!userId) {
       return res.status(400).json({ message: "userId is required" });
     }
 
+    // kind: "billing" -> plan payments + credit purchases only
+    //       "usage"   -> AI Assistant deductions only
+    //       "all"     -> everything (old behaviour)
+    // The split happens BEFORE paging. Previously everything was merged and
+    // only the newest rows were returned, so a busy AI-usage history pushed
+    // every payment and purchase off the page and Billing History looked empty.
+    const wantBilling = kind === "all" || kind === "billing";
+
     // Subscription payments (plan purchases/renewals)
-    const { data: payments, error: paymentsError } = await supabase
-      .from("payments")
-      .select("*, plans(name)")
-      .eq("user_id", userId);
+    let payments = [];
+    if (wantBilling) {
+      const { data, error: paymentsError } = await supabase
+        .from("payments")
+        .select("*, plans(name)")
+        .eq("user_id", userId);
+      if (paymentsError) throw paymentsError;
+      payments = data || [];
+    }
 
-    if (paymentsError) throw paymentsError;
-
-    // Credit ledger (top-ups + the one-time free-subscription bonus)
-    const { data: creditTxns, error: creditError } = await supabase
+    // Credit ledger (top-ups, the one-time free-subscription bonus, usage)
+    let creditQuery = supabase
       .from("credit_transactions")
       .select("*")
-      .eq("user_id", userId);
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(5000);
+    if (kind === "billing") creditQuery = creditQuery.eq("type", "purchase");
+    if (kind === "usage") creditQuery = creditQuery.eq("type", "deduction");
+    const { data: creditTxns, error: creditError } = await creditQuery;
 
     if (creditError) throw creditError;
+
+    console.log(
+      `[payment-logs] user=${userId} payments=${(payments || []).length} ` +
+        `creditTxns=${(creditTxns || []).length} ` +
+        `deductions=${(creditTxns || []).filter((t) => t.type === "deduction").length}`,
+    );
 
     const subscriptionLogs = (payments || []).map((p) => ({
       id: `payment_${p.payment_id}`,
@@ -269,7 +307,7 @@ export const getPaymentLogs = async (req, res) => {
     });
 
     const pageNum = Math.max(1, parseInt(page, 10) || 1);
-    const size = Math.min(100, Math.max(1, parseInt(pageSize, 10) || 20));
+    const size = Math.min(500, Math.max(1, parseInt(pageSize, 10) || 20));
     const start = (pageNum - 1) * size;
 
     res.json({
@@ -281,6 +319,107 @@ export const getPaymentLogs = async (req, res) => {
   } catch (err) {
     console.error("Get Payment Logs Error:", err);
     res.status(500).json({ message: "Failed to fetch payment logs" });
+  }
+};
+
+/**
+ * Download Invoice
+ * Generates a branded PDF invoice on the fly for one subscription payment
+ * or one credit purchase (never for a deduction/bonus/adjustment row —
+ * those aren't money-in events). Nothing is pre-generated or stored; the
+ * PDF is streamed straight to the response on each request.
+ */
+export const downloadInvoice = async (req, res) => {
+  try {
+    const { type, id } = req.params;
+    const { userId } = req.query;
+
+    if (!userId) {
+      return res.status(400).json({ message: "userId is required" });
+    }
+    if (!["subscription", "credits"].includes(type)) {
+      return res.status(400).json({ message: "Invalid invoice type" });
+    }
+
+    let invoice;
+
+    if (type === "subscription") {
+      const { data: payment, error } = await supabase
+        .from("payments")
+        .select("*, plans(name)")
+        .eq("payment_id", id)
+        .eq("user_id", userId)
+        .single();
+
+      if (error || !payment) {
+        return res.status(404).json({ message: "Payment not found" });
+      }
+      if (normalizeStatus(payment.status) !== "paid") {
+        return res.status(400).json({
+          message: "Invoice is only available for completed payments",
+        });
+      }
+
+      invoice = {
+        invoiceNumber: `SMVK-SUB-${String(payment.payment_id).slice(0, 8).toUpperCase()}`,
+        date: payment.paid_at || payment.created_at,
+        description: payment.plans?.name
+          ? `${payment.plans.name} Subscription`
+          : "Subscription",
+        amount: toRupees(payment.amount),
+        paymentId: payment.razorpay_payment_id,
+        orderId: payment.razorpay_order_id,
+        status: normalizeStatus(payment.status),
+      };
+    } else {
+      const { data: txn, error } = await supabase
+        .from("credit_transactions")
+        .select("*")
+        .eq("transaction_id", id)
+        .eq("user_id", userId)
+        .eq("type", "purchase")
+        .single();
+
+      if (error || !txn) {
+        return res.status(404).json({ message: "Transaction not found" });
+      }
+      if (normalizeStatus(txn.status) !== "paid") {
+        return res.status(400).json({
+          message: "Invoice is only available for completed payments",
+        });
+      }
+
+      invoice = {
+        invoiceNumber: `SMVK-CR-${String(txn.transaction_id).slice(0, 8).toUpperCase()}`,
+        date: txn.created_at,
+        description: `${Number(txn.credits)} Samvaadik AI credits`,
+        amount: toRupees(txn.amount_paid),
+        paymentId: txn.razorpay_payment_id,
+        orderId: txn.razorpay_order_id,
+        status: normalizeStatus(txn.status),
+      };
+    }
+
+    // Best-effort customer details — invoice still generates fine without them
+    const { data: userRow } = await supabase
+      .from("users")
+      .select("*")
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    invoice.customerName =
+      userRow?.full_name || userRow?.name || userRow?.email || "Customer";
+    invoice.customerEmail = userRow?.email || null;
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${invoice.invoiceNumber}.pdf"`,
+    );
+    generateInvoicePdf(invoice, res);
+  } catch (err) {
+    console.error("Download Invoice Error:", err);
+    res.status(500).json({ message: "Failed to generate invoice" });
   }
 };
 

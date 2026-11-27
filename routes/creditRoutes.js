@@ -6,6 +6,7 @@ import {
   createOrder,
   verify,
   webhook,
+  purchaseWithSavedMethod,
 } from "../controllers/creditController.js";
 
 const router = express.Router();
@@ -19,5 +20,7 @@ router.post("/verify", verify);
 // Webhook must receive the raw body for signature verification elsewhere;
 // kept here for symmetry with paymentRoutes' webhook.
 router.post("/webhook", webhook);
+
+router.post("/purchase-with-saved-method", purchaseWithSavedMethod);
 
 export default router;

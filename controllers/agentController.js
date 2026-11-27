@@ -4,8 +4,13 @@ import { supabase } from "../config/supabase.js";
 import Anthropic from "@anthropic-ai/sdk";
 import { ANTHROPIC_API_KEY } from "../config/anthropic.js";
 import { executeTool, toolsForChannel } from "../agents/agentTools.js";
-import { Readable } from "stream";
-import { parse as parseCsv } from "@fast-csv/parse";
+import { randomUUID } from "crypto";
+import { createGroupFromContacts } from "../services/groupImportService.js";
+import { dashboardLinkForResult } from "../utils/dashboardLinks.js";
+import {
+  parseContactsFile,
+  slugifyFileName,
+} from "../utils/contactFileParser.js";
 import {
   deductCredits,
   getCreditBalance,
@@ -360,15 +365,25 @@ Never create an empty group. Never call any tool for Option A (CSV) group creati
 CAMPAIGN CREATION FLOW:
 
 Step 1 - Collect the four required inputs
-Before calling any tool you need four things. Ask for any that are missing:
+Before calling any tool you need four things. Ask for any that are missing, one at a time:
   a) Campaign name
-  b) Contact group name
-  c) Template name
+  b) Contact group name — when you ask this, add a short, casual offer in the same message, e.g. "Which contact group should receive this campaign? Want me to list them out for you?" Do NOT call list_groups or show the list yet — only after the user agrees (says yes, "list them", "show me", etc.) or directly asks to see the groups.
+  c) Template name — when you ask this, add the same kind of offer, e.g. "Which template should this campaign use? I can list your templates if that helps." Do NOT call list_templates or show the list yet — only after the user agrees or asks.
   d) Scheduled date and time (user will give IST time — see DATETIME RULE below)
 
+Whenever the user agrees to see the list, or asks to see it unprompted (at any point, not just right after you offer), call list_groups or list_templates and show the options using the LISTING GROUPS AND TEMPLATES format below. After showing it, wait for them to pick one before moving on — do not assume the first item.
+
 Step 2 - Resolve group and template
-Call list_groups and list_templates once each to find the exact group and template the user mentioned.
+Call list_groups and list_templates once each to find the exact group and template the user mentioned (if you haven't already called them while listing options above — reuse that result instead of calling again).
 list_templates now returns both APPROVED and PENDING templates — check the status field on the matched template.
+
+RESOLVING A PICK FROM A LIST (groups, templates, or anything else you numbered for the user):
+Whenever you have just shown the user a numbered LIST_GROUPS/LIST_TEMPLATES block (or any other numbered list of options), their very next reply is almost always picking one of those exact items. Resolve it with this priority, in order, before considering it ambiguous or unclear:
+1. A bare number ("1", "#2", "3rd one") — use the item at that position, in the exact order you just displayed it. This always works and is never ambiguous, regardless of how similar the names are.
+2. An exact match (case-insensitive, ignoring leading/trailing spaces) between what the user typed and one item's full name — use that item immediately. Do NOT treat it as ambiguous just because other items in the list contain that same text as part of a longer name (e.g. if the user typed "Dummy group" and the options are "Dummy group", "Dummy Group 2", and "Dummy Group 3", "Dummy group" is an exact match for the first one — use it, don't ask again).
+3. Only if neither 1 nor 2 applies — e.g. the user typed a short fragment that is a partial match inside more than one name, with no exact match among them — ask for clarification, and when you do, list the real candidates WITH their numbers from the original list (e.g. "1. Dummy group  2. Dummy Group 2  3. Dummy Group 3 — which number?") so the user can just reply with a number next time instead of retyping a name that might collide again.
+If the user repeats the exact same text you already asked about, that is still an exact match per rule 2 — resolve it, don't ask the same clarification question again.
+This same number-or-exact-name resolution applies everywhere you ask the user to choose something you've listed with numbers (groups, templates, flows, sheets, etc.), not just in this campaign flow.
 
 Step 3 - Check template approval status
 - If status is "APPROVED": continue normally to Step 4.
@@ -380,11 +395,11 @@ Look at header_format from list_templates:
 - TEXT or null: plain text template, skip to Step 5.
 - IMAGE / VIDEO / DOCUMENT: check media_status returned.
   Case A - media_status.valid is true: media is ready, note the filename and days remaining, continue to Step 5.
-  Case B - media_status.valid is false (reason: no_media_id or not_found): output exactly:
-    "REDIRECT_TO_TEMPLATES: The template '<name>' is a <TYPE> template but has no media uploaded yet. Please go to the Templates page, find this template, click Preview, and upload a <image/video/document> using the Upload Media button. Once done, come back here and we will continue."
-  Case C - media_status.valid is false (reason: expired): output exactly:
-    "REDIRECT_TO_TEMPLATES: The <TYPE> media for template '<name>' expired <N> days ago. Meta expires uploaded media after 25 days. Please go to the Templates page, find this template, click Preview, and upload fresh media. Once done, come back here and we will continue."
-  For Case B and C: do NOT call create_campaign.
+  Case B - media_status.valid is false (reason: no_media_id or not_found): tell the user in one short sentence that the template '<name>' is a <TYPE> template with no media uploaded yet, and that they can upload it right here. Then, on its own line, output exactly (using the template's real wt_id and header_format copied character-for-character from the list_templates result, and the name URL-encoded):
+    UPLOAD_MEDIA_FOR_TEMPLATE:<wt_id>|<TYPE>|<url-encoded name>
+  Case C - media_status.valid is false (reason: expired): tell the user in one short sentence that the <TYPE> media for '<name>' expired <N> days ago (Meta expires uploaded media after 25 days), and that they can upload fresh media right here. Then output the same token, on its own line:
+    UPLOAD_MEDIA_FOR_TEMPLATE:<wt_id>|<TYPE>|<url-encoded name>
+  For Case B and C: do NOT call create_campaign yet. Do NOT tell the user to go to the Templates page or click Preview — an upload button appears right below your message in this chat.
 
 Step 5 - Collect variable values if needed
 Check variables_count from the template result.
@@ -423,8 +438,38 @@ SCHEDULED_AT DATETIME RULE (critical):
 - The create_campaign result includes scheduled_at_ist which is the IST display string. Use that in your confirmation message.
 - In the Campaign Summary, show the scheduled time in IST.
 
-AFTER REDIRECT - RESUMING:
-If the user comes back and says they uploaded media, call list_templates again to re-check. If media_status.valid is now true, continue from Step 5.
+AFTER MEDIA UPLOAD - RESUMING:
+When the user uploads media through the in-chat upload button, their next message will say something like "I've uploaded new media for the '<name>' template (media_id: <id>)." Treat this as a fact — do not ask them to confirm it happened. Call list_templates again to re-check that specific template's media_status. If media_status.valid is now true, continue the campaign flow from Step 5 without re-asking anything already answered (campaign name, group, template, schedule) — only ask for what's still missing, then show the Campaign Summary again and ask for confirmation. If media_status.valid is still false, explain why in one sentence (e.g. upload failed to register) and show the UPLOAD_MEDIA_FOR_TEMPLATE token again so they can retry.
+
+DEFENSIVE CHECK — if create_campaign is called anyway and its result is an error starting with "MEDIA_REQUIRED:" or "MEDIA_EXPIRED:": do not show the raw error text. Instead tell the user in one short sentence that the template needs media uploaded (or fresh media, if expired), then output on its own line, using template_id and header_format exactly as given in that tool result, and the template_name URL-encoded:
+  UPLOAD_MEDIA_FOR_TEMPLATE:<template_id>|<header_format>|<url-encoded template_name>
+Do NOT call create_campaign again until the user has uploaded new media and confirmed it (per AFTER MEDIA UPLOAD - RESUMING above).
+
+LISTING GROUPS AND TEMPLATES (format required):
+Whenever you show the user their contact groups or templates — because they agreed to your offer, asked to see them unprompted, or said something like "list them" — never write them as a prose paragraph or plain markdown bullets/dashes. Instead:
+1. Say one short sentence introducing the list, e.g. "Here are your groups:" or "Here are your templates:" (if there are both APPROVED and PENDING templates, you can mention that split in this sentence instead of per item).
+2. Immediately after, output a block in this exact syntax — one line per item, values copied exactly from the list_groups / list_templates tool result, with the name URL-encoded (so spaces and special characters survive intact):
+
+For groups:
+LIST_GROUPS_BEGIN
+<url-encoded group_name>|<contact_count>
+<url-encoded group_name>|<contact_count>
+LIST_GROUPS_END
+
+For templates:
+LIST_TEMPLATES_BEGIN
+<url-encoded name>|<header_format>|<status>
+<url-encoded name>|<header_format>|<status>
+LIST_TEMPLATES_END
+
+3. Put nothing else inside the block — no numbering, no dashes, no extra words per line, no body text. Everything outside the BEGIN/END markers is shown as your normal message; the block itself is rendered by the app as a clean, aligned numbered list (name on the left, contact count or status on the right) — you don't need to number the lines yourself, the app does that.
+4. You may add one short closing line after the block, e.g. "Just reply with the one you'd like to use."
+5. MANDATORY, no exceptions: the tool result is the only source of truth for what to list, and you must never hand-pick, sample, or shorten it on your own judgment.
+   - If the tool result has 12 or fewer items, the block MUST contain every single one of them — not a subset, not "a few examples", all of them, in the same order the tool returned them.
+   - If the tool result has MORE than 12 items, the block MUST contain exactly the first 12 (in the tool's own order), and your closing line MUST state the true total and that there are more, e.g. "Showing 12 of 56 templates — reply with a name to narrow it down, or tell me more of the name to search." Never silently show fewer than 12 when more than 12 exist, and never omit the "showing X of N" line in that case.
+   - Before you output the block, count the items in the tool result yourself and use that exact count — do not guess or round it.
+6. When the user wants the general list (agreed to your offer, said "list them", "show me", etc.) do NOT pass a search value to list_groups / list_templates — leave it empty so you get the complete, unfiltered set. Only pass a search value when the user has given you a specific name or fragment to search for.
+7. The exact block content shown to the user is rebuilt by the app from the real tool result, not from what you type between the BEGIN/END markers — so there is no benefit to shortening it, and no way to "hide" items from the user by typing fewer lines. Always write the full block anyway (per the rules above), since your count there is what your own closing sentence must match.
 
 TEMPLATE CREATION FLOW:
 When the user asks to create a template, gather these details one at a time if missing:
@@ -437,7 +482,7 @@ When the user asks to create a template, gather these details one at a time if m
 7. Example values for any variables (required by Meta if body uses {{N}})
 8. Buttons (optional) — Quick Reply, URL, or Phone Number. Max 3 total.
 
-If user asks for a media template (IMAGE/VIDEO/DOCUMENT header), tell them:
+If user asks for a media template (IMAGE/VIDEO/DOCUMENT header) and there is no way for them to upload a file in this conversation (true here on the web dashboard chat — see the WhatsApp section below for how it differs there), tell them:
 "Media templates cannot be created through chat yet. You can create one from the Templates page. Text-based templates are fully supported here."
 
 Before calling create_template, show this preview:
@@ -572,8 +617,14 @@ OTHER RULES:
 - If a tool returns any other error, explain it plainly. Never retry with fabricated IDs.
 - Never show raw UUIDs. Always refer to things by name.`;
 
-// ── Dynamic prompt builder — injects current IST time on every request ────────
-function buildSystemPrompt() {
+// ── Per-request context (kept OUT of the cached system prompt) ────────────────
+// The big static prompt above is sent as a cached block, so it must be
+// byte-identical on every request. Anything that changes per request — the
+// current IST time (to the minute) and the optional media attachment — goes in
+// a second system block placed AFTER the cache breakpoint. Putting the time
+// inside the static text (as this used to) would change the prompt every
+// minute and make the cache miss almost every time.
+function buildTimeContext() {
   const nowUtc = new Date();
 
   // Current IST time using Intl.DateTimeFormat — no manual offset math
@@ -587,21 +638,141 @@ function buildSystemPrompt() {
     hour12: false,
   }).format(nowUtc);
 
-  const timeContext = `\nCURRENT TIME (use for all date/time calculations):
+  return `CURRENT TIME (use for all date/time calculations):
 - Current IST time (Asia/Kolkata): ${istString}
 - Current UTC time: ${nowUtc.toISOString()}
 - The user is in India. All times they mention are in IST (Asia/Kolkata, UTC+5:30) unless stated otherwise.
 - To convert IST to UTC: subtract 5 hours and 30 minutes.
-- Example: "5:07 PM IST" → 11:37 AM UTC → "2026-05-16T11:37:00.000Z"\n`;
-
-  // Inject time context right after the first paragraph
-  return SAMVAADIK_SYSTEM_PROMPT.replace(
-    "ID RULES (critical):",
-    timeContext + "\nID RULES (critical):",
-  );
+- Example: "5:07 PM IST" → 11:37 AM UTC → "2026-05-16T11:37:00.000Z"`;
 }
 
 const MAX_TOOL_ITERATIONS = 8;
+
+// ─────────────────────────────────────────────
+// Deterministic rebuild of a LIST_GROUPS_BEGIN/LIST_TEMPLATES_BEGIN block.
+// The model is told to copy every item from the tool result and count them
+// correctly, but it can still under-list or miscount under load. Rather than
+// trust that every time, the server rebuilds the block from the real tool
+// array whenever one is available for this turn, keeping only the model's
+// surrounding sentences. `lineFn` returns the pipe-delimited line for one
+// item (name already URL-encoded inside it).
+// ─────────────────────────────────────────────
+
+function rebuildListBlockInText(
+  text,
+  beginToken,
+  endToken,
+  items,
+  lineFn,
+  noun,
+) {
+  if (!text || !Array.isArray(items) || items.length === 0) return text;
+  const startIdx = text.indexOf(beginToken);
+  if (startIdx === -1) return text;
+  const endIdx = text.indexOf(endToken, startIdx);
+  if (endIdx === -1) return text;
+
+  const before = text.slice(0, startIdx);
+  let after = text.slice(endIdx + endToken.length);
+
+  const total = items.length;
+  const shown = items.slice(0, 12);
+  const lines = shown.map(lineFn).join("\n");
+  const block = `${beginToken}\n${lines}\n${endToken}`;
+
+  if (total > 12) {
+    // The model's own "N total" sentence is often wrong when it under-lists;
+    // drop a leading line that looks like one and replace it with the real
+    // count so the two never contradict each other.
+    after = after.replace(
+      /^[ \t]*\n?[ \t]*[^\n]*\b\d+[^\n]*\b(templates?|groups?|total)\b[^\n]*\n?/i,
+      "\n",
+    );
+    const note = `\nShowing ${shown.length} of ${total} ${noun} — reply with a name or number, or part of a name to narrow it down.\n`;
+    return `${before}${block}${note}${after}`;
+  }
+
+  return `${before}${block}${after}`;
+}
+
+// ─────────────────────────────────────────────
+// Resolve a bare numeric pick ("option 3", "#3", "3rd one"...) against the
+// LIST_GROUPS_BEGIN/LIST_TEMPLATES_BEGIN block the assistant showed in its
+// immediately preceding turn. Counting "the 3rd item" is the kind of
+// off-by-one-prone arithmetic a model can get wrong under load, so instead
+// of trusting it to recount correctly, the server does the counting here
+// and hands the model the exact resolved name — nothing left to miscount.
+// ─────────────────────────────────────────────
+
+function stripLineNumberingServer(line) {
+  return line.replace(/^\s*(?:\d+[.)]|[-*•])\s*/, "");
+}
+
+function parseListBlockNames(text, beginToken, endToken) {
+  const startIdx = text.indexOf(beginToken);
+  if (startIdx === -1) return null;
+  const endIdx = text.indexOf(endToken, startIdx);
+  if (endIdx === -1) return null;
+  const body = text.slice(startIdx + beginToken.length, endIdx);
+  return body
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [rawName] = stripLineNumberingServer(line).split("|");
+      let name = (rawName || "").trim();
+      try {
+        name = decodeURIComponent(name);
+      } catch {
+        // keep raw name
+      }
+      return name;
+    })
+    .filter(Boolean);
+}
+
+const NUMERIC_PICK_RE =
+  /^(?:option|opt|number|no\.?|item|choice|pick|select)?\s*#?\s*(\d{1,3})(?:st|nd|rd|th)?\s*(?:one)?\s*\.?$/i;
+
+function resolveNumericPick(trimmedMessages) {
+  const last = trimmedMessages[trimmedMessages.length - 1];
+  if (!last || last.role !== "user" || typeof last.content !== "string") {
+    return trimmedMessages;
+  }
+  const match = last.content.trim().match(NUMERIC_PICK_RE);
+  if (!match) return trimmedMessages;
+  const n = parseInt(match[1], 10);
+  if (!n || n < 1 || n > 50) return trimmedMessages;
+
+  const prev = trimmedMessages[trimmedMessages.length - 2];
+  if (!prev || prev.role !== "assistant" || typeof prev.content !== "string") {
+    return trimmedMessages;
+  }
+
+  let names = null;
+  if (prev.content.includes("LIST_GROUPS_BEGIN")) {
+    names = parseListBlockNames(
+      prev.content,
+      "LIST_GROUPS_BEGIN",
+      "LIST_GROUPS_END",
+    );
+  } else if (prev.content.includes("LIST_TEMPLATES_BEGIN")) {
+    names = parseListBlockNames(
+      prev.content,
+      "LIST_TEMPLATES_BEGIN",
+      "LIST_TEMPLATES_END",
+    );
+  }
+  if (!names || n > names.length) return trimmedMessages;
+
+  const resolvedName = names[n - 1];
+  const updated = [...trimmedMessages];
+  updated[updated.length - 1] = {
+    ...last,
+    content: `${last.content} (this picks item ${n} from the list you just showed, which is exactly: "${resolvedName}" — use that exact name, do not recount)`,
+  };
+  return updated;
+}
 
 // The assistant's own "you're out of credits" reply — same shape as any other
 // chat response, so the frontend doesn't need a special status-code path. The
@@ -644,8 +815,11 @@ function attachPickerToken(text, token) {
 
 // ── WhatsApp channel instructions ───────────────────────────────────────────
 // Appended to the system prompt when the assistant is used from the user's
-// own WhatsApp (samvaadikWaController). Plain text only: no buttons, no file
-// uploads, no template picker — so those flows are replaced here.
+// own WhatsApp (samvaadikWaController). Plain text only: no buttons and no
+// template picker, so those flows are replaced here. Files (CSV/Excel contact
+// lists, template header media) arrive as WhatsApp documents/photos, are
+// processed by the controller, and reach the model only as short notes plus
+// STAGED CONTACT FILE / MEDIA ATTACHMENT context blocks.
 // The summary titles ("Campaign Summary", "Message Preview", "Template Message
 // Preview", ...) and their "Ready to ..." questions must stay word-for-word:
 // confirmation detection in runSamvaadikAssistant relies on them.
@@ -654,15 +828,30 @@ const WHATSAPP_CHANNEL_PROMPT = `
 CHANNEL: WHATSAPP
 This conversation is happening in WhatsApp text messages from the user's own phone, not in the dashboard. The user is the account owner (or their team) — not a customer.
 
+How to sound:
+- Talk like a friendly, capable teammate on WhatsApp, not a form. Short and natural: usually 1-3 short sentences. Plain words, no corporate phrasing.
+- Match the user's language and style: English, Hindi or Hinglish, casual or formal. If they write "haan kar do", answer in the same spirit.
+- Greetings ("hi", "good morning"): greet back in one short line and ask what they'd like to do. Do NOT bring up, correct or apologise for earlier messages unless the user asks about them.
+- Never list the user's templates, groups, campaigns or flows from memory. Call the tool first, every time, even if you listed them earlier.
+- Accept any natural way of agreeing or declining ("yes", "yes proceed", "haan", "ok do it", "go ahead", "nahi", "leave it"). Never ask the user to type an exact word like "yes" or "cancel", and never treat a confirmation as a new name or value.
+- Never mention tools, markers, staging, servers or "the system". Just talk about what the user cares about: their groups, templates, campaigns.
+- Do not write dashboard links yourself. After something is created, a link to it is added to your reply automatically.
+
 Formatting:
 - Plain WhatsApp text. Use *single asterisks* for bold, never **double**. No markdown headings or tables.
 - Keep replies short. Summaries/previews: keep the exact title line (e.g. "Campaign Summary", "Message Preview", "Template Message Preview") and the exact "Ready to ..." question; the "───" separator lines are optional.
 
 What is different on WhatsApp:
-- CSV/Excel group upload (Group creation Option A) is not possible here — there is no file upload. Offer Option B (Google Sheets), or tell the user to upload the file from the Samvaadik dashboard.
-- If a Google Sheet must be picked from Google Drive, tell the user to do that once from the AI Assistant in the Samvaadik dashboard, then continue here.
-- There are NO buttons, cards or pop-ups on WhatsApp. Never say "button below", "click the button", "use the button" or similar. Where the dashboard instructions mention a button, just say what to do in words (e.g. "If your sheet is not listed, pick it from Google Drive in the Samvaadik dashboard, then come back here").
-- Images, videos and documents sent here cannot be read. Media templates cannot be created here.
+- GROUP FROM A CSV/EXCEL FILE (this REPLACES "Option A" above, including "never call any tool for Option A"): there is no + button on WhatsApp. If the user wants to create a group from a file, ask for the group name if you don't have it yet, and tell them to send the file as a document (tap the 📎 attach icon, then Document). When the file arrives it is read for you automatically and you will see a STAGED CONTACT FILE block in your context. Then:
+  1. If the user already gave a group name earlier in this conversation, use it and call create_group_from_upload right away — don't ask again and don't ask for another confirmation.
+  2. If you don't have a name yet, say how many contacts you found and ask what to call the group (you may suggest one). Once they answer, call create_group_from_upload.
+  3. If they later give a different name, use that one.
+  4. Only say the group was created after create_group_from_upload returns success: true. If it returns an error, explain it simply and ask them to send the file again if needed.
+  You never see the contact rows, so never claim to know who is in the file.
+- Option B (Google Sheets) works as above. If a sheet must be picked from Google Drive, tell the user to do that once from the AI Assistant in the Samvaadik dashboard, then continue here.
+- TEMPLATE MEDIA: ignore the line above that says media templates can't be created through chat — that's a web-dashboard limitation only. On WhatsApp they can. If the user sends a photo, video or PDF to use as a template header, it is uploaded for you automatically and you'll see a MEDIA ATTACHMENT block in your context — use it exactly as that block says and never ask them to upload it again. Supported: JPG/PNG images, MP4 video, PDF documents. If a template's media is missing or expired and you output the UPLOAD_MEDIA_FOR_TEMPLATE line as instructed above, the user is told to just send the file here in the chat, so you don't need to explain how.
+- CREATING A TEMPLATE WITH A MEDIA HEADER (adds to TEMPLATE CREATION FLOW above): when asking about the header, offer image/video/document as an option, not just text. If they want one and there's no MEDIA ATTACHMENT block yet, ask them to send the photo, video or PDF here. Once it's in your context, use header_format = IMAGE/VIDEO/DOCUMENT and pass header_handle (and media_id, if given) exactly as shown there — never header_text in that case. Show "Header: <file name> (<type>)" in the preview instead of header text.
+- There are NO Samvaadik buttons, cards or pop-ups on WhatsApp. Never say "button below", "click the button", "use the button" or similar. Where the dashboard instructions mention a button, just say what to do in words (e.g. "If your sheet is not listed, pick it from Google Drive in the Samvaadik dashboard, then come back here"). Referring to WhatsApp's own 📎 attach icon is fine.
 
 ONE-TO-ONE TEMPLATE MESSAGE (replaces Step 2b of ONE-TO-ONE MESSAGING — there is no template picker here; open_template_picker does not exist):
 1. Identify the person with find_contact as usual (or use the full phone number the user gave).
@@ -703,6 +892,9 @@ export async function runSamvaadikAssistant({
   messages,
   media_attachment,
   channel = "web",
+  // WhatsApp only: { link_id, staged_upload: {file_name, count, skipped} | null }.
+  // Web never passes this, so none of the code keyed on it runs there.
+  channelContext = {},
 }) {
   if (!user_id) {
     throw Object.assign(new Error("user_id is required"), {
@@ -750,13 +942,17 @@ export async function runSamvaadikAssistant({
     return buildOutOfCreditsPayload(creditBalance);
   }
 
-  // Build system prompt with current IST time + optional media attachment context
-  let systemPrompt = buildSystemPrompt();
-  if (channel === "whatsapp") {
-    systemPrompt += WHATSAPP_CHANNEL_PROMPT;
-  }
+  // Static prompt for this channel. It never changes between requests, so it
+  // can be sent as a cached block.
+  const staticPrompt =
+    channel === "whatsapp"
+      ? SAMVAADIK_SYSTEM_PROMPT + WHATSAPP_CHANNEL_PROMPT
+      : SAMVAADIK_SYSTEM_PROMPT;
+
+  // Per-request context: current IST time + optional media attachment
+  let dynamicContext = buildTimeContext();
   if (media_attachment?.header_handle) {
-    systemPrompt +=
+    dynamicContext +=
       `\n\nMEDIA ATTACHMENT FOR THIS SESSION:\n` +
       `The user has already uploaded a ${media_attachment.header_format || "IMAGE"} file` +
       (media_attachment.file_name
@@ -776,6 +972,20 @@ export async function runSamvaadikAssistant({
       ` to the create_template tool. Do NOT ask the user to upload a file — the upload is already complete.`;
   }
 
+  // A contact file the user sent over WhatsApp, parsed and held server-side.
+  // The model only sees counts — never the rows themselves.
+  const stagedUpload = channelContext?.staged_upload || null;
+  if (stagedUpload) {
+    dynamicContext +=
+      `\n\nSTAGED CONTACT FILE (the user sent this on WhatsApp; it is NOT a group yet):\n` +
+      `- File: "${stagedUpload.file_name || "contacts"}" — ${stagedUpload.count} valid contact${stagedUpload.count === 1 ? "" : "s"}` +
+      (stagedUpload.skipped
+        ? ` (${stagedUpload.skipped} row${stagedUpload.skipped === 1 ? "" : "s"} skipped: no phone number)`
+        : "") +
+      `.\n- To make the group, call create_group_from_upload with the group name. ` +
+      `If the user already told you a group name earlier in this conversation, use it. Otherwise ask for one.`;
+  }
+
   // Trim to last 20 messages to prevent context bloat across multiple campaigns
   // Earlier picker tokens are replaced with a short note so the model
   // never sees (and imitates) them.
@@ -792,7 +1002,11 @@ export async function runSamvaadikAssistant({
         }
       : m,
   );
-  let currentMessages = [...trimmedMessages];
+  // If the user's latest message is a bare numeric pick ("option 3", "#3",
+  // "3rd one"...) right after a LIST_GROUPS/LIST_TEMPLATES block, resolve
+  // it to the exact name here rather than letting the model recount.
+  const resolvedMessages = resolveNumericPick(trimmedMessages);
+  let currentMessages = [...resolvedMessages];
   let iteration = 0;
   let pickerToken = null; // set when open_template_picker succeeds this turn
 
@@ -855,10 +1069,45 @@ export async function runSamvaadikAssistant({
   // Anthropic call — not after racking up more cost we can't charge for.
   let turnCreditsCharged = 0; // sum across every iteration of this turn
 
-  const chargeIteration = async (usage) => {
+  // One id per chat turn. Every iteration's ledger row carries it (plus that
+  // call's token counts) so the AI Usage table can show ONE line per chat
+  // message with the total credits and the input/output tokens.
+  const turnId = randomUUID().slice(0, 8);
+  const turnTotals = {
+    calls: 0,
+    input: 0, // fresh (uncached) input tokens
+    output: 0,
+    cacheWrite: 0,
+    cacheRead: 0,
+    realRupees: 0,
+  };
+
+  // Printed once, when this turn ends — no matter which return path (or
+  // error) the turn took.
+  const logTurnTotals = () => {
+    const totalIn =
+      turnTotals.input + turnTotals.cacheWrite + turnTotals.cacheRead;
+    console.log(
+      `[SamvaadikAI][billing] user=${user_id} TURN ${turnId} TOTAL ` +
+        `calls=${turnTotals.calls} ` +
+        `tokens(in=${turnTotals.input}, out=${turnTotals.output}, ` +
+        `cacheWrite=${turnTotals.cacheWrite}, cacheRead=${turnTotals.cacheRead}, ` +
+        `totalInput=${totalIn}) ` +
+        `realCost=\u20B9${turnTotals.realRupees.toFixed(4)} ` +
+        `creditsCharged=${turnCreditsCharged} balance=${creditBalance}`,
+    );
+  };
+
+  const chargeIteration = async (usage, content = []) => {
     const realRupees = usageToRealRupees(usage);
-    const creditsCharged =
-      realRupees > 0 ? realRupeesToCredits(realRupees) : 0;
+    const creditsCharged = realRupees > 0 ? realRupeesToCredits(realRupees) : 0;
+
+    turnTotals.calls += 1;
+    turnTotals.input += usage?.input_tokens || 0;
+    turnTotals.output += usage?.output_tokens || 0;
+    turnTotals.cacheWrite += usage?.cache_creation_input_tokens || 0;
+    turnTotals.cacheRead += usage?.cache_read_input_tokens || 0;
+    turnTotals.realRupees += realRupees;
 
     console.log(
       `[SamvaadikAI][billing] user=${user_id} iteration=${iteration} ` +
@@ -869,11 +1118,21 @@ export async function runSamvaadikAssistant({
 
     if (creditsCharged === 0) return;
 
+    // Which tools the assistant used in this step (e.g. "list_templates").
+    const stepTools = (Array.isArray(content) ? content : [])
+      .filter((b) => b?.type === "tool_use" && b?.name)
+      .map((b) => b.name)
+      .join(",");
+
     try {
       const updatedUser = await deductCredits(
         user_id,
         creditsCharged,
-        "Samvaadik AI Assistant usage",
+        // The [[...]] tag is read (and hidden) by the AI Usage table to
+        // group this turn's calls into one row and describe what the
+        // assistant did. Token counts are deliberately NOT stored here —
+        // they stay in the server log only.
+        `Samvaadik AI Assistant usage [[t=${turnId};s=${iteration};tools=${stepTools}]]`,
       );
       creditBalance = Number(updatedUser.credits) || 0;
       turnCreditsCharged += creditsCharged;
@@ -911,188 +1170,286 @@ export async function runSamvaadikAssistant({
   const tools = toolsForChannel(channel);
   const toolNames = new Set(tools.map((t) => t.name));
 
-  while (iteration < MAX_TOOL_ITERATIONS) {
-    iteration++;
+  // Raw arrays from the most recent list_groups/list_templates call this
+  // turn, captured so the LIST_GROUPS_BEGIN/LIST_TEMPLATES_BEGIN block the
+  // model writes can be rebuilt deterministically below instead of trusting
+  // the model to copy every item and count correctly.
+  let lastGroupsResult = null;
+  let lastTemplatesResult = null;
 
-    // First iteration after confirmation: force a tool call so Claude cannot
-    // hallucinate a confirmation text. After that, let Claude respond freely.
-    const toolChoice = forcePickerTool
-      ? { type: "tool", name: "open_template_picker" }
-      : forceSendTool
-        ? { type: "tool", name: confirmedSendTool }
-        : forceToolUse && iteration === 1
-          ? { type: "any" }
-          : { type: "auto" };
-    forcePickerTool = false;
-    forceSendTool = false;
+  // WhatsApp: links to what got created this turn (appended to the reply by
+  // the caller), and the outcome of create_group_from_upload (so the reply
+  // can never claim a group exists when it doesn't).
+  const dashboardLinks = [];
+  let groupUploadResult = null; // null = not called this turn
 
-    const response = await anthropic.messages.create({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 4096,
-      system: systemPrompt,
-      tools,
-      tool_choice: toolChoice,
-      messages: currentMessages,
-    });
+  try {
+    while (iteration < MAX_TOOL_ITERATIONS) {
+      iteration++;
 
-    const { stop_reason, content, usage } = response;
-    await chargeIteration(usage);
+      // First iteration after confirmation: force a tool call so Claude cannot
+      // hallucinate a confirmation text. After that, let Claude respond freely.
+      const toolChoice = forcePickerTool
+        ? { type: "tool", name: "open_template_picker" }
+        : forceSendTool
+          ? { type: "tool", name: confirmedSendTool }
+          : forceToolUse && iteration === 1
+            ? { type: "any" }
+            : { type: "auto" };
+      forcePickerTool = false;
+      forceSendTool = false;
 
-    if (stop_reason === "end_turn") {
-      const textBlock = content.find((b) => b.type === "text");
+      // Prompt caching. Order of the cached prefix is tools -> system ->
+      // messages:
+      //  - explicit breakpoint on the static system block caches the tool
+      //    definitions + the big system prompt (identical on every request);
+      //  - the top-level cache_control (automatic caching) also caches the
+      //    growing conversation, so the 2nd, 3rd... tool iteration inside one
+      //    turn only pays full price for what is new.
+      // tool_choice changes do not invalidate the tools/system cache.
+      // The per-request block (time, media attachment) sits after the static
+      // block, so it never breaks the cache. Cache reads cost 10% of normal
+      // input; usage is billed from the real token counts in chargeIteration.
+      const response = await anthropic.messages.create({
+        model: "claude-haiku-5-5",
+        max_tokens: 4096,
+        cache_control: { type: "ephemeral" },
+        system: [
+          {
+            type: "text",
+            text: staticPrompt,
+            cache_control: { type: "ephemeral" },
+          },
+          { type: "text", text: dynamicContext },
+        ],
+        tools,
+        tool_choice: toolChoice,
+        messages: currentMessages,
+      });
 
-      // Guard: the reply points to a template button but the picker tool
-      // was never called this turn, so no button would appear. Make the
-      // model call it (once), then let it answer again.
-      // Web only — the picker (and this tool) doesn't exist on WhatsApp.
-      const promisesPicker =
-        toolNames.has("open_template_picker") &&
-        /template/i.test(textBlock?.text || "") &&
-        /button (below|above)/i.test(textBlock?.text || "") &&
-        !/REDIRECT_TO_TEMPLATES|GOOGLE_/.test(textBlock?.text || "");
-      if (promisesPicker && !pickerToken && !pickerRetried) {
-        if (creditBalance <= 0) {
-          return buildOutOfCreditsPayload(creditBalance, turnCreditsCharged);
+      const { stop_reason, content, usage } = response;
+      await chargeIteration(usage, content);
+
+      if (stop_reason === "end_turn") {
+        const textBlock = content.find((b) => b.type === "text");
+
+        // Guard: the reply points to a template button but the picker tool
+        // was never called this turn, so no button would appear. Make the
+        // model call it (once), then let it answer again.
+        // Web only — the picker (and this tool) doesn't exist on WhatsApp.
+        const promisesPicker =
+          toolNames.has("open_template_picker") &&
+          /template/i.test(textBlock?.text || "") &&
+          /button (below|above)/i.test(textBlock?.text || "") &&
+          !/REDIRECT_TO_TEMPLATES|GOOGLE_|UPLOAD_MEDIA_FOR_TEMPLATE|LIST_TEMPLATES_BEGIN|LIST_GROUPS_BEGIN/.test(
+            textBlock?.text || "",
+          );
+        if (promisesPicker && !pickerToken && !pickerRetried) {
+          if (creditBalance <= 0) {
+            return buildOutOfCreditsPayload(creditBalance, turnCreditsCharged);
+          }
+          console.warn(
+            "[SamvaadikAI] Template button promised without open_template_picker — forcing the tool call",
+          );
+          pickerRetried = true;
+          forcePickerTool = true;
+          currentMessages.push({ role: "assistant", content });
+          currentMessages.push({
+            role: "user",
+            content:
+              "(System note, not from the user) You mentioned the template button but did not call open_template_picker, so no button is shown. Call open_template_picker now with the exact chat_id from find_contact, or the phone_number for a new contact. Then reply again in one short sentence.",
+          });
+          continue;
         }
-        console.warn(
-          "[SamvaadikAI] Template button promised without open_template_picker — forcing the tool call",
-        );
-        pickerRetried = true;
-        forcePickerTool = true;
-        currentMessages.push({ role: "assistant", content });
-        currentMessages.push({
-          role: "user",
-          content:
-            "(System note, not from the user) You mentioned the template button but did not call open_template_picker, so no button is shown. Call open_template_picker now with the exact chat_id from find_contact, or the phone_number for a new contact. Then reply again in one short sentence.",
-        });
-        continue;
-      }
 
-      let replyText = textBlock?.text || "";
-      const claimsSent =
-        /\bsent\b/i.test(replyText) &&
-        !/\b(not|n't|unable|fail|failed|couldn|could not|cannot)\b/i.test(
+        let replyText = textBlock?.text || "";
+        const claimsSent =
+          /\bsent\b/i.test(replyText) &&
+          !/\b(not|n't|unable|fail|failed|couldn|could not|cannot)\b/i.test(
+            replyText,
+          );
+
+        // Guard: user confirmed a Message Preview but the model replied
+        // without calling send_text_message. Force the call once.
+        if (confirmedMessagePreview && !lastTextSend && !sendRetried) {
+          if (creditBalance <= 0) {
+            return buildOutOfCreditsPayload(creditBalance, turnCreditsCharged);
+          }
+          console.warn(
+            `[SamvaadikAI] Preview confirmed but ${confirmedSendTool} not called — forcing the tool call`,
+          );
+          sendRetried = true;
+          forceSendTool = true;
+          currentMessages.push({ role: "assistant", content });
+          currentMessages.push({
+            role: "user",
+            content:
+              confirmedSendTool === "send_template_message"
+                ? "(System note, not from the user) The user confirmed the Template Message Preview but send_template_message was not called, so nothing was sent. Call send_template_message now with the phone_number from the preview's 'To:' line, the template_name and the values from the preview. Then report the real result."
+                : "(System note, not from the user) The user confirmed the Message Preview but send_text_message was not called, so nothing was sent. Call send_text_message now with the phone_number from the preview's 'To:' line and the exact message text. Then report the real result.",
+          });
+          continue;
+        }
+
+        // Guard: never tell the user a text was sent when the tool failed
+        // (or was never called).
+        if (claimsSent && lastTextSend && !lastTextSend.sent) {
+          const reason = String(lastTextSend.error || "")
+            .replace(/^MESSAGE NOT SENT:\s*/i, "")
+            .trim();
+          replyText = `The message was not sent. ${reason || "Please try again."}`;
+          if (["NO_USER_REPLY", "WINDOW_EXPIRED"].includes(lastTextSend.code)) {
+            replyText += " Would you like to send a template instead?";
+          }
+        } else if (claimsSent && !lastTextSend && confirmedMessagePreview) {
+          replyText =
+            "The message was not sent because something went wrong. Please try again.";
+        }
+
+        // WhatsApp group-from-file: never let the reply say a group was
+        // created when it wasn't (tool not called, or it returned an error).
+        const claimsGroupCreated =
+          /\b(has been|have been|was|were|is now|successfully|i'?ve|i have|just)\s+created\b|\bcreated\s+(the|your|a)\s+(new\s+)?group\b|\bgroup\b[^.\n]{0,60}\bcreated with\b/i.test(
+            replyText,
+          );
+        if (claimsGroupCreated && groupUploadResult?.error) {
+          replyText = `I couldn't create the group: ${String(groupUploadResult.error).replace(/^NO_STAGED_FILE:\s*/i, "")}`;
+        } else if (claimsGroupCreated && stagedUpload && !groupUploadResult) {
+          replyText =
+            "Hold on, I haven't created the group yet. Tell me what name you'd like and I'll set it up right away.";
+        }
+
+        // Rebuild any group/template list block from the real tool result
+        // for this turn, so the displayed list can never be shorter than, or
+        // miscounted against, what the account actually has.
+        replyText = rebuildListBlockInText(
           replyText,
+          "LIST_GROUPS_BEGIN",
+          "LIST_GROUPS_END",
+          lastGroupsResult,
+          (g) =>
+            `${encodeURIComponent(g.group_name || "")}|${g.contact_count ?? 0}`,
+          "groups",
+        );
+        replyText = rebuildListBlockInText(
+          replyText,
+          "LIST_TEMPLATES_BEGIN",
+          "LIST_TEMPLATES_END",
+          lastTemplatesResult,
+          (t) =>
+            `${encodeURIComponent(t.name || "")}|${t.header_format || "TEXT"}|${t.status || ""}`,
+          "templates",
         );
 
-      // Guard: user confirmed a Message Preview but the model replied
-      // without calling send_text_message. Force the call once.
-      if (confirmedMessagePreview && !lastTextSend && !sendRetried) {
+        return {
+          success: true,
+          role: "assistant",
+          content: attachPickerToken(replyText, pickerToken),
+          usage,
+          iterations: iteration,
+          credits_charged: turnCreditsCharged,
+          credits_remaining: creditBalance,
+          ...(dashboardLinks.length > 0 && { dashboard_links: dashboardLinks }),
+        };
+      }
+
+      if (stop_reason === "tool_use") {
+        // Claude wants another round (tool results fed back in), which means
+        // another billable Anthropic call. If this iteration's charge just
+        // used up what was left, stop here instead of making that call.
         if (creditBalance <= 0) {
           return buildOutOfCreditsPayload(creditBalance, turnCreditsCharged);
         }
-        console.warn(
-          `[SamvaadikAI] Preview confirmed but ${confirmedSendTool} not called — forcing the tool call`,
-        );
-        sendRetried = true;
-        forceSendTool = true;
+
         currentMessages.push({ role: "assistant", content });
-        currentMessages.push({
-          role: "user",
-          content:
-            confirmedSendTool === "send_template_message"
-              ? "(System note, not from the user) The user confirmed the Template Message Preview but send_template_message was not called, so nothing was sent. Call send_template_message now with the phone_number from the preview's 'To:' line, the template_name and the values from the preview. Then report the real result."
-              : "(System note, not from the user) The user confirmed the Message Preview but send_text_message was not called, so nothing was sent. Call send_text_message now with the phone_number from the preview's 'To:' line and the exact message text. Then report the real result.",
-        });
+
+        const toolResults = [];
+        for (const block of content) {
+          if (block.type === "tool_use") {
+            console.log(
+              `[SamvaadikAI] Tool call: ${block.name}`,
+              JSON.stringify(block.input),
+            );
+            // Only tools offered on this channel may run (defence in depth)
+            const result = toolNames.has(block.name)
+              ? await executeTool(
+                  block.name,
+                  block.input,
+                  user_id,
+                  channelContext,
+                )
+              : { error: `Tool ${block.name} is not available here.` };
+            if (block.name === "create_group_from_upload") {
+              groupUploadResult = result || { error: "No result" };
+            }
+            if (channel === "whatsapp") {
+              const link = dashboardLinkForResult(block.name, result);
+              if (link) dashboardLinks.push(link);
+            }
+            // The template-picker token is attached to the reply by the server
+            // (see attachPickerToken). Hide it from the model so it can't
+            // echo a mangled copy (placeholder text / bare UUID).
+            if (
+              block.name === "send_text_message" ||
+              block.name === "send_template_message"
+            ) {
+              lastTextSend = result || { sent: false, error: "No result" };
+            }
+            if (block.name === "open_template_picker" && result?.picker_token) {
+              pickerToken = result.picker_token;
+              delete result.picker_token;
+            }
+            // Keep the raw, unfiltered arrays so the LIST_GROUPS_BEGIN /
+            // LIST_TEMPLATES_BEGIN block can be rebuilt from ground truth
+            // further down, regardless of what the model writes.
+            if (block.name === "list_groups" && Array.isArray(result?.groups)) {
+              lastGroupsResult = result.groups;
+            }
+            if (
+              block.name === "list_templates" &&
+              Array.isArray(result?.templates)
+            ) {
+              lastTemplatesResult = result.templates;
+            }
+            console.log(
+              `[SamvaadikAI] Tool result: ${block.name}`,
+              JSON.stringify(result),
+            );
+            toolResults.push({
+              type: "tool_result",
+              tool_use_id: block.id,
+              content: JSON.stringify(result),
+            });
+          }
+        }
+
+        currentMessages.push({ role: "user", content: toolResults });
         continue;
       }
 
-      // Guard: never tell the user a text was sent when the tool failed
-      // (or was never called).
-      if (claimsSent && lastTextSend && !lastTextSend.sent) {
-        const reason = String(lastTextSend.error || "")
-          .replace(/^MESSAGE NOT SENT:\s*/i, "")
-          .trim();
-        replyText = `The message was not sent. ${reason || "Please try again."}`;
-        if (["NO_USER_REPLY", "WINDOW_EXPIRED"].includes(lastTextSend.code)) {
-          replyText += " Would you like to send a template instead?";
-        }
-      } else if (claimsSent && !lastTextSend && confirmedMessagePreview) {
-        replyText =
-          "The message was not sent because something went wrong. Please try again.";
-      }
-
+      console.warn("[SamvaadikAI] Unexpected stop_reason:", stop_reason);
       return {
         success: true,
         role: "assistant",
-        content: attachPickerToken(replyText, pickerToken),
-        usage,
+        content: "I ran into an unexpected issue. Please try again.",
         iterations: iteration,
         credits_charged: turnCreditsCharged,
         credits_remaining: creditBalance,
       };
     }
 
-    if (stop_reason === "tool_use") {
-      // Claude wants another round (tool results fed back in), which means
-      // another billable Anthropic call. If this iteration's charge just
-      // used up what was left, stop here instead of making that call.
-      if (creditBalance <= 0) {
-        return buildOutOfCreditsPayload(creditBalance, turnCreditsCharged);
-      }
-
-      currentMessages.push({ role: "assistant", content });
-
-      const toolResults = [];
-      for (const block of content) {
-        if (block.type === "tool_use") {
-          console.log(
-            `[SamvaadikAI] Tool call: ${block.name}`,
-            JSON.stringify(block.input),
-          );
-          // Only tools offered on this channel may run (defence in depth)
-        const result = toolNames.has(block.name)
-          ? await executeTool(block.name, block.input, user_id)
-          : { error: `Tool ${block.name} is not available here.` };
-          // The template-picker token is attached to the reply by the server
-          // (see attachPickerToken). Hide it from the model so it can't
-          // echo a mangled copy (placeholder text / bare UUID).
-          if (
-          block.name === "send_text_message" ||
-          block.name === "send_template_message"
-        ) {
-            lastTextSend = result || { sent: false, error: "No result" };
-          }
-          if (block.name === "open_template_picker" && result?.picker_token) {
-            pickerToken = result.picker_token;
-            delete result.picker_token;
-          }
-          console.log(
-            `[SamvaadikAI] Tool result: ${block.name}`,
-            JSON.stringify(result),
-          );
-          toolResults.push({
-            type: "tool_result",
-            tool_use_id: block.id,
-            content: JSON.stringify(result),
-          });
-        }
-      }
-
-      currentMessages.push({ role: "user", content: toolResults });
-      continue;
-    }
-
-    console.warn("[SamvaadikAI] Unexpected stop_reason:", stop_reason);
     return {
       success: true,
       role: "assistant",
-      content: "I ran into an unexpected issue. Please try again.",
+      content:
+        "I had trouble completing that. Could you rephrase or break it into smaller steps?",
       iterations: iteration,
       credits_charged: turnCreditsCharged,
       credits_remaining: creditBalance,
     };
+  } finally {
+    logTurnTotals();
   }
-
-  return {
-    success: true,
-    role: "assistant",
-    content:
-      "I had trouble completing that. Could you rephrase or break it into smaller steps?",
-    iterations: iteration,
-    credits_charged: turnCreditsCharged,
-    credits_remaining: creditBalance,
-  };
 }
 
 // ── handleSamvaadikChat ───────────────────────────────────────────────────────
@@ -1130,29 +1487,14 @@ export const handleSamvaadikChat = async (req, res) => {
   }
 };
 
-// ─── HELPERS for group CSV parsing ────────────────────────────────────────────
-
-const findColumn = (headers, candidates) => {
-  const lower = headers.map((h) => h.toLowerCase().trim());
-  for (const c of candidates) {
-    const i = lower.indexOf(c.toLowerCase());
-    if (i !== -1) return headers[i];
-  }
-  return null;
-};
-
-const slugify = (s) =>
-  String(s || "")
-    .toLowerCase()
-    .replace(/\s+/g, "-")
-    .replace(/[^a-z0-9-_]/g, "")
-    .slice(0, 60);
-
 // ─── GROUP PREVIEW ────────────────────────────────────────────────────────────
 // POST /api/agents/samvaadik/preview-group
 // multipart/form-data: user_id, group_name, file
-// Parses CSV, uploads to Supabase storage, returns preview + contacts[].
-// NO DB writes to groups or group_contacts.
+// Parses CSV or Excel (see utils/contactFileParser.js — previously this only
+// ever ran @fast-csv against the buffer, so a real .xlsx/.xls upload here
+// either threw or silently produced garbage rows), uploads the original file
+// to Supabase storage, returns preview + contacts[]. NO DB writes to groups
+// or group_contacts — see handleGroupFromCsv / createGroupFromContacts.
 export const handleGroupPreview = async (req, res) => {
   try {
     const { user_id, group_name } = req.body;
@@ -1171,75 +1513,29 @@ export const handleGroupPreview = async (req, res) => {
         .status(400)
         .json({ success: false, error: "A CSV or Excel file is required" });
 
-    // Parse CSV
-    const rows = [];
-    const headers = [];
-
+    let parsed;
     try {
-      await new Promise((resolve, reject) => {
-        Readable.from(file.buffer)
-          .pipe(parseCsv({ headers: true, ignoreEmpty: true, trim: true }))
-          .on("headers", (h) => headers.push(...h))
-          .on("data", (row) => rows.push(row))
-          .on("error", reject)
-          .on("end", resolve);
+      parsed = await parseContactsFile(file.buffer, {
+        fileName: file.originalname,
+        mimeType: file.mimetype,
+        userId: user_id,
       });
-    } catch {
-      return res.status(400).json({
-        success: false,
-        error:
-          "Could not parse the file. Make sure it is a valid CSV with headers.",
-      });
+    } catch (parseErr) {
+      return res.status(400).json({ success: false, error: parseErr.message });
     }
 
-    if (!rows.length) {
-      return res
-        .status(400)
-        .json({ success: false, error: "The file has no data rows." });
-    }
+    const { contacts, rowCount, skipped, columns_found } = parsed;
 
-    // Detect columns
-    const nameCol = findColumn(headers, ["name", "full_name", "fullname"]);
-    const phoneCol = findColumn(headers, [
-      "phone",
-      "phone_number",
-      "phoneno",
-      "mobile",
-      "contact",
-    ]);
-    const emailCol = findColumn(headers, ["email", "email_address"]);
-
-    if (!phoneCol) {
-      return res.status(400).json({
-        success: false,
-        error: `No phone column found. Columns in your file: ${headers.join(", ")}. Rename one to "phone", "phoneno", or "mobile".`,
-      });
-    }
-
-    // Build contacts
-    const contacts = rows
-      .map((r) => ({
-        user_id,
-        full_name: nameCol ? r[nameCol]?.trim() || null : null,
-        email: emailCol ? r[emailCol]?.trim() || null : null,
-        phone_number: r[phoneCol]?.trim(),
-      }))
-      .filter((c) => c.phone_number);
-
-    if (!contacts.length) {
-      return res.status(400).json({
-        success: false,
-        error: "No valid phone numbers found in the file.",
-      });
-    }
-
-    // Upload CSV to Supabase storage (non-fatal)
+    // Upload the original file to Supabase storage (non-fatal)
     let csvUrl = null;
     try {
-      const storageKey = `${user_id}/${Date.now()}_${slugify(group_name)}.csv`;
+      const ext = (file.originalname?.split(".").pop() || "csv").toLowerCase();
+      const storageKey = `${user_id}/${Date.now()}_${slugifyFileName(group_name)}.${ext}`;
       const { error: uploadErr } = await supabase.storage
         .from("group-csvs")
-        .upload(storageKey, file.buffer, { contentType: "text/csv" });
+        .upload(storageKey, file.buffer, {
+          contentType: file.mimetype || "text/csv",
+        });
 
       if (!uploadErr) {
         const { data: urlData } = supabase.storage
@@ -1260,12 +1556,8 @@ export const handleGroupPreview = async (req, res) => {
       success: true,
       group_name: group_name.trim(),
       contact_count: contacts.length,
-      skipped: rows.length - contacts.length,
-      columns_found: {
-        name: nameCol || null,
-        phone: phoneCol,
-        email: emailCol || null,
-      },
+      skipped,
+      columns_found,
       sample: contacts.slice(0, 3),
       contacts, // full list — frontend holds and sends back on confirm
       csv_url: csvUrl, // Supabase storage URL — stored in groups.uploaded_csv
@@ -1277,87 +1569,23 @@ export const handleGroupPreview = async (req, res) => {
 };
 
 // ─── GROUP CREATION FROM CSV ──────────────────────────────────────────────────
+// createGroupFromContacts lives in services/groupImportService.js (shared with
+// the WhatsApp assistant's create_group_from_upload tool) — re-exported below.
+
 // POST /api/agents/samvaadik/create-group
 // JSON body: { user_id, group_name, description, contacts[], csv_url }
 // contacts[] and csv_url come from the preview step — no file upload here.
+// Thin HTTP wrapper around createGroupFromContacts (see above).
 export const handleGroupFromCsv = async (req, res) => {
   try {
-    const {
-      user_id,
-      group_name,
-      description = "",
-      contacts,
-      csv_url = null,
-    } = req.body;
-
-    if (!user_id)
-      return res
-        .status(400)
-        .json({ success: false, error: "user_id is required" });
-    if (!group_name?.trim())
-      return res
-        .status(400)
-        .json({ success: false, error: "group_name is required" });
-    if (!contacts?.length)
-      return res
-        .status(400)
-        .json({ success: false, error: "No contacts provided" });
-
-    // Create group row
-    const { data: group, error: groupErr } = await supabase
-      .from("groups")
-      .insert({
-        user_id,
-        group_name: group_name.trim(),
-        description: description?.trim() || null,
-        uploaded_csv: csv_url, // Supabase storage URL from preview step
-        status: "active",
-      })
-      .select()
-      .single();
-
-    if (groupErr)
-      return res.status(500).json({ success: false, error: groupErr.message });
-
-    // Bulk insert contacts — attach group_id (preview didn't know it yet)
-    const contactsWithGroup = contacts.map((c) => ({
-      ...c,
-      group_id: group.group_id,
-      user_id,
-    }));
-
-    const BATCH = 500;
-    let insertedCount = 0;
-
-    for (let i = 0; i < contactsWithGroup.length; i += BATCH) {
-      const batch = contactsWithGroup.slice(i, i + BATCH);
-      const { data: inserted, error: insertErr } = await supabase
-        .from("group_contacts")
-        .insert(batch)
-        .select("contact_id");
-
-      if (insertErr) {
-        console.error(
-          `[AgentGroup] Batch insert error at offset ${i}:`,
-          insertErr.message,
-        );
-      } else {
-        insertedCount += inserted?.length ?? 0;
-      }
-    }
-
-    const skipped = contacts.length - insertedCount;
-
-    return res.status(201).json({
-      success: true,
-      group_id: group.group_id,
-      group_name: group.group_name,
-      contacts_inserted: insertedCount,
-      skipped,
-      message: `Group "${group.group_name}" created with ${insertedCount} contact${insertedCount !== 1 ? "s" : ""}${skipped > 0 ? ` (${skipped} skipped)` : ""}.`,
-    });
+    const result = await createGroupFromContacts(req.body);
+    return res.status(201).json(result);
   } catch (err) {
     console.error("❌ handleGroupFromCsv:", err);
-    return res.status(500).json({ success: false, error: err.message });
+    return res
+      .status(err.status || 500)
+      .json({ success: false, error: err.message });
   }
 };
+
+export { createGroupFromContacts };

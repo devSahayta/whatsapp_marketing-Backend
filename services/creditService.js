@@ -6,10 +6,14 @@
 //
 // 1 credit = ₹1, flat — that's the only rate ever shown to users.
 // All pricing math lives in config/creditConfig.js — nothing here hardcodes ₹.
+// GST (18%) is added on top of the base credit price at charge time — see
+// config/gstConfig.js, the single source of truth for that math.
 
 import Razorpay from "razorpay";
 import crypto from "crypto";
 import { supabase } from "../config/supabase.js";
+import { chargeOrderWithSavedToken } from "./paymentMethodService.js";
+import { addGst } from "../config/gstConfig.js";
 import {
   CREDIT_PACKAGES,
   PRICE_PER_CREDIT_RUPEES,
@@ -19,6 +23,8 @@ import {
   creditsToRupees,
   toPaise,
 } from "../config/creditConfig.js";
+
+import { maybeAutoReloadCredits } from "./autoPayService.js";
 
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
@@ -169,7 +175,8 @@ export const grantFirstSubscriptionBonusIfEligible = async (userId) => {
  * Creates a Razorpay order for a credit top-up.
  * `credits` must already be validated against the package list / custom
  * bounds — the price is always computed server-side from the credit count,
- * never trusted from the client.
+ * never trusted from the client. GST is added on top of the base credit
+ * price so the order (and what we store) is the real, GST-inclusive total.
  */
 export const createCreditOrder = async ({ userId, credits, packageId }) => {
   if (!userId) throw new Error("userId is required");
@@ -185,8 +192,10 @@ export const createCreditOrder = async ({ userId, credits, packageId }) => {
 
   await getUserOrThrow(userId); // 404s cleanly if the user doesn't exist
 
-  const amountRupees = creditsToRupees(finalCredits);
-  const amountPaise = toPaise(amountRupees);
+  const baseAmountRupees = creditsToRupees(finalCredits);
+  const baseAmountPaise = toPaise(baseAmountRupees);
+  const amountPaise = addGst(baseAmountPaise); // GST added on top
+  const amountRupees = amountPaise / 100;
 
   const order = await razorpay.orders.create({
     amount: amountPaise,
@@ -203,7 +212,7 @@ export const createCreditOrder = async ({ userId, credits, packageId }) => {
     user_id: userId,
     type: "purchase",
     credits: finalCredits,
-    amount_paid: amountRupees,
+    amount_paid: amountRupees, // GST-inclusive — matches what's actually charged
     status: "created",
     razorpay_order_id: order.id,
     description: packageId
@@ -211,7 +220,13 @@ export const createCreditOrder = async ({ userId, credits, packageId }) => {
       : "Credit purchase (custom amount)",
   });
 
-  return { order, credits: finalCredits, amountRupees, amountPaise };
+  return {
+    order,
+    credits: finalCredits,
+    amountRupees, // GST-inclusive total — what the frontend should show as "you pay"
+    baseAmountRupees, // pre-GST — for showing the breakdown
+    amountPaise,
+  };
 };
 
 const findPendingPurchaseByOrderId = async (razorpayOrderId) => {
@@ -287,6 +302,113 @@ export const verifyCreditPurchase = async ({
 };
 
 /**
+ * Buys credits using the user's saved default payment method — no Razorpay
+ * popup, no client-side signature to verify afterwards; the charge happens
+ * synchronously on the server via the stored card token. Mirrors
+ * createCreditOrder + verifyCreditPurchase's exact bookkeeping (same two
+ * credit_transactions writes: the order row updated to 'paid', then a
+ * separate 'completed' ledger row from applyCreditDelta) so this purchase
+ * shows up in Billing History / invoice download identically to a normal
+ * checkout purchase. GST is added on top here too, same as createCreditOrder.
+ */
+export const purchaseCreditsWithSavedMethod = async ({
+  userId,
+  credits,
+  packageId,
+}) => {
+  if (!userId) throw new Error("userId is required");
+
+  let finalCredits;
+  if (packageId) {
+    const pkg = CREDIT_PACKAGES.find((p) => p.id === packageId);
+    if (!pkg) throw new Error("Invalid credit package");
+    finalCredits = pkg.credits;
+  } else {
+    finalCredits = assertValidCreditAmount(credits);
+  }
+
+  await getUserOrThrow(userId); // 404s cleanly if the user doesn't exist
+
+  const baseAmountRupees = creditsToRupees(finalCredits);
+  const baseAmountPaise = toPaise(baseAmountRupees);
+  const amountPaise = addGst(baseAmountPaise); // GST added on top
+  const amountRupees = amountPaise / 100;
+
+  const order = await razorpay.orders.create({
+    amount: amountPaise,
+    currency: "INR",
+    payment_capture: 1,
+    receipt: `credits_saved_${Date.now()}`,
+    notes: {
+      userId,
+      credits: String(finalCredits),
+      type: "credit_purchase",
+    },
+  });
+
+  const { data: transaction, error: insertError } = await supabase
+    .from("credit_transactions")
+    .insert({
+      user_id: userId,
+      type: "purchase",
+      credits: finalCredits,
+      amount_paid: amountRupees,
+      status: "created",
+      razorpay_order_id: order.id,
+      description: packageId
+        ? `Credit purchase (${packageId} package) — saved card`
+        : "Credit purchase (custom amount) — saved card",
+    })
+    .select()
+    .single();
+
+  if (insertError) throw insertError;
+
+  let payment;
+  try {
+    payment = await chargeOrderWithSavedToken({
+      userId,
+      order,
+      description: `Samvaadik credits — ${finalCredits} credits`,
+    });
+  } catch (chargeErr) {
+    await supabase
+      .from("credit_transactions")
+      .update({ status: "failed" })
+      .eq("transaction_id", transaction.transaction_id);
+
+    throw new Error(
+      chargeErr?.error?.description || chargeErr?.message || "Charge failed",
+    );
+  }
+
+  await supabase
+    .from("credit_transactions")
+    .update({
+      status: "paid",
+      razorpay_payment_id: payment.id,
+    })
+    .eq("transaction_id", transaction.transaction_id)
+    .eq("status", "created"); // guards against a concurrent double-credit
+
+  const updatedUser = await applyCreditDelta(userId, finalCredits, {
+    type: "purchase",
+    status: "completed",
+    razorpay_order_id: order.id,
+    razorpay_payment_id: payment.id,
+    amount_paid: amountRupees,
+    description: `Credit purchase confirmed (saved card — ${finalCredits} credits)`,
+  });
+
+  return {
+    credits: finalCredits,
+    balance: updatedUser.credits,
+    paymentId: payment.id,
+    amountRupees,
+  };
+};
+
+/**
  * Mirrors paymentController's razorpayWebhook, but for credit top-up orders.
  * Safe to call even if verifyCreditPurchase already handled this order.
  */
@@ -321,15 +443,25 @@ export const handleCreditPaymentCaptured = async (paymentEntity) => {
 // Called by handleSamvaadikChat (controllers/agentController.js) after every
 // Samvaadik AI Assistant turn, for the doubled real cost of that turn's
 // Anthropic usage. See realRupeesToCredits() in config/creditConfig.js.
+//
+// FIX: previously referenced an undefined `updatedUser` before the deduction
+// even ran, throwing a ReferenceError on every call. Now the deduction runs
+// first, and the auto-reload check fires off its result afterwards.
 export const deductCredits = async (userId, amount, description) => {
   const n = Number(amount);
   if (!Number.isFinite(n) || n <= 0) {
     throw new Error("Deduction amount must be a positive number");
   }
 
-  return applyCreditDelta(userId, -n, {
+  const updatedUser = await applyCreditDelta(userId, -n, {
     type: "deduction",
     status: "completed",
     description: description || "Credit usage",
   });
+
+  // Fire-and-forget: check low-balance auto-reload using the post-deduction
+  // balance. Never blocks or fails the deduction itself.
+  maybeAutoReloadCredits(userId, updatedUser.credits).catch(() => {});
+
+  return updatedUser;
 };

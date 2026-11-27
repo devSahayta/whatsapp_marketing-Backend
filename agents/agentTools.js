@@ -14,6 +14,11 @@ import {
   sendTextToChat,
   normalizePhone,
 } from "../services/chatMessagingService.js";
+import { createGroupFromContacts } from "../services/groupImportService.js";
+import {
+  getPendingAction,
+  clearPendingAction,
+} from "../services/samvaadikWaService.js";
 
 // ─────────────────────────────────────────────
 // TOOL DEFINITIONS  (sent to Anthropic API)
@@ -55,7 +60,7 @@ export const CAMPAIGN_TOOLS = [
   {
     name: "create_template",
     description:
-      "Create a new WhatsApp message template (text only, no media) and submit it to Meta for approval. Only call this AFTER showing the user a full preview and receiving explicit confirmation.",
+      "Create a new WhatsApp message template and submit it to Meta for approval. Supports a TEXT header, or an IMAGE/VIDEO/DOCUMENT header when the user has already uploaded a media file in this conversation (its handle appears in a media_attachment context block — pass header_format/header_handle/media_id from that block; never guess them). Only call this AFTER showing the user a full preview and receiving explicit confirmation.",
     input_schema: {
       type: "object",
       properties: {
@@ -432,7 +437,8 @@ export const CAMPAIGN_TOOLS = [
       properties: {
         chat_id: {
           type: "string",
-          description: "Exact chat_id from find_contact, if the person has one.",
+          description:
+            "Exact chat_id from find_contact, if the person has one.",
         },
         phone_number: {
           type: "string",
@@ -476,11 +482,13 @@ export const CAMPAIGN_TOOLS = [
       properties: {
         phone_number: {
           type: "string",
-          description: "Recipient phone number with country code, from the preview's 'To:' line.",
+          description:
+            "Recipient phone number with country code, from the preview's 'To:' line.",
         },
         contact_name: {
           type: "string",
-          description: "Recipient's name if known (used when creating a new chat).",
+          description:
+            "Recipient's name if known (used when creating a new chat).",
         },
         template_name: {
           type: "string",
@@ -489,7 +497,8 @@ export const CAMPAIGN_TOOLS = [
         },
         wt_id: {
           type: "string",
-          description: "wt_id from list_templates in this same turn (optional if template_name is given).",
+          description:
+            "wt_id from list_templates in this same turn (optional if template_name is given).",
         },
         body_variables: {
           type: "object",
@@ -498,7 +507,8 @@ export const CAMPAIGN_TOOLS = [
         },
         header_variable: {
           type: "string",
-          description: "Value for the header placeholder, only if get_template_details says header_variable_needed.",
+          description:
+            "Value for the header placeholder, only if get_template_details says header_variable_needed.",
         },
         button_variables: {
           type: "array",
@@ -510,6 +520,25 @@ export const CAMPAIGN_TOOLS = [
       required: ["phone_number"],
     },
   },
+  {
+    name: "create_group_from_upload",
+    description:
+      "WhatsApp only. Create a contact group from the CSV/Excel file the user just sent in this chat. The file is already parsed and held server-side (you only see its counts in the STAGED CONTACT FILE context) — never ask for the contacts again. Call this once you know the group name the user wants (use a name they already gave you earlier in the conversation; otherwise ask). Fails with NO_STAGED_FILE if no file is waiting.",
+    input_schema: {
+      type: "object",
+      properties: {
+        group_name: {
+          type: "string",
+          description: "Name for the new group, as the user wants it.",
+        },
+        description: {
+          type: "string",
+          description: "Optional short description for the group.",
+        },
+      },
+      required: ["group_name"],
+    },
+  },
 ];
 
 // Tools that only make sense on one channel. The web assistant has the
@@ -519,6 +548,7 @@ const WEB_ONLY_TOOLS = new Set(["open_template_picker"]);
 const WHATSAPP_ONLY_TOOLS = new Set([
   "get_template_details",
   "send_template_message",
+  "create_group_from_upload",
 ]);
 
 export function toolsForChannel(channel = "web") {
@@ -530,8 +560,12 @@ export function toolsForChannel(channel = "web") {
 // TOOL EXECUTOR
 // ─────────────────────────────────────────────
 
-export async function executeTool(toolName, toolInput, userId) {
+// `ctx` carries per-channel session info the tools can't get from userId alone
+// (currently { link_id } on WhatsApp, used by create_group_from_upload).
+export async function executeTool(toolName, toolInput, userId, ctx = {}) {
   switch (toolName) {
+    case "create_group_from_upload":
+      return await createGroupFromUpload(userId, toolInput, ctx);
     case "list_groups":
       return await listGroups(userId, toolInput.search);
     case "list_templates":
@@ -870,8 +904,9 @@ async function createCampaign(userId, input) {
 
       if (!effectiveMediaId) {
         return {
-          error: `MEDIA_REQUIRED: Template "${template.name}" is a ${template.header_format} template and requires a media file. Please go to the Templates page to upload media for this template, then come back to create the campaign.`,
+          error: `MEDIA_REQUIRED: Template "${template.name}" is a ${template.header_format} template and requires a media file before this campaign can be created.`,
           requires_media_upload: true,
+          template_id,
           template_name: template.name,
           header_format: template.header_format,
         };
@@ -884,8 +919,9 @@ async function createCampaign(userId, input) {
       );
       if (!mediaValidity.valid) {
         return {
-          error: `MEDIA_EXPIRED: The ${template.header_format} media for template "${template.name}" has ${mediaValidity.reason === "expired" ? `expired (uploaded ${mediaValidity.days_old} days ago — Meta expires media after 25 days)` : "not been found"}. Please go to the Templates page to upload fresh media, then come back to create the campaign.`,
+          error: `MEDIA_EXPIRED: The ${template.header_format} media for template "${template.name}" has ${mediaValidity.reason === "expired" ? `expired (uploaded ${mediaValidity.days_old} days ago — Meta expires media after 25 days)` : "not been found"}.`,
           requires_media_upload: true,
+          template_id,
           template_name: template.name,
           header_format: template.header_format,
           media_reason: mediaValidity.reason,
@@ -1079,6 +1115,39 @@ async function listGoogleSheets(userId) {
 // ─────────────────────────────────────────────
 // create_group_from_sheet
 // ─────────────────────────────────────────────
+
+// ─────────────────────────────────────────────
+// create_group_from_upload (WhatsApp)
+// The contacts were parsed when the file arrived (samvaadikWaController) and
+// staged on the user's WhatsApp session. The model only ever sees counts.
+// Clears the staged file on success, so a repeated call can't create twice.
+// ─────────────────────────────────────────────
+
+async function createGroupFromUpload(userId, input, ctx) {
+  try {
+    const name = String(input?.group_name || "").trim();
+    if (!name) return { error: "group_name is required." };
+
+    const staged = ctx?.link_id ? await getPendingAction(ctx.link_id) : null;
+    if (!staged || staged.type !== "staged_contacts") {
+      return {
+        error:
+          "NO_STAGED_FILE: There is no contact file waiting (it may have expired or already been used). Ask the user to send the CSV/Excel file again.",
+      };
+    }
+
+    const result = await createGroupFromContacts({
+      user_id: userId,
+      group_name: name.slice(0, 80),
+      description: input?.description || "",
+      contacts: staged.contacts,
+    });
+    await clearPendingAction(ctx.link_id);
+    return result;
+  } catch (err) {
+    return { error: err.message };
+  }
+}
 
 async function createGroupFromSheet(userId, input) {
   try {
@@ -1750,7 +1819,10 @@ async function createAgentTool(userId, input) {
 // shared with the chat dashboard's /admin/chat/send route.
 // ─────────────────────────────────────────────
 
-const last10 = (phone) => String(phone || "").replace(/\D/g, "").slice(-10);
+const last10 = (phone) =>
+  String(phone || "")
+    .replace(/\D/g, "")
+    .slice(-10);
 
 async function findContact(userId, search) {
   try {
@@ -1761,13 +1833,17 @@ async function findContact(userId, search) {
     const nameQ = q.replace(/[+\d]/g, "").trim();
 
     if (!nameQ && digits.length < 4) {
-      return { error: "Give at least part of the person's name or 4+ digits of their phone number." };
+      return {
+        error:
+          "Give at least part of the person's name or 4+ digits of their phone number.",
+      };
     }
 
     const conditions = (nameCol, phoneCol) => {
       const parts = [];
       if (nameQ) parts.push(`${nameCol}.ilike.%${nameQ}%`);
-      if (digits.length >= 4) parts.push(`${phoneCol}.ilike.%${last10(digits)}%`);
+      if (digits.length >= 4)
+        parts.push(`${phoneCol}.ilike.%${last10(digits)}%`);
       return parts.join(",");
     };
 
@@ -1795,7 +1871,9 @@ async function findContact(userId, search) {
         return {
           chat_id: c.chat_id,
           name:
-            c.person_name && c.person_name !== c.phone_number && c.person_name !== "Unknown"
+            c.person_name &&
+            c.person_name !== c.phone_number &&
+            c.person_name !== "Unknown"
               ? c.person_name
               : null,
           phone: c.phone_number,
@@ -1829,7 +1907,8 @@ async function findContact(userId, search) {
     if (results.length === 0) {
       return {
         contacts: [],
-        message: `No chat or contact found matching "${raw}".` +
+        message:
+          `No chat or contact found matching "${raw}".` +
           (digits.length >= 10
             ? " A template can still be sent to this phone number as a new contact."
             : ""),
@@ -1891,7 +1970,8 @@ async function sendTextMessageTool(userId, input) {
         error: `MESSAGE NOT SENT: ${result.error}`,
         code: result.code,
         ...(["NO_USER_REPLY", "WINDOW_EXPIRED"].includes(result.code) && {
-          suggestion: "Offer to send a template instead (open_template_picker).",
+          suggestion:
+            "Offer to send a template instead (open_template_picker).",
         }),
       };
     }
@@ -1902,7 +1982,11 @@ async function sendTextMessageTool(userId, input) {
       phone: chat.phone_number,
     };
   } catch (err) {
-    return { success: false, sent: false, error: `MESSAGE NOT SENT: ${err.message}` };
+    return {
+      success: false,
+      sent: false,
+      error: `MESSAGE NOT SENT: ${err.message}`,
+    };
   }
 }
 
@@ -1924,20 +2008,31 @@ async function openTemplatePicker(userId, input) {
         .maybeSingle();
       chat = data;
       if (!chat && !phone_number) {
-        return { error: "Chat not found. Call find_contact again and pass the person's phone_number." };
+        return {
+          error:
+            "Chat not found. Call find_contact again and pass the person's phone_number.",
+        };
       }
     }
 
     if (chat) {
       chatId = chat.chat_id;
       phone = chat.phone_number;
-      if (!name && chat.person_name && chat.person_name !== phone && chat.person_name !== "Unknown") {
+      if (
+        !name &&
+        chat.person_name &&
+        chat.person_name !== phone &&
+        chat.person_name !== "Unknown"
+      ) {
         name = chat.person_name;
       }
     } else {
       phone = normalizePhone(phone_number);
       if (!phone) {
-        return { error: "Invalid phone number. Ask the user for the number with country code, e.g. +91 98765 43210." };
+        return {
+          error:
+            "Invalid phone number. Ask the user for the number with country code, e.g. +91 98765 43210.",
+        };
       }
       // Reuse an existing chat for this number if there is one
       const { data: existing } = await supabase
@@ -1949,7 +2044,8 @@ async function openTemplatePicker(userId, input) {
         .maybeSingle();
       if (existing?.chat_id) {
         chatId = existing.chat_id;
-        if (!name && existing.person_name && existing.person_name !== phone) name = existing.person_name;
+        if (!name && existing.person_name && existing.person_name !== phone)
+          name = existing.person_name;
       }
     }
 
@@ -2010,7 +2106,8 @@ async function loadOwnTemplate(userId, { wt_id, template_name } = {}) {
   }
 
   return {
-    error: "Template not found. Call list_templates and use the exact template name.",
+    error:
+      "Template not found. Call list_templates and use the exact template name.",
   };
 }
 
@@ -2049,7 +2146,12 @@ async function sendTemplateMessageTool(userId, input) {
       };
     }
     const { template, error } = await loadOwnTemplate(userId, input);
-    if (error) return { success: false, sent: false, error: `MESSAGE NOT SENT: ${error}` };
+    if (error)
+      return {
+        success: false,
+        sent: false,
+        error: `MESSAGE NOT SENT: ${error}`,
+      };
 
     const { status, data } = await sendTemplateToContact(userId, {
       phone_number,
@@ -2078,6 +2180,10 @@ async function sendTemplateMessageTool(userId, input) {
       phone: phone_number,
     };
   } catch (err) {
-    return { success: false, sent: false, error: `MESSAGE NOT SENT: ${err.message}` };
+    return {
+      success: false,
+      sent: false,
+      error: `MESSAGE NOT SENT: ${err.message}`,
+    };
   }
 }
