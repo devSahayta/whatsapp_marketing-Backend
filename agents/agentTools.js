@@ -14,6 +14,11 @@ import {
   sendTextToChat,
   normalizePhone,
 } from "../services/chatMessagingService.js";
+import { createGroupFromContacts } from "../services/groupImportService.js";
+import {
+  getPendingAction,
+  clearPendingAction,
+} from "../services/samvaadikWaService.js";
 
 // ─────────────────────────────────────────────
 // TOOL DEFINITIONS  (sent to Anthropic API)
@@ -477,11 +482,13 @@ export const CAMPAIGN_TOOLS = [
       properties: {
         phone_number: {
           type: "string",
-          description: "Recipient phone number with country code, from the preview's 'To:' line.",
+          description:
+            "Recipient phone number with country code, from the preview's 'To:' line.",
         },
         contact_name: {
           type: "string",
-          description: "Recipient's name if known (used when creating a new chat).",
+          description:
+            "Recipient's name if known (used when creating a new chat).",
         },
         template_name: {
           type: "string",
@@ -490,7 +497,8 @@ export const CAMPAIGN_TOOLS = [
         },
         wt_id: {
           type: "string",
-          description: "wt_id from list_templates in this same turn (optional if template_name is given).",
+          description:
+            "wt_id from list_templates in this same turn (optional if template_name is given).",
         },
         body_variables: {
           type: "object",
@@ -499,7 +507,8 @@ export const CAMPAIGN_TOOLS = [
         },
         header_variable: {
           type: "string",
-          description: "Value for the header placeholder, only if get_template_details says header_variable_needed.",
+          description:
+            "Value for the header placeholder, only if get_template_details says header_variable_needed.",
         },
         button_variables: {
           type: "array",
@@ -511,6 +520,25 @@ export const CAMPAIGN_TOOLS = [
       required: ["phone_number"],
     },
   },
+  {
+    name: "create_group_from_upload",
+    description:
+      "WhatsApp only. Create a contact group from the CSV/Excel file the user just sent in this chat. The file is already parsed and held server-side (you only see its counts in the STAGED CONTACT FILE context) — never ask for the contacts again. Call this once you know the group name the user wants (use a name they already gave you earlier in the conversation; otherwise ask). Fails with NO_STAGED_FILE if no file is waiting.",
+    input_schema: {
+      type: "object",
+      properties: {
+        group_name: {
+          type: "string",
+          description: "Name for the new group, as the user wants it.",
+        },
+        description: {
+          type: "string",
+          description: "Optional short description for the group.",
+        },
+      },
+      required: ["group_name"],
+    },
+  },
 ];
 
 // Tools that only make sense on one channel. The web assistant has the
@@ -520,6 +548,7 @@ const WEB_ONLY_TOOLS = new Set(["open_template_picker"]);
 const WHATSAPP_ONLY_TOOLS = new Set([
   "get_template_details",
   "send_template_message",
+  "create_group_from_upload",
 ]);
 
 export function toolsForChannel(channel = "web") {
@@ -531,8 +560,12 @@ export function toolsForChannel(channel = "web") {
 // TOOL EXECUTOR
 // ─────────────────────────────────────────────
 
-export async function executeTool(toolName, toolInput, userId) {
+// `ctx` carries per-channel session info the tools can't get from userId alone
+// (currently { link_id } on WhatsApp, used by create_group_from_upload).
+export async function executeTool(toolName, toolInput, userId, ctx = {}) {
   switch (toolName) {
+    case "create_group_from_upload":
+      return await createGroupFromUpload(userId, toolInput, ctx);
     case "list_groups":
       return await listGroups(userId, toolInput.search);
     case "list_templates":
@@ -1082,6 +1115,39 @@ async function listGoogleSheets(userId) {
 // ─────────────────────────────────────────────
 // create_group_from_sheet
 // ─────────────────────────────────────────────
+
+// ─────────────────────────────────────────────
+// create_group_from_upload (WhatsApp)
+// The contacts were parsed when the file arrived (samvaadikWaController) and
+// staged on the user's WhatsApp session. The model only ever sees counts.
+// Clears the staged file on success, so a repeated call can't create twice.
+// ─────────────────────────────────────────────
+
+async function createGroupFromUpload(userId, input, ctx) {
+  try {
+    const name = String(input?.group_name || "").trim();
+    if (!name) return { error: "group_name is required." };
+
+    const staged = ctx?.link_id ? await getPendingAction(ctx.link_id) : null;
+    if (!staged || staged.type !== "staged_contacts") {
+      return {
+        error:
+          "NO_STAGED_FILE: There is no contact file waiting (it may have expired or already been used). Ask the user to send the CSV/Excel file again.",
+      };
+    }
+
+    const result = await createGroupFromContacts({
+      user_id: userId,
+      group_name: name.slice(0, 80),
+      description: input?.description || "",
+      contacts: staged.contacts,
+    });
+    await clearPendingAction(ctx.link_id);
+    return result;
+  } catch (err) {
+    return { error: err.message };
+  }
+}
 
 async function createGroupFromSheet(userId, input) {
   try {
@@ -2040,7 +2106,8 @@ async function loadOwnTemplate(userId, { wt_id, template_name } = {}) {
   }
 
   return {
-    error: "Template not found. Call list_templates and use the exact template name.",
+    error:
+      "Template not found. Call list_templates and use the exact template name.",
   };
 }
 
@@ -2079,7 +2146,12 @@ async function sendTemplateMessageTool(userId, input) {
       };
     }
     const { template, error } = await loadOwnTemplate(userId, input);
-    if (error) return { success: false, sent: false, error: `MESSAGE NOT SENT: ${error}` };
+    if (error)
+      return {
+        success: false,
+        sent: false,
+        error: `MESSAGE NOT SENT: ${error}`,
+      };
 
     const { status, data } = await sendTemplateToContact(userId, {
       phone_number,
@@ -2108,6 +2180,10 @@ async function sendTemplateMessageTool(userId, input) {
       phone: phone_number,
     };
   } catch (err) {
-    return { success: false, sent: false, error: `MESSAGE NOT SENT: ${err.message}` };
+    return {
+      success: false,
+      sent: false,
+      error: `MESSAGE NOT SENT: ${err.message}`,
+    };
   }
 }

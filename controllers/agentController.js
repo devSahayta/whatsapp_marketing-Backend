@@ -5,6 +5,8 @@ import Anthropic from "@anthropic-ai/sdk";
 import { ANTHROPIC_API_KEY } from "../config/anthropic.js";
 import { executeTool, toolsForChannel } from "../agents/agentTools.js";
 import { randomUUID } from "crypto";
+import { createGroupFromContacts } from "../services/groupImportService.js";
+import { dashboardLinkForResult } from "../utils/dashboardLinks.js";
 import {
   parseContactsFile,
   slugifyFileName,
@@ -813,8 +815,11 @@ function attachPickerToken(text, token) {
 
 // ── WhatsApp channel instructions ───────────────────────────────────────────
 // Appended to the system prompt when the assistant is used from the user's
-// own WhatsApp (samvaadikWaController). Plain text only: no buttons, no file
-// uploads, no template picker — so those flows are replaced here.
+// own WhatsApp (samvaadikWaController). Plain text only: no buttons and no
+// template picker, so those flows are replaced here. Files (CSV/Excel contact
+// lists, template header media) arrive as WhatsApp documents/photos, are
+// processed by the controller, and reach the model only as short notes plus
+// STAGED CONTACT FILE / MEDIA ATTACHMENT context blocks.
 // The summary titles ("Campaign Summary", "Message Preview", "Template Message
 // Preview", ...) and their "Ready to ..." questions must stay word-for-word:
 // confirmation detection in runSamvaadikAssistant relies on them.
@@ -823,15 +828,28 @@ const WHATSAPP_CHANNEL_PROMPT = `
 CHANNEL: WHATSAPP
 This conversation is happening in WhatsApp text messages from the user's own phone, not in the dashboard. The user is the account owner (or their team) — not a customer.
 
+How to sound:
+- Talk like a friendly, capable teammate on WhatsApp, not a form. Short and natural: usually 1-3 short sentences. Plain words, no corporate phrasing.
+- Match the user's language and style: English, Hindi or Hinglish, casual or formal. If they write "haan kar do", answer in the same spirit.
+- Greetings ("hi", "good morning"): greet back in one short line and ask what they'd like to do. Do NOT bring up, correct or apologise for earlier messages unless the user asks about them.
+- Never list the user's templates, groups, campaigns or flows from memory. Call the tool first, every time, even if you listed them earlier.
+- Accept any natural way of agreeing or declining ("yes", "yes proceed", "haan", "ok do it", "go ahead", "nahi", "leave it"). Never ask the user to type an exact word like "yes" or "cancel", and never treat a confirmation as a new name or value.
+- Never mention tools, markers, staging, servers or "the system". Just talk about what the user cares about: their groups, templates, campaigns.
+- Do not write dashboard links yourself. After something is created, a link to it is added to your reply automatically.
+
 Formatting:
 - Plain WhatsApp text. Use *single asterisks* for bold, never **double**. No markdown headings or tables.
 - Keep replies short. Summaries/previews: keep the exact title line (e.g. "Campaign Summary", "Message Preview", "Template Message Preview") and the exact "Ready to ..." question; the "───" separator lines are optional.
 
 What is different on WhatsApp:
-- CSV/Excel group upload (Group creation Option A) works here too: if the user sends a CSV or Excel file as a WhatsApp document, it is downloaded, parsed and confirmed with them automatically — outside of you, before you see anything about it. You will not see the file itself; you will only see a plain-text message afterwards telling you a group was created (or that it wasn't), as a fact. Do not ask the user to upload a file here yourself or claim you can't read it; if the user says they're about to send one, just wait. Option B (Google Sheets) also still works exactly as below.
-- If a Google Sheet must be picked from Google Drive, tell the user to do that once from the AI Assistant in the Samvaadik dashboard, then continue here.
-- Media templates CAN be created here. If the user sends a photo, video or document to use as a template header, it is uploaded outside of you — you'll either see a media_attachment in the conversation context (ready to pass to create_template, exactly as the instructions for that tool describe) or a plain-text message telling you a specific template's media was refreshed (treat it as a fact, same as the group-import message above).
-- There is no in-chat upload *button* here — when you output UPLOAD_MEDIA_FOR_TEMPLATE:<wt_id>|<TYPE>|<name> for missing/expired media (per the instructions above), the user is told in plain text to just send the photo/video/document in this same chat; you do not need to say anything else about how to upload it.
+- GROUP FROM A CSV/EXCEL FILE (this REPLACES "Option A" above, including "never call any tool for Option A"): there is no + button on WhatsApp. If the user wants to create a group from a file, ask for the group name if you don't have it yet, and tell them to send the file as a document (tap the 📎 attach icon, then Document). When the file arrives it is read for you automatically and you will see a STAGED CONTACT FILE block in your context. Then:
+  1. If the user already gave a group name earlier in this conversation, use it and call create_group_from_upload right away — don't ask again and don't ask for another confirmation.
+  2. If you don't have a name yet, say how many contacts you found and ask what to call the group (you may suggest one). Once they answer, call create_group_from_upload.
+  3. If they later give a different name, use that one.
+  4. Only say the group was created after create_group_from_upload returns success: true. If it returns an error, explain it simply and ask them to send the file again if needed.
+  You never see the contact rows, so never claim to know who is in the file.
+- Option B (Google Sheets) works as above. If a sheet must be picked from Google Drive, tell the user to do that once from the AI Assistant in the Samvaadik dashboard, then continue here.
+- TEMPLATE MEDIA: media templates CAN be created here. If the user sends a photo, video or PDF to use as a template header, it is uploaded for you automatically and you'll see a MEDIA ATTACHMENT block in your context — use it exactly as that block says and never ask them to upload it again. Supported: JPG/PNG images, MP4 video, PDF documents. If a template's media is missing or expired and you output the UPLOAD_MEDIA_FOR_TEMPLATE line as instructed above, the user is told to just send the file here in the chat, so you don't need to explain how.
 
 ONE-TO-ONE TEMPLATE MESSAGE (replaces Step 2b of ONE-TO-ONE MESSAGING — there is no template picker here; open_template_picker does not exist):
 1. Identify the person with find_contact as usual (or use the full phone number the user gave).
@@ -872,6 +890,9 @@ export async function runSamvaadikAssistant({
   messages,
   media_attachment,
   channel = "web",
+  // WhatsApp only: { link_id, staged_upload: {file_name, count, skipped} | null }.
+  // Web never passes this, so none of the code keyed on it runs there.
+  channelContext = {},
 }) {
   if (!user_id) {
     throw Object.assign(new Error("user_id is required"), {
@@ -947,6 +968,20 @@ export async function runSamvaadikAssistant({
         ? `, and media_id="${media_attachment.media_id}"`
         : "") +
       ` to the create_template tool. Do NOT ask the user to upload a file — the upload is already complete.`;
+  }
+
+  // A contact file the user sent over WhatsApp, parsed and held server-side.
+  // The model only sees counts — never the rows themselves.
+  const stagedUpload = channelContext?.staged_upload || null;
+  if (stagedUpload) {
+    dynamicContext +=
+      `\n\nSTAGED CONTACT FILE (the user sent this on WhatsApp; it is NOT a group yet):\n` +
+      `- File: "${stagedUpload.file_name || "contacts"}" — ${stagedUpload.count} valid contact${stagedUpload.count === 1 ? "" : "s"}` +
+      (stagedUpload.skipped
+        ? ` (${stagedUpload.skipped} row${stagedUpload.skipped === 1 ? "" : "s"} skipped: no phone number)`
+        : "") +
+      `.\n- To make the group, call create_group_from_upload with the group name. ` +
+      `If the user already told you a group name earlier in this conversation, use it. Otherwise ask for one.`;
   }
 
   // Trim to last 20 messages to prevent context bloat across multiple campaigns
@@ -1140,6 +1175,12 @@ export async function runSamvaadikAssistant({
   let lastGroupsResult = null;
   let lastTemplatesResult = null;
 
+  // WhatsApp: links to what got created this turn (appended to the reply by
+  // the caller), and the outcome of create_group_from_upload (so the reply
+  // can never claim a group exists when it doesn't).
+  const dashboardLinks = [];
+  let groupUploadResult = null; // null = not called this turn
+
   try {
     while (iteration < MAX_TOOL_ITERATIONS) {
       iteration++;
@@ -1263,6 +1304,19 @@ export async function runSamvaadikAssistant({
             "The message was not sent because something went wrong. Please try again.";
         }
 
+        // WhatsApp group-from-file: never let the reply say a group was
+        // created when it wasn't (tool not called, or it returned an error).
+        const claimsGroupCreated =
+          /\b(has been|have been|was|were|is now|successfully|i'?ve|i have|just)\s+created\b|\bcreated\s+(the|your|a)\s+(new\s+)?group\b|\bgroup\b[^.\n]{0,60}\bcreated with\b/i.test(
+            replyText,
+          );
+        if (claimsGroupCreated && groupUploadResult?.error) {
+          replyText = `I couldn't create the group: ${String(groupUploadResult.error).replace(/^NO_STAGED_FILE:\s*/i, "")}`;
+        } else if (claimsGroupCreated && stagedUpload && !groupUploadResult) {
+          replyText =
+            "Hold on, I haven't created the group yet. Tell me what name you'd like and I'll set it up right away.";
+        }
+
         // Rebuild any group/template list block from the real tool result
         // for this turn, so the displayed list can never be shorter than, or
         // miscounted against, what the account actually has.
@@ -1293,6 +1347,7 @@ export async function runSamvaadikAssistant({
           iterations: iteration,
           credits_charged: turnCreditsCharged,
           credits_remaining: creditBalance,
+          ...(dashboardLinks.length > 0 && { dashboard_links: dashboardLinks }),
         };
       }
 
@@ -1315,8 +1370,20 @@ export async function runSamvaadikAssistant({
             );
             // Only tools offered on this channel may run (defence in depth)
             const result = toolNames.has(block.name)
-              ? await executeTool(block.name, block.input, user_id)
+              ? await executeTool(
+                  block.name,
+                  block.input,
+                  user_id,
+                  channelContext,
+                )
               : { error: `Tool ${block.name} is not available here.` };
+            if (block.name === "create_group_from_upload") {
+              groupUploadResult = result || { error: "No result" };
+            }
+            if (channel === "whatsapp") {
+              const link = dashboardLinkForResult(block.name, result);
+              if (link) dashboardLinks.push(link);
+            }
             // The template-picker token is attached to the reply by the server
             // (see attachPickerToken). Hide it from the model so it can't
             // echo a mangled copy (placeholder text / bare UUID).
@@ -1500,76 +1567,8 @@ export const handleGroupPreview = async (req, res) => {
 };
 
 // ─── GROUP CREATION FROM CSV ──────────────────────────────────────────────────
-// Shared by the dashboard's create-group endpoint below AND the WhatsApp
-// assistant's document-upload flow (samvaadikWaController) — the latter has
-// no multipart request to hand a controller, just a parsed contacts array,
-// so it calls this directly instead of going back over HTTP to itself.
-// Throws a plain Error (not an HTTP response) on bad input.
-export async function createGroupFromContacts({
-  user_id,
-  group_name,
-  description = "",
-  contacts,
-  csv_url = null,
-}) {
-  const badInput = (msg) => Object.assign(new Error(msg), { status: 400 });
-  if (!user_id) throw badInput("user_id is required");
-  if (!group_name?.trim()) throw badInput("group_name is required");
-  if (!contacts?.length) throw badInput("No contacts provided");
-
-  const { data: group, error: groupErr } = await supabase
-    .from("groups")
-    .insert({
-      user_id,
-      group_name: group_name.trim(),
-      description: description?.trim() || null,
-      uploaded_csv: csv_url, // Supabase storage URL from preview step
-      status: "active",
-    })
-    .select()
-    .single();
-
-  if (groupErr)
-    throw Object.assign(new Error(groupErr.message), { status: 500 });
-
-  // Bulk insert contacts — attach group_id (preview didn't know it yet)
-  const contactsWithGroup = contacts.map((c) => ({
-    ...c,
-    group_id: group.group_id,
-    user_id,
-  }));
-
-  const BATCH = 500;
-  let insertedCount = 0;
-
-  for (let i = 0; i < contactsWithGroup.length; i += BATCH) {
-    const batch = contactsWithGroup.slice(i, i + BATCH);
-    const { data: inserted, error: insertErr } = await supabase
-      .from("group_contacts")
-      .insert(batch)
-      .select("contact_id");
-
-    if (insertErr) {
-      console.error(
-        `[AgentGroup] Batch insert error at offset ${i}:`,
-        insertErr.message,
-      );
-    } else {
-      insertedCount += inserted?.length ?? 0;
-    }
-  }
-
-  const skipped = contacts.length - insertedCount;
-
-  return {
-    success: true,
-    group_id: group.group_id,
-    group_name: group.group_name,
-    contacts_inserted: insertedCount,
-    skipped,
-    message: `Group "${group.group_name}" created with ${insertedCount} contact${insertedCount !== 1 ? "s" : ""}${skipped > 0 ? ` (${skipped} skipped)` : ""}.`,
-  };
-}
+// createGroupFromContacts lives in services/groupImportService.js (shared with
+// the WhatsApp assistant's create_group_from_upload tool) — re-exported below.
 
 // POST /api/agents/samvaadik/create-group
 // JSON body: { user_id, group_name, description, contacts[], csv_url }
@@ -1586,3 +1585,5 @@ export const handleGroupFromCsv = async (req, res) => {
       .json({ success: false, error: err.message });
   }
 };
+
+export { createGroupFromContacts };
